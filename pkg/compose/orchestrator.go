@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"digital.vasic.containers/pkg/logging"
 )
@@ -75,6 +77,20 @@ type DefaultOrchestrator struct {
 	workDir     string
 	logger      logging.Logger
 	cmdFactory  CmdFactory
+	// isPodmanCompose is true when the active runtime is the standalone
+	// podman-compose tool, which differs from docker compose in two
+	// material ways handled by this package: (1) it does NOT support the
+	// `up --wait` flag, and (2) its `ps` output is podman-native JSON, not
+	// the docker compose Go-template format.
+	isPodmanCompose bool
+}
+
+// isPodmanComposeCmd reports whether the given compose command + args is the
+// standalone podman-compose tool. `podman compose` (the docker-compose
+// provider invoked via the podman CLI) is docker-compose-compatible and is
+// NOT classified as podman-compose here.
+func isPodmanComposeCmd(composeCmd string, _ []string) bool {
+	return composeCmd == "podman-compose"
 }
 
 // NewDefaultOrchestrator creates a DefaultOrchestrator, auto-detecting
@@ -91,11 +107,12 @@ func NewDefaultOrchestrator(
 		logger = logging.NopLogger{}
 	}
 	return &DefaultOrchestrator{
-		composeCmd:  cmd,
-		composeArgs: args,
-		workDir:     workDir,
-		logger:      logger,
-		cmdFactory:  realCmdFactory{},
+		composeCmd:      cmd,
+		composeArgs:     args,
+		workDir:         workDir,
+		logger:          logger,
+		cmdFactory:      realCmdFactory{},
+		isPodmanCompose: isPodmanComposeCmd(cmd, args),
 	}, nil
 }
 
@@ -111,11 +128,12 @@ func NewOrchestrator(
 		logger = logging.NopLogger{}
 	}
 	return &DefaultOrchestrator{
-		composeCmd:  composeCmd,
-		composeArgs: composeArgs,
-		workDir:     workDir,
-		logger:      logger,
-		cmdFactory:  realCmdFactory{},
+		composeCmd:      composeCmd,
+		composeArgs:     composeArgs,
+		workDir:         workDir,
+		logger:          logger,
+		cmdFactory:      realCmdFactory{},
+		isPodmanCompose: isPodmanComposeCmd(composeCmd, composeArgs),
 	}
 }
 
@@ -135,11 +153,12 @@ func NewOrchestratorWithFactory(
 		factory = realCmdFactory{}
 	}
 	return &DefaultOrchestrator{
-		composeCmd:  composeCmd,
-		composeArgs: composeArgs,
-		workDir:     workDir,
-		logger:      logger,
-		cmdFactory:  factory,
+		composeCmd:      composeCmd,
+		composeArgs:     composeArgs,
+		workDir:         workDir,
+		logger:          logger,
+		cmdFactory:      factory,
+		isPodmanCompose: isPodmanComposeCmd(composeCmd, composeArgs),
 	}
 }
 
@@ -172,7 +191,12 @@ func (o *DefaultOrchestrator) Up(
 		args = append(args, "--timeout",
 			strconv.Itoa(cfg.Timeout))
 	}
-	if cfg.Wait {
+	// `--wait` is a docker compose flag; podman-compose does not support it
+	// (it forwards unknown flags to `podman` and fails, or silently ignores
+	// them). For podman-compose we omit the flag here and fall back to
+	// host-side healthcheck polling AFTER `up` returns so the wait
+	// semantics still hold for the caller.
+	if cfg.Wait && !o.isPodmanCompose {
 		args = append(args, "--wait")
 	}
 
@@ -180,7 +204,112 @@ func (o *DefaultOrchestrator) Up(
 
 	o.logger.Info("compose up: %s %s", o.composeCmd,
 		strings.Join(args, " "))
-	return o.run(ctx, args)
+	if err := o.run(ctx, args); err != nil {
+		return err
+	}
+
+	// podman-compose host-side wait fallback: poll Status() until every
+	// service is running (and any service with a healthcheck is healthy),
+	// or the context / timeout elapses.
+	if cfg.Wait && o.isPodmanCompose {
+		return o.waitForServices(ctx, project, cfg.Timeout)
+	}
+	return nil
+}
+
+// waitForServices polls the project's service status until every service is
+// running and no service reports an unhealthy/starting health state, or the
+// deadline elapses. It is the host-side equivalent of docker compose's
+// `up --wait` for runtimes (podman-compose) that lack the native flag.
+//
+// timeoutSecs of 0 means "use the default" (defaultWaitTimeout).
+func (o *DefaultOrchestrator) waitForServices(
+	ctx context.Context,
+	project ComposeProject,
+	timeoutSecs int,
+) error {
+	timeout := defaultWaitTimeout
+	if timeoutSecs > 0 {
+		timeout = time.Duration(timeoutSecs) * time.Second
+	}
+
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(waitPollInterval)
+	defer ticker.Stop()
+
+	var lastErr error
+	for {
+		statuses, err := o.Status(ctx, project)
+		if err != nil {
+			lastErr = err
+		} else if servicesReady(statuses) {
+			o.logger.Debug(
+				"podman-compose wait: all services ready (%d)",
+				len(statuses),
+			)
+			return nil
+		} else {
+			lastErr = fmt.Errorf(
+				"services not ready: %s", summarizeStatuses(statuses),
+			)
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf(
+				"timed out after %s waiting for services to be ready: %w",
+				timeout, lastErr,
+			)
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf(
+				"context canceled waiting for services: %w", ctx.Err(),
+			)
+		case <-ticker.C:
+		}
+	}
+}
+
+// servicesReady reports whether every service in statuses is running and no
+// service is in a non-ready health state. An empty slice is NOT ready — there
+// is nothing to confirm came up.
+func servicesReady(statuses []ServiceStatus) bool {
+	if len(statuses) == 0 {
+		return false
+	}
+	for _, s := range statuses {
+		if s.State != "running" {
+			return false
+		}
+		// A service that declares a healthcheck must be healthy. States
+		// "starting" / "unhealthy" are not ready. An empty/"none"/"healthy"
+		// health value is acceptable (no healthcheck or already healthy).
+		switch s.Health {
+		case "starting", "unhealthy":
+			return false
+		}
+	}
+	return true
+}
+
+// summarizeStatuses renders a compact name=state/health summary for error
+// messages.
+func summarizeStatuses(statuses []ServiceStatus) string {
+	if len(statuses) == 0 {
+		return "no services reported"
+	}
+	parts := make([]string, 0, len(statuses))
+	for _, s := range statuses {
+		if s.Health != "" {
+			parts = append(parts,
+				fmt.Sprintf("%s=%s/%s", s.Name, s.State, s.Health))
+		} else {
+			parts = append(parts,
+				fmt.Sprintf("%s=%s", s.Name, s.State))
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 // Down stops and removes containers.
@@ -212,12 +341,29 @@ func (o *DefaultOrchestrator) Down(
 	return o.run(ctx, args)
 }
 
-// Status returns the status of all services in the project by parsing
-// the output of `docker compose ps`.
+// defaultWaitTimeout and waitPollInterval bound the host-side wait fallback
+// used for runtimes that lack docker compose's native `up --wait`.
+const (
+	defaultWaitTimeout = 120 * time.Second
+	waitPollInterval   = 1 * time.Second
+)
+
+// Status returns the status of all services in the project. For docker
+// compose it parses the pipe-delimited Go-template `ps` output; for
+// podman-compose it parses podman-native JSON (`ps --format json`), because
+// podman-compose forwards `--format` to `podman ps`, where the docker
+// compose `{{.Name}}` template fields do not exist (the type is
+// containers.psReporter with capitalized `Names`, etc.) — the docker
+// template path returns a template-error line that parses to ZERO services
+// even while containers are running, which is exactly the bug this fixes.
 func (o *DefaultOrchestrator) Status(
 	ctx context.Context,
 	project ComposeProject,
 ) ([]ServiceStatus, error) {
+	if o.isPodmanCompose {
+		return o.statusPodman(ctx, project)
+	}
+
 	args := o.projectArgs(project)
 	args = append(args, "ps", "--format",
 		"{{.Name}}|{{.State}}|{{.Health}}|{{.Ports}}|{{.ExitCode}}")
@@ -228,6 +374,28 @@ func (o *DefaultOrchestrator) Status(
 	}
 
 	return parseStatusOutput(out), nil
+}
+
+// statusPodman returns service status by parsing podman-compose's JSON ps
+// output. podman-compose `ps --format json` forwards to `podman ps -a
+// --format json`, returning an array of podman container records.
+func (o *DefaultOrchestrator) statusPodman(
+	ctx context.Context,
+	project ComposeProject,
+) ([]ServiceStatus, error) {
+	args := o.projectArgs(project)
+	args = append(args, "ps", "--format", "json")
+
+	out, err := o.output(ctx, args)
+	if err != nil {
+		return nil, fmt.Errorf("compose ps failed: %w", err)
+	}
+
+	statuses, err := parsePodmanStatusJSON(out)
+	if err != nil {
+		return nil, fmt.Errorf("compose ps failed: %w", err)
+	}
+	return statuses, nil
 }
 
 // Logs returns a reader for the log output of the named service.
@@ -384,6 +552,112 @@ func parseStatusOutput(output string) []ServiceStatus {
 		})
 	}
 	return statuses
+}
+
+// podmanContainer is the subset of podman's `ps --format json` record that
+// maps onto ServiceStatus. Field names + the `Names` array follow podman's
+// JSON schema (containers/podman) which differs from docker compose ps.
+type podmanContainer struct {
+	Names    []string          `json:"Names"`
+	State    string            `json:"State"`
+	Health   string            `json:"Health"`
+	ExitCode int               `json:"ExitCode"`
+	Exited   bool              `json:"Exited"`
+	Labels   map[string]string `json:"Labels"`
+	Ports    []podmanPort      `json:"Ports"`
+}
+
+// podmanPort is podman's JSON port-mapping record.
+type podmanPort struct {
+	HostIP        string `json:"host_ip"`
+	HostPort      int    `json:"host_port"`
+	ContainerPort int    `json:"container_port"`
+	Protocol      string `json:"protocol"`
+}
+
+// parsePodmanStatusJSON parses podman's `ps --format json` array into
+// ServiceStatus records. The service NAME prefers the compose service label
+// (`com.docker.compose.service` / `io.podman.compose.service`) when present —
+// falling back to the container name — so callers keying off the logical
+// service name match what they used at `up` time. Empty / whitespace-only
+// input yields no statuses (not an error), mirroring the docker path.
+func parsePodmanStatusJSON(output string) ([]ServiceStatus, error) {
+	trimmed := strings.TrimSpace(output)
+	if trimmed == "" {
+		return nil, nil
+	}
+
+	var containers []podmanContainer
+	if err := json.Unmarshal([]byte(trimmed), &containers); err != nil {
+		return nil, fmt.Errorf(
+			"failed to parse podman ps json: %w", err,
+		)
+	}
+
+	statuses := make([]ServiceStatus, 0, len(containers))
+	for _, c := range containers {
+		name := podmanServiceName(c)
+		if name == "" {
+			continue
+		}
+
+		state := c.State
+		if state == "" && c.Exited {
+			state = "exited"
+		}
+
+		statuses = append(statuses, ServiceStatus{
+			Name:     name,
+			State:    state,
+			Health:   c.Health,
+			Ports:    podmanPortStrings(c.Ports),
+			ExitCode: c.ExitCode,
+		})
+	}
+	return statuses, nil
+}
+
+// podmanServiceName resolves the logical compose service name for a podman
+// container, preferring the compose service label and falling back to the
+// first container name.
+func podmanServiceName(c podmanContainer) string {
+	for _, key := range []string{
+		"com.docker.compose.service",
+		"io.podman.compose.service",
+	} {
+		if v, ok := c.Labels[key]; ok && v != "" {
+			return v
+		}
+	}
+	if len(c.Names) > 0 {
+		return c.Names[0]
+	}
+	return ""
+}
+
+// podmanPortStrings renders podman's structured port records into the
+// docker-style "host_ip:host_port->container_port/proto" string form used by
+// ServiceStatus.Ports.
+func podmanPortStrings(ports []podmanPort) []string {
+	if len(ports) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(ports))
+	for _, p := range ports {
+		host := p.HostIP
+		if host == "" {
+			host = "0.0.0.0"
+		}
+		proto := p.Protocol
+		if proto == "" {
+			proto = "tcp"
+		}
+		result = append(result, fmt.Sprintf(
+			"%s:%d->%d/%s",
+			host, p.HostPort, p.ContainerPort, proto,
+		))
+	}
+	return result
 }
 
 // parsePorts splits a comma-separated list of port mappings.
