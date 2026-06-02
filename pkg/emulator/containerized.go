@@ -10,6 +10,42 @@ import (
 	"time"
 )
 
+// defaultGradleModule is the neutral module name used when a caller
+// supplies no GradleModule. It is deliberately generic — the
+// Containers package is 100% decoupled from any consumer project, so
+// no consumer module (e.g. Lava's "api-app") is ever baked in as a
+// default or special case.
+const defaultGradleModule = "app"
+
+// gradleModuleSetter is the optional capability the matrix runner uses
+// to propagate MatrixConfig.GradleModule onto an Emulator before
+// RunInstrumentation. Both concrete emulators implement it; an external
+// Emulator implementation that does not is simply run with whatever
+// module it was constructed with (default "app").
+type gradleModuleSetter interface {
+	setGradleModule(module string)
+}
+
+// gradleConnectedTestArgs builds the gradle argument slice both
+// emulator implementations (host-direct AndroidEmulator and
+// Containerized) use to run a single instrumentation test class.
+// `module` is the bare gradle module name (e.g. "app", "api-app");
+// empty defaults to defaultGradleModule. The returned task is
+// `:<module>:connectedDebugAndroidTest`. Centralising this here keeps
+// the host-direct and container paths byte-identical and gives the
+// module-substitution one falsifiability-rehearsed code path.
+func gradleConnectedTestArgs(module, testClass string) []string {
+	m := module
+	if m == "" {
+		m = defaultGradleModule
+	}
+	return []string{
+		fmt.Sprintf(":%s:connectedDebugAndroidTest", m),
+		"-Pandroid.testInstrumentationRunnerArguments.class=" + testClass,
+		"--no-daemon",
+	}
+}
+
 // Containerized implements [Emulator] by running the Android emulator
 // process INSIDE a podman or docker container managed by the
 // vasic-digital/Containers package. This is the constitutional landing
@@ -100,6 +136,14 @@ type Containerized struct {
 	// defaults to "./gradlew". RunInstrumentation invokes this
 	// with ANDROID_SERIAL pointing at the forwarded port.
 	gradleBinary string
+
+	// gradleModule is the bare gradle module name whose
+	// connectedDebugAndroidTest task RunInstrumentation runs. Empty
+	// defaults to "app" (preserving the prior hardwired :app behavior).
+	// Generic per the Decoupled Reusable Architecture rule — the
+	// consuming project supplies its own module name; no consumer
+	// module is special-cased here.
+	gradleModule string
 }
 
 // ContainerizedConfig parameterises a [Containerized] instance.
@@ -117,6 +161,11 @@ type ContainerizedConfig struct {
 	// GradleBinary is the host-side gradle wrapper. Empty =
 	// "./gradlew".
 	GradleBinary string
+	// GradleModule is the bare gradle module whose
+	// connectedDebugAndroidTest task runs. Empty defaults to "app".
+	// The CLI's --gradle-module flag threads into this field. Generic
+	// — no consumer module is special-cased.
+	GradleModule string
 }
 
 // NewContainerized constructs a Containerized emulator. Returns an
@@ -147,6 +196,7 @@ func NewContainerized(cfg ContainerizedConfig) (*Containerized, error) {
 		executor:      executor,
 		adbBinaryPath: adbBin,
 		gradleBinary:  gradleBin,
+		gradleModule:  cfg.GradleModule,
 	}, nil
 }
 
@@ -316,11 +366,7 @@ func (c *Containerized) RunInstrumentation(
 	// localhost:<port> form because that's what we connected via
 	// in WaitForBoot.
 	target := fmt.Sprintf("localhost:%d", port)
-	args := []string{
-		":app:connectedDebugAndroidTest",
-		"-Pandroid.testInstrumentationRunnerArguments.class=" + testClass,
-		"--no-daemon",
-	}
+	args := gradleConnectedTestArgs(c.gradleModule, testClass)
 	// The CommandExecutor seam doesn't expose env-var setting, so
 	// we synthesize the env via a shell wrapper. In production
 	// osExecutor.Execute this is `sh -c 'ANDROID_SERIAL=... ./gradlew ...'`.
@@ -338,6 +384,15 @@ func (c *Containerized) RunInstrumentation(
 		err = fmt.Errorf("gradle exit zero but BUILD SUCCESSFUL not in output")
 	}
 	return output, passed, err
+}
+
+// setGradleModule sets the bare gradle module RunInstrumentation
+// targets. Empty is a no-op (the constructor default stands). The
+// matrix runner calls this to propagate MatrixConfig.GradleModule.
+func (c *Containerized) setGradleModule(module string) {
+	if module != "" {
+		c.gradleModule = module
+	}
 }
 
 // Teardown stops + removes the container via the runtime CLI. Uses

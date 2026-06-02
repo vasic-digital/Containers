@@ -133,14 +133,34 @@ func NewOSExecutor() CommandExecutor { return osExecutor{} }
 type AndroidEmulator struct {
 	executor       CommandExecutor
 	androidSdkRoot string
+
+	// gradleModule is the bare gradle module whose
+	// connectedDebugAndroidTest task RunInstrumentation runs. Empty
+	// defaults to "app". Generic per the Decoupled Reusable
+	// Architecture rule — no consumer module is special-cased.
+	gradleModule string
 }
 
 // NewAndroidEmulator constructs an AndroidEmulator that uses the real
-// host shell to invoke the SDK binaries.
+// host shell to invoke the SDK binaries. The gradle module defaults to
+// "app"; use NewAndroidEmulatorWithModule to target a different module.
 func NewAndroidEmulator(androidSdkRoot string) *AndroidEmulator {
 	return &AndroidEmulator{
 		executor:       osExecutor{},
 		androidSdkRoot: androidSdkRoot,
+	}
+}
+
+// NewAndroidEmulatorWithModule constructs an AndroidEmulator targeting a
+// specific gradle module's connectedDebugAndroidTest task. Empty module
+// defaults to "app" (identical to NewAndroidEmulator). Production code
+// that needs a non-default module (the CLI's --gradle-module flag) uses
+// this constructor.
+func NewAndroidEmulatorWithModule(androidSdkRoot, gradleModule string) *AndroidEmulator {
+	return &AndroidEmulator{
+		executor:       osExecutor{},
+		androidSdkRoot: androidSdkRoot,
+		gradleModule:   gradleModule,
 	}
 }
 
@@ -853,12 +873,11 @@ func (a *AndroidEmulator) RunInstrumentation(
 
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(
-		runCtx, "./gradlew",
-		":app:connectedDebugAndroidTest",
-		"-Pandroid.testInstrumentationRunnerArguments.class="+testClass,
-		"--no-daemon",
+	gradleArgs := append(
+		[]string{"./gradlew"},
+		gradleConnectedTestArgs(a.gradleModule, testClass)...,
 	)
+	cmd := exec.CommandContext(runCtx, gradleArgs[0], gradleArgs[1:]...)
 	cmd.Env = append(os.Environ(), "ANDROID_SERIAL="+target)
 	out, err := cmd.CombinedOutput()
 	output := string(out)
@@ -867,6 +886,15 @@ func (a *AndroidEmulator) RunInstrumentation(
 		err = fmt.Errorf("gradle exit zero but BUILD SUCCESSFUL not in output")
 	}
 	return output, passed, err
+}
+
+// setGradleModule sets the bare gradle module RunInstrumentation
+// targets. Empty is a no-op (the constructor default stands). The
+// matrix runner calls this to propagate MatrixConfig.GradleModule.
+func (a *AndroidEmulator) setGradleModule(module string) {
+	if module != "" {
+		a.gradleModule = module
+	}
 }
 
 // Teardown stops the emulator via `adb -s localhost:<port> emu kill`,

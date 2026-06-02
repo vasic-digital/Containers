@@ -464,6 +464,74 @@ func TestContainerized_RunInstrumentation_SetsAndroidSerialAndChecksBuildSuccess
 	})
 }
 
+// TestContainerized_RunInstrumentation_HonorsGradleModule pins the
+// §6.X-debt / decoupling fix: the CLI's --gradle-module flag (and the
+// MatrixConfig.GradleModule field it threads into) MUST change the
+// gradle task the emulator invokes. A consumer that ships its
+// instrumentation under a non-"app" module (e.g. Lava's :api-app
+// challenge classes) discovers ZERO tests when the module is hardwired
+// to :app — a false-green by construction. This test drives the
+// non-default module and asserts the synthesized shell command targets
+// `:api-app:connectedDebugAndroidTest` and NOT `:app:`.
+//
+// Generic/decoupled: the test uses a neutral consumer module name; the
+// production code MUST NOT special-case it.
+func TestContainerized_RunInstrumentation_HonorsGradleModule(t *testing.T) {
+	t.Run("non-default module substitutes the gradle task", func(t *testing.T) {
+		fake := &fakeExecutor{
+			scripts: map[string]fakeScript{
+				"/bin/sh": {Out: []byte("> Task :api-app:connectedDebugAndroidTest\nBUILD SUCCESSFUL in 9s\n")},
+			},
+		}
+		c, _ := NewContainerized(ContainerizedConfig{
+			RuntimeBinary: "podman",
+			Image:         "any:tag",
+			Executor:      fake,
+			GradleModule:  "api-app",
+		})
+		_, _, err := c.RunInstrumentation(
+			context.Background(), 5555, "some.consumer.ChallengeTest", 60*time.Second,
+		)
+		if err != nil {
+			t.Fatalf("RunInstrumentation: %v", err)
+		}
+		shCall := firstCallMatching(t, fake.calls, "/bin/sh")
+		if len(shCall.Args) < 2 {
+			t.Fatalf("expected shell -c form; got args: %v", shCall.Args)
+		}
+		cmd := shCall.Args[1]
+		if !strings.Contains(cmd, ":api-app:connectedDebugAndroidTest") {
+			t.Errorf("gradle command must target :api-app:connectedDebugAndroidTest; got: %q", cmd)
+		}
+		if strings.Contains(cmd, ":app:connectedDebugAndroidTest") {
+			t.Errorf("gradle command must NOT target the hardwired :app:connectedDebugAndroidTest; got: %q", cmd)
+		}
+	})
+	t.Run("empty module preserves the :app default", func(t *testing.T) {
+		fake := &fakeExecutor{
+			scripts: map[string]fakeScript{
+				"/bin/sh": {Out: []byte("> Task :app:connectedDebugAndroidTest\nBUILD SUCCESSFUL in 9s\n")},
+			},
+		}
+		c, _ := NewContainerized(ContainerizedConfig{
+			RuntimeBinary: "podman",
+			Image:         "any:tag",
+			Executor:      fake,
+			// GradleModule omitted — defaults to "app".
+		})
+		_, _, err := c.RunInstrumentation(
+			context.Background(), 5555, "some.consumer.ChallengeTest", 60*time.Second,
+		)
+		if err != nil {
+			t.Fatalf("RunInstrumentation: %v", err)
+		}
+		shCall := firstCallMatching(t, fake.calls, "/bin/sh")
+		if len(shCall.Args) < 2 || !strings.Contains(shCall.Args[1], ":app:connectedDebugAndroidTest") {
+			t.Errorf("empty module must default to :app:connectedDebugAndroidTest; got: %v", shCall.Args)
+		}
+	})
+}
+
 // TestContainerized_satisfies_Emulator is the compile-time + runtime
 // assertion that Containerized fits the Emulator interface — without
 // it a future refactor of either side could silently break the matrix

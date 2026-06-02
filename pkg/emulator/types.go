@@ -151,6 +151,17 @@ type MatrixConfig struct {
 	// connectedAndroidTest task discovers tests).
 	TestClass string
 
+	// GradleModule is the bare gradle module whose
+	// connectedDebugAndroidTest task runs (e.g. "app", "api-app").
+	// Empty defaults to "app", preserving all prior behavior. The
+	// RunMatrix caller propagates this onto the Emulator before
+	// instrumentation so a consumer whose tests live outside the
+	// default "app" module is not silently run against :app (which
+	// discovers zero of its tests — a false-green by construction).
+	// Generic per the Decoupled Reusable Architecture rule: no
+	// consumer module name is baked in as a default or special case.
+	GradleModule string
+
 	// EvidenceDir is where the matrix runner writes its per-AVD
 	// attestation rows + log files. Per clause 6.I clause 4: one row
 	// per AVD-test pair.

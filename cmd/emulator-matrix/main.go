@@ -82,6 +82,10 @@ func main() {
 	flagAPK := flag.String("apk", "", "Host path to the debug APK to install")
 	flagTestClass := flag.String("test-class", "",
 		"Fully-qualified instrumentation test class")
+	flagGradleModule := flag.String("gradle-module", "app",
+		"Bare gradle module whose connectedDebugAndroidTest task runs "+
+			"(e.g. \"app\", \"api-app\"); the runner targets "+
+			":<module>:connectedDebugAndroidTest")
 	flagEvidence := flag.String("evidence-dir", "",
 		"Where to write per-AVD attestation rows (real-device-verification.json)")
 	flagAVDs := flag.String("avds", "",
@@ -205,6 +209,7 @@ func main() {
 		c, ferr := emulator.NewContainerized(emulator.ContainerizedConfig{
 			RuntimeBinary: *flagContainerRuntime,
 			Image:         *flagContainerImage,
+			GradleModule:  *flagGradleModule,
 		})
 		if ferr != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: NewContainerized: %v\n", ferr)
@@ -214,7 +219,7 @@ func main() {
 		fmt.Printf("[§6.X] runner=containerized image=%s runtime=%s\n",
 			*flagContainerImage, *flagContainerRuntime)
 	} else {
-		emu = emulator.NewAndroidEmulator(*flagSdkRoot)
+		emu = emulator.NewAndroidEmulatorWithModule(*flagSdkRoot, *flagGradleModule)
 		// host-direct is OS-correct on macOS (HVF) and Windows (WHPX) —
 		// there it IS the accelerated, gate-eligible runner, not a
 		// workstation-iteration fallback. It is a workstation-iteration
@@ -234,6 +239,7 @@ func main() {
 		AndroidSdkRoot:    *flagSdkRoot,
 		APKPath:           *flagAPK,
 		TestClass:         *flagTestClass,
+		GradleModule:      *flagGradleModule,
 		EvidenceDir:       *flagEvidence,
 		BootTimeout:       *flagBootTimeout,
 		TestTimeout:       *flagTestTimeout,

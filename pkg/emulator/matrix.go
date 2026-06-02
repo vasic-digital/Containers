@@ -199,6 +199,15 @@ func (r *AndroidMatrixRunner) runOne(
 	// state the test will encounter).
 	diag := r.captureDiagnostic(ctx, boot.ADBPort, avd)
 
+	// Propagate the consumer's gradle module onto the emulator so
+	// RunInstrumentation targets `:<module>:connectedDebugAndroidTest`.
+	// Empty GradleModule is a no-op (the emulator's construction-time
+	// default "app" stands). An Emulator implementation that does not
+	// satisfy gradleModuleSetter is run with its constructed module.
+	if setter, ok := r.emulator.(gradleModuleSetter); ok {
+		setter.setGradleModule(config.GradleModule)
+	}
+
 	startedTest := time.Now()
 	out, passed, runErr := r.emulator.RunInstrumentation(
 		ctx, boot.ADBPort, config.TestClass, testTimeout,
