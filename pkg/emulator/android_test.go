@@ -118,6 +118,22 @@ func firstCallMatching(t *testing.T, calls []fakeCall, target string) fakeCall {
 	return fakeCall{}
 }
 
+// disableADBHygiene replaces adbHygieneHook with a no-op for the duration of
+// the test and restores the original on cleanup. Call this in Boot tests that
+// use sequencedScripts for "adb devices" so the hygiene pre-call doesn't
+// consume the first entry in the sequence.
+//
+// Tests that ARE specifically exercising ADB hygiene MUST NOT call this —
+// they should call ResetADBHygiene (or the hook) directly.
+func disableADBHygiene(t *testing.T) {
+	t.Helper()
+	prev := adbHygieneHook
+	adbHygieneHook = func(_ context.Context, _ string, _ CommandExecutor) ADBHygieneResult {
+		return ADBHygieneResult{} // no-op in tests
+	}
+	t.Cleanup(func() { adbHygieneHook = prev })
+}
+
 // Start mirrors the production Start contract — records the call and
 // returns the script's err (if any). The production Start launches a
 // long-running process and returns nil immediately on success; the
@@ -140,6 +156,11 @@ func (f *fakeExecutor) Start(_ context.Context, name string, args ...string) err
 //             flag string changes.
 //   Reverted: yes (see git log).
 func TestAndroidEmulator_Boot_PassesExpectedFlagsToEmulatorBinary(t *testing.T) {
+	// Disable the pre-boot ADB hygiene reset so it doesn't consume the first
+	// entry in the sequenced "adb devices" script before Boot's pre-snapshot
+	// call does. Tests that exercise ADB hygiene do so directly.
+	disableADBHygiene(t)
+
 	exec := &fakeExecutor{
 		scripts: map[string]fakeScript{},
 		sequencedScripts: map[string][]fakeScript{
@@ -181,6 +202,8 @@ func TestAndroidEmulator_Boot_PassesExpectedFlagsToEmulatorBinary(t *testing.T) 
 //   Observed-Failure: this test fails because -no-snapshot would be
 //             present even though ColdBoot was false.
 func TestAndroidEmulator_Boot_WithoutColdBoot_OmitsNoSnapshotFlag(t *testing.T) {
+	disableADBHygiene(t)
+
 	exec := &fakeExecutor{
 		scripts: map[string]fakeScript{},
 		sequencedScripts: map[string][]fakeScript{
@@ -386,6 +409,8 @@ func init() {
 //             "expected 5557 but got 5555" — the assertion below.
 //   Reverted: yes, post-revert this test passes again.
 func TestAndroidEmulator_Boot_DiscoversNewSerial_WhenPriorEmulatorPersists(t *testing.T) {
+	disableADBHygiene(t)
+
 	// Simulate the bug scenario: a prior matrix iteration's emulator
 	// is STILL running on 5554 (Teardown failed silently). The new
 	// AVD's emulator lands on 5556 because 5554/5555 is busy.
@@ -542,6 +567,8 @@ func TestTeardown_FastPath_SucceedsAfterKillByPort(t *testing.T) {
 }
 
 func TestAndroidEmulator_Boot_FailsWhenNoNewSerialAppears(t *testing.T) {
+	disableADBHygiene(t)
+
 	exec := &fakeExecutor{
 		scripts: map[string]fakeScript{},
 		sequencedScripts: map[string][]fakeScript{
@@ -727,13 +754,19 @@ func TestEnsureSystemImageViaCache_RoutesMissingImageThroughCache(t *testing.T) 
 //	          field-count and field-set assertions fire.
 //	Reverted: yes — post-revert this test passes again.
 func TestBootResult_AttestationSchemaUnchanged(t *testing.T) {
+	// BootDiag was added 2026-06-03 for boot-timeout forensic capture (per
+	// clause 6.I Group-B diag intent). It is a pointer field that is only
+	// set on error paths — nil on every successful boot — so it does NOT
+	// appear in attestation rows for passing runs. Its presence here is
+	// intentional: adding a nil-safe diagnostic field is not a breaking
+	// schema change for existing consumers.
 	expectedFields := []string{
-		"AVD", "ADBPort", "BootCompleted", "BootDuration",
+		"AVD", "ADBPort", "BootCompleted", "BootDiag", "BootDuration",
 		"ConsolePort", "Error", "Started",
 	}
 	bootResultType := reflect.TypeOf(BootResult{})
 	require.Equal(t, len(expectedFields), bootResultType.NumField(),
-		"BootResult field count drifted from pre-Phase-B; expected %d, got %d. "+
+		"BootResult field count drifted; expected %d, got %d. "+
 			"Adding fields breaks downstream attestation schema consumers "+
 			"(matrix.go writeAttestation + scripts/tag.sh).",
 		len(expectedFields), bootResultType.NumField())
@@ -745,7 +778,7 @@ func TestBootResult_AttestationSchemaUnchanged(t *testing.T) {
 	wantSorted := append([]string{}, expectedFields...)
 	sort.Strings(wantSorted)
 	assert.Equal(t, wantSorted, got,
-		"BootResult field-set drifted from pre-Phase-B. The Phase B refactor "+
+		"BootResult field-set drifted. The Phase B refactor "+
 			"is API-preserving by spec; any new field is a constitutional "+
 			"violation that breaks the attestation schema downstream consumers depend on.")
 }

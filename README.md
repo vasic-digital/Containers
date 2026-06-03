@@ -358,6 +358,13 @@ parent Lava clauses 6.I (Multi-Emulator Container Matrix), 6.K
 
 ### Boot reliability features
 
+- **Pre-boot ADB hygiene** (added 2026-06-03): `Boot()` calls `ResetADBHygiene()`
+  before launching the emulator. This disconnects any phantom TCP entries (e.g.
+  `localhost:5555 offline`) that wedge adb's device tracking, then cycles
+  `adb kill-server` / `adb start-server` so the daemon starts from a clean
+  state. Forensic anchor: a phantom `localhost:5555 offline` entry caused
+  `discoverNewSerial` to never observe the new emulator, producing boot-timeout
+  on every attempt even after the emulator had started.
 - **Pre-boot zombie cleanup**: `runOne` calls `Cleanup()` before every
   emulator boot to remove stale `qemu-system-*` processes left by interrupted
   runs. This prevents ADB-port collisions on multi-AVD matrix iterations.
@@ -366,6 +373,25 @@ parent Lava clauses 6.I (Multi-Emulator Container Matrix), 6.K
   previous shutdown cannot block the next boot.
 - **Configurable boot timeout**: `MatrixConfig.BootTimeout` / `--boot-timeout`
   flag is honored on both the host-direct and containerized paths.
+- **Reap on boot-timeout** (added 2026-06-03): when `Boot()` port-discovery
+  times out, `Cleanup()` reaps any orphaned `qemu-system-*` processes to
+  prevent hot zombies consuming CPU/RAM and holding AVD lock files. When
+  `WaitForBoot()` times out, `KillByPort(consolePort)` terminates the specific
+  emulator by its console-port argv token; if that matches zero processes,
+  `Cleanup()` is the fallback. Forensic anchor: an unreapped emulator was
+  observed at ~370% CPU after a matrix FAIL row, causing the next boot to also
+  time out (CPU starvation).
+- **Offline transport classification** (added 2026-06-03): `ParseADBDevicesLine`
+  classifies `adb devices` lines into `ADBStateDevice`, `ADBStateOffline`,
+  `ADBStatePhantomTCP`, and `ADBStateUnauthorized`. TCP endpoints in offline
+  state (`ADBStatePhantomTCP`) are explicitly disconnected by `ResetADBHygiene`
+  before kill-server so they cannot re-wedge the daemon immediately after restart.
+- **Boot diagnostic capture** (added 2026-06-03): on `Boot()` or `WaitForBoot()`
+  timeout, `CaptureBootDiagnostic()` captures `adb devices` output and a
+  `getprop` snapshot into a `boot-diag-<ts>.json` file in the per-AVD evidence
+  directory. The `BootResult.BootDiag` field (non-nil only on error paths)
+  surfaces this diagnostic to the matrix runner for embedding in the attestation
+  row — satisfying clause 6.I Group-B `diag` intent.
 - **Reliable teardown**: `Teardown` polls `adb devices` until the emulator
   transitions out of "device" state before returning, preventing the next
   boot from colliding with a still-running emulator. `KillByPort` provides

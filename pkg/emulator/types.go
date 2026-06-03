@@ -46,13 +46,18 @@ type AVD struct {
 // BootResult captures the outcome of a single emulator boot attempt.
 // A successful boot requires `getprop sys.boot_completed == 1`.
 type BootResult struct {
-	AVD          AVD
-	Started      bool
+	AVD           AVD
+	Started       bool
 	BootCompleted bool
-	BootDuration time.Duration
-	ConsolePort  int
-	ADBPort      int
-	Error        error
+	BootDuration  time.Duration
+	ConsolePort   int
+	ADBPort       int
+	Error         error
+	// BootDiag is the forensic snapshot captured when Boot() or WaitForBoot()
+	// times out. Non-nil only on timeout/error paths — never set on success.
+	// Surfaced so the matrix runner can embed it in the attestation row per
+	// clause 6.I Group-B diag intent.
+	BootDiag *BootDiagnostic
 }
 
 // DiagnosticInfo is the per-AVD forensic snapshot captured immediately

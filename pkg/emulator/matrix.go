@@ -153,6 +153,30 @@ func (r *AndroidMatrixRunner) runOne(
 	boot.BootDuration += waitDuration
 	if err != nil {
 		boot.Error = err
+
+		// Capture boot diagnostics so the attestation row carries forensic
+		// evidence of WHY boot timed out (clause 6.I Group-B diag intent).
+		// Write the diagnostic file into the per-AVD evidence directory so
+		// the next operator can read it without re-running.
+		avdEvidenceDir := ""
+		if config.EvidenceDir != "" {
+			avdEvidenceDir = filepath.Join(config.EvidenceDir, avd.Name)
+		}
+		var adbBin string
+		if ae, ok := r.emulator.(*AndroidEmulator); ok {
+			adbBin = ae.adbBinary()
+		}
+		if adbBin != "" {
+			var execForDiag CommandExecutor
+			if ae, ok := r.emulator.(*AndroidEmulator); ok {
+				execForDiag = ae.executor
+			}
+			if execForDiag != nil {
+				bootDiag := CaptureBootDiagnostic(ctx, adbBin, execForDiag, boot.ADBPort, avdEvidenceDir)
+				boot.BootDiag = &bootDiag
+			}
+		}
+
 		_ = r.emulator.Teardown(ctx, boot.ADBPort)
 		return boot, TestResult{
 			AVD:        avd,

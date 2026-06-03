@@ -37,6 +37,24 @@ import (
 // QEMU processes to test the fast-path branch.
 var killByPortHook = KillByPort
 
+// adbHygieneHook is the package-level seam that lets tests bypass the
+// pre-boot ADB hygiene reset (ResetADBHygiene) without needing to add
+// kill-server/start-server entries to every test's fakeExecutor.scripts.
+//
+// Production Boot() calls the real ResetADBHygiene. Tests that are not
+// specifically testing ADB hygiene set this to a no-op:
+//
+//	prev := adbHygieneHook
+//	adbHygieneHook = func(ctx context.Context, adbBinary string, exec CommandExecutor) ADBHygieneResult {
+//	    return ADBHygieneResult{} // no-op
+//	}
+//	defer func() { adbHygieneHook = prev }()
+//
+// Anti-bluff: the seam exists only for testing. Production Boot() always
+// calls the real implementation. Tests that ARE testing ADB hygiene bypass
+// this seam entirely and call ResetADBHygiene directly.
+var adbHygieneHook = ResetADBHygiene
+
 // loadManifestHook is the package-level seam tests use to substitute a
 // fake manifest loader. Production code uses cache.LoadManifest; tests
 // override to inject a manifest without writing a JSON file.
@@ -697,11 +715,51 @@ func (a *AndroidEmulator) discoverNewSerial(
 // bluff (see emulatorSerials KDoc above). Without dynamic discovery,
 // multi-AVD matrix runs silently test against the FIRST emulator
 // every iteration.
+//
+// Robustness fixes (2026-06-03 forensic findings):
+//
+//  1. ADB hygiene: before launching the emulator, reset adb state by
+//     disconnecting phantom TCP entries and cycling kill-server/start-server.
+//     Phantom offline TCP entries (e.g. "localhost:5555 offline") wedge adb's
+//     device tracking so discoverNewSerial never sees the new emulator.
+//
+//  2. Reap on timeout: when discoverNewSerial times out, the launched
+//     qemu-system-* process is still alive consuming CPU/RAM. Boot now calls
+//     Cleanup() to reap any orphaned qemu-system-* processes so they cannot
+//     cause CPU starvation on the next boot attempt.
+//
+//  3. Diagnostic capture: on port-discovery timeout, a BootDiagnostic is
+//     captured and embedded in the returned BootResult so the matrix runner
+//     can record WHY the boot timed out in the attestation row.
 func (a *AndroidEmulator) Boot(
 	ctx context.Context,
 	avd AVD,
 	coldBoot bool,
 ) (BootResult, error) {
+	// Pre-boot ADB hygiene: disconnect phantom TCP entries and cycle
+	// kill-server / start-server so device tracking starts from a clean
+	// state. This prevents the "phantom localhost:5555 offline" wedge that
+	// caused discoverNewSerial to never see a new emulator.
+	//
+	// Best-effort: a hygiene failure is logged but does NOT abort the boot —
+	// the emulator may still succeed if the phantom entry was already gone.
+	//
+	// adbHygieneHook is a package-level seam; tests that don't test hygiene
+	// itself can swap it to a no-op so they don't need kill-server/start-server
+	// entries in their fakeExecutor. See the seam declaration above.
+	hygieneResult := adbHygieneHook(ctx, a.adbBinary(), a.executor)
+	if hygieneResult.Err != nil {
+		fmt.Fprintf(os.Stderr,
+			"[boot] adb hygiene reset failed (continuing): %v\n",
+			hygieneResult.Err,
+		)
+	} else if len(hygieneResult.PhantomTCPDisconnected) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"[boot] disconnected phantom TCP entries: %v\n",
+			hygieneResult.PhantomTCPDisconnected,
+		)
+	}
+
 	// Snapshot existing emulator ports BEFORE launch so we can detect
 	// the new one after launch. Errors here are non-fatal — empty map
 	// is a safe baseline (we'll just claim the first emulator we see).
@@ -737,11 +795,40 @@ func (a *AndroidEmulator) Boot(
 	// and we fail loudly rather than silently mis-target later calls.
 	newPort, derr := a.discoverNewSerial(ctx, before, 60*time.Second)
 	if derr != nil {
+		// Reap the launched emulator process to prevent a hot zombie from
+		// consuming CPU/RAM and holding AVD lock files, which would cause
+		// the NEXT boot attempt to also time out.
+		//
+		// We use Cleanup() here (not KillByPort) because we don't know the
+		// port — the discovery timeout means we never learned which port the
+		// emulator bound to. Cleanup() uses the strict "qemu-system-" comm
+		// prefix so only Android emulator processes are targeted.
+		cleanupReport, cleanupErr := Cleanup(ctx)
+		if cleanupErr != nil {
+			fmt.Fprintf(os.Stderr,
+				"[boot] cleanup after port-discovery timeout: %v\n",
+				cleanupErr,
+			)
+		} else {
+			fmt.Fprintf(os.Stderr,
+				"[boot] cleanup after port-discovery timeout: "+
+					"found=%v terminated=%v killed=%v surviving=%v\n",
+				cleanupReport.Found,
+				cleanupReport.TerminatedTERM,
+				cleanupReport.KilledKILL,
+				cleanupReport.Surviving,
+			)
+		}
+
+		// Capture diagnostic snapshot so the operator can see WHY the
+		// boot timed out (per clause 6.I Group-B diag intent).
+		diag := CaptureBootDiagnostic(ctx, a.adbBinary(), a.executor, 0, "")
 		return BootResult{
 			AVD:          avd,
 			Started:      true,
 			BootDuration: time.Since(startedAt),
 			Error:        fmt.Errorf("emulator port discovery failed: %w", derr),
+			BootDiag:     &diag,
 		}, derr
 	}
 
@@ -787,7 +874,18 @@ func (a *AndroidEmulator) WaitForBoot(
 	// socket comes up actually establishes the connection; subsequent
 	// `-s` calls then succeed and the boot-completed prop is read.
 	for time.Now().Before(deadline) {
-		_, _ = a.executor.Execute(ctx, a.adbBinary(), "connect", target)
+		connectOut, connectErr := a.executor.Execute(ctx, a.adbBinary(), "connect", target)
+		// Classify the transport state returned by `adb connect` so we can
+		// surface offline vs not-yet-visible in the diagnostic log.
+		connectOutStr := strings.TrimSpace(string(connectOut))
+		if connectErr != nil {
+			fmt.Fprintf(os.Stderr,
+				"[wait-for-boot] adb connect %s: %v\n", target, connectErr)
+		} else if strings.Contains(connectOutStr, "offline") {
+			fmt.Fprintf(os.Stderr,
+				"[wait-for-boot] adb connect %s: offline (not yet ready)\n", target)
+		}
+
 		out, err := a.executor.Execute(
 			ctx, a.adbBinary(), "-s", target,
 			"shell", "getprop", "sys.boot_completed",
@@ -801,6 +899,52 @@ func (a *AndroidEmulator) WaitForBoot(
 		case <-time.After(5 * time.Second):
 		}
 	}
+
+	// Boot timed out. Reap the emulator process to prevent a hot zombie:
+	// the qemu-system-* process is still alive consuming ~370% CPU and
+	// holding AVD lock files. KillByPort targets the specific emulator by
+	// its console port (port-1 of the ADB port) to avoid touching sibling
+	// emulators on other ports.
+	//
+	// consolePort = adbPort - 1 (the canonical relationship between the
+	// emulator's console port and its ADB port).
+	consolePort := port - 1
+	killReport, killErr := KillByPort(ctx, consolePort)
+	if killErr != nil {
+		fmt.Fprintf(os.Stderr,
+			"[wait-for-boot] KillByPort(%d) after timeout: %v\n",
+			consolePort, killErr,
+		)
+	} else if killReport.Matched > 0 {
+		fmt.Fprintf(os.Stderr,
+			"[wait-for-boot] KillByPort(%d): matched=%d sigtermed=%v sigkilled=%v surviving=%v\n",
+			consolePort,
+			killReport.Matched,
+			killReport.Sigtermed,
+			killReport.Sigkilled,
+			killReport.Surviving,
+		)
+	} else {
+		// Matched=0 means KillByPort found no process with "-port <consolePort>".
+		// This is possible if the emulator used a different port or if the
+		// process already exited on its own. Fall back to Cleanup() which uses
+		// the broader "qemu-system-" comm prefix.
+		cleanupReport, cleanupErr := Cleanup(ctx)
+		if cleanupErr != nil {
+			fmt.Fprintf(os.Stderr,
+				"[wait-for-boot] Cleanup() fallback after KillByPort matched=0: %v\n",
+				cleanupErr,
+			)
+		} else if len(cleanupReport.Found) > 0 {
+			fmt.Fprintf(os.Stderr,
+				"[wait-for-boot] Cleanup() fallback: found=%v terminated=%v killed=%v\n",
+				cleanupReport.Found,
+				cleanupReport.TerminatedTERM,
+				cleanupReport.KilledKILL,
+			)
+		}
+	}
+
 	return time.Since(startedAt),
 		fmt.Errorf("boot not completed within %s", timeout)
 }
