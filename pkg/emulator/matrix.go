@@ -102,6 +102,26 @@ func (r *AndroidMatrixRunner) runOne(
 	// manifestPath is empty). This is the production wiring that the
 	// schema-stub TestRunMatrix_RoutesMissingSystemImageThroughCache_*
 	// test exercises end-to-end via runOne.
+	// Pre-boot cleanup: remove zombie qemu-system-* processes from any
+	// prior interrupted matrix run before launching the new emulator.
+	// Per clause 6.M clause 2, this replaces ad-hoc `pkill qemu-system`
+	// invocations that the Forbidden Command List would reject. Best-
+	// effort: a Cleanup error is logged to stderr but does not abort
+	// the matrix row — the subsequent Boot will discover the new
+	// emulator's serial via dynamic discovery regardless of stale
+	// processes.
+	if _, cleanupErr := Cleanup(ctx); cleanupErr != nil {
+		fmt.Fprintf(os.Stderr,
+			"[matrix] pre-boot cleanup warning for %s: %v\n",
+			avd.Name, cleanupErr,
+		)
+	}
+	// Clear any stale AVD lock file that a prior interrupted run may
+	// have left. A lock left by an unclean shutdown causes the emulator
+	// to refuse boot with "the AVD is already running". Best-effort:
+	// a remove failure is not fatal.
+	clearAVDLock(avd.Name)
+
 	if ae, ok := r.emulator.(*AndroidEmulator); ok && config.ImageManifestPath != "" {
 		if cacheErr := ae.ensureSystemImageViaCache(ctx, avd, config.ImageManifestPath); cacheErr != nil {
 			return BootResult{

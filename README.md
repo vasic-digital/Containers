@@ -337,6 +337,82 @@ The challenge respects the host-power-management hard ban (CONST-033 / §12),
 performs no sudo / suspend / hibernate / poweroff calls, never echoes secrets
 (§11.4.10), and runs in O(seconds) without any container start.
 
+## Android Emulator (pkg/emulator)
+
+`pkg/emulator` provides multi-target Android emulator orchestration satisfying
+parent Lava clauses 6.I (Multi-Emulator Container Matrix), 6.K
+(Builds-Inside-Containers Mandate), 6.V (Container Emulators Mandate), and
+6.X (Container-Submodule Emulator Wiring Mandate).
+
+### Emulator variants
+
+| Host OS       | Acceleration | Runner           | Gate-eligible |
+|---------------|-------------|------------------|:---:|
+| Linux x86_64  | KVM (`/dev/kvm`) | `containerized` | ✓ |
+| macOS arm64   | HVF (host-only API) | `host-direct` | ✓ |
+| Windows       | WHPX (host-only API) | `host-direct` | ✓ |
+
+`AccelProfileForOS(runtime.GOOS)` returns the deterministic OS-correct profile.
+`ResolveRunner("auto", runtime.GOOS)` picks the OS-correct runner. See
+`pkg/emulator/accel.go` for the complete rationale.
+
+### Boot reliability features
+
+- **Pre-boot zombie cleanup**: `runOne` calls `Cleanup()` before every
+  emulator boot to remove stale `qemu-system-*` processes left by interrupted
+  runs. This prevents ADB-port collisions on multi-AVD matrix iterations.
+- **AVD lock clearing**: `clearAVDLock(avdName)` removes
+  `$HOME/.android/avd/<name>.avd/<name>.lock` before boot so an unclean
+  previous shutdown cannot block the next boot.
+- **Configurable boot timeout**: `MatrixConfig.BootTimeout` / `--boot-timeout`
+  flag is honored on both the host-direct and containerized paths.
+- **Reliable teardown**: `Teardown` polls `adb devices` until the emulator
+  transitions out of "device" state before returning, preventing the next
+  boot from colliding with a still-running emulator. `KillByPort` provides
+  a port-strict SIGTERM/SIGKILL fast-path for stuck processes.
+
+### Release cold-start canary (`cmd/emulator-canary`)
+
+The canary closes the §6.Z tooling gap: debug-signed `androidTest` APKs
+cannot test release-signed APKs (signature mismatch), so the canary uses
+`adb shell am start` + logcat to exercise the release build directly.
+
+```bash
+emulator-canary \
+  --android-sdk-root $ANDROID_SDK_ROOT \
+  --apk releases/1.2.36/android-release/app-release.apk \
+  --package digital.vasic.lava.client \
+  --activity .MainActivity \
+  --avd Pixel_8:35:phone \
+  --evidence-dir .lava-ci-evidence/canary-1.2.36 \
+  --cold-boot
+```
+
+Exit codes:
+- `0` — activity reached RESUMED state AND no FATAL in logcat (canary PASS)
+- `1` — activity did not resume OR FATAL crash detected (canary FAIL)
+- `2` — configuration error
+
+The canary writes a `canary-attestation.json` and `logcat.txt` under
+`--evidence-dir`. The primary anti-bluff assertion is on user-visible state:
+"activity resumed AND logcat FATAL-free" — NOT "APK installed without error".
+
+### Matrix runner (`cmd/emulator-matrix`)
+
+```bash
+emulator-matrix \
+  --android-sdk-root /opt/android-sdk \
+  --apk releases/1.2.36/android-debug/app-debug.apk \
+  --test-class lava.app.challenges.Challenge01AppLaunchAndTrackerSelectionTest \
+  --evidence-dir .lava-ci-evidence/1.2.36 \
+  --avds Pixel_8:35:phone,Pixel_Tablet:34:tablet \
+  --runner auto \
+  --cold-boot
+```
+
+`--runner auto` selects the OS-correct runner: `containerized` on Linux
+(requires `--container-image`), `host-direct` on macOS/Windows.
+
 ## License
 
 MIT
