@@ -2,9 +2,7 @@ package emulator
 
 import (
 	"context"
-	"fmt"
-	"os"
-	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -13,78 +11,24 @@ import (
 
 // CleanupReport summarises the outcome of a Cleanup invocation.
 type CleanupReport struct {
-	Found          []int // PIDs whose /proc/<pid>/comm matched "qemu-system-*"
+	Found          []int // PIDs whose comm matched "qemu-system-*"
 	TerminatedTERM []int // PIDs that exited within the SIGTERM grace window
 	KilledKILL     []int // PIDs that required SIGKILL
 	Surviving      []int // PIDs still alive after SIGKILL (rare; permission errors)
-	SkippedReadErr []int // PIDs whose /proc/<pid>/comm couldn't be read (permission/race)
+	SkippedReadErr []int // PIDs whose comm couldn't be read (permission/race)
 }
 
-// procWalker abstracts /proc enumeration so cleanup_test.go can inject
-// synthetic /proc data. Production walks the real /proc.
+// procWalker abstracts process enumeration so cleanup_test.go can inject
+// synthetic data. Production uses the OS-appropriate implementation from
+// cleanup_os.go (Linux: procFSWalker via /proc; macOS/other: psWalker via
+// `ps -A`).
 //
-// PidComms returns pid → /proc/<pid>/comm (process name only, used by
-// Cleanup's prefix matcher). PidCmdlines returns pid → argv slice
-// (split on NUL bytes, used by KillByPort's strict adjacent-token
-// matcher).
+// PidComms returns pid → process name (used by Cleanup's prefix matcher).
+// PidCmdlines returns pid → argv slice (used by KillByPort's strict
+// adjacent-token matcher).
 type procWalker interface {
 	PidComms() (map[int]string, error)
 	PidCmdlines() (map[int][]string, error)
-}
-
-type osProcWalker struct{}
-
-func (osProcWalker) PidComms() (map[int]string, error) {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return nil, fmt.Errorf("read /proc: %w", err)
-	}
-	out := make(map[int]string)
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid <= 0 {
-			continue
-		}
-		commPath := filepath.Join("/proc", e.Name(), "comm")
-		b, err := os.ReadFile(commPath)
-		if err != nil {
-			// Best-effort: process may have exited mid-walk
-			out[pid] = ""
-			continue
-		}
-		out[pid] = strings.TrimSpace(string(b))
-	}
-	return out, nil
-}
-
-func (osProcWalker) PidCmdlines() (map[int][]string, error) {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return nil, fmt.Errorf("read /proc: %w", err)
-	}
-	out := make(map[int][]string)
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid <= 0 {
-			continue
-		}
-		cmdPath := filepath.Join("/proc", e.Name(), "cmdline")
-		b, err := os.ReadFile(cmdPath)
-		if err != nil {
-			// Best-effort: process may have exited mid-walk; record
-			// empty argv so the matcher simply skips it.
-			out[pid] = nil
-			continue
-		}
-		// /proc/<pid>/cmdline is NUL-separated. Trailing NUL is common.
-		raw := strings.TrimRight(string(b), "\x00")
-		if raw == "" {
-			out[pid] = nil
-			continue
-		}
-		out[pid] = strings.Split(raw, "\x00")
-	}
-	return out, nil
 }
 
 // killer abstracts signalling for testability.
@@ -103,9 +47,14 @@ func (osKiller) Exists(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
 }
 
-// Cleanup walks /proc, finds processes whose comm has the prefix
-// "qemu-system-", sends SIGTERM, waits up to 5 seconds for graceful
-// exit, then SIGKILLs stragglers. Returns a CleanupReport.
+// Cleanup finds processes whose comm has the prefix "qemu-system-",
+// sends SIGTERM, waits up to 5 seconds for graceful exit, then
+// SIGKILLs stragglers. Returns a CleanupReport.
+//
+// On Linux the process list is walked via /proc (procFSWalker); on
+// macOS and other POSIX systems it is obtained via `ps -A` (psWalker).
+// The per-OS dispatch happens inside newOSProcWalker (cleanup_os.go) so
+// Cleanup itself has no OS-specific branches.
 //
 // This API replaces the per-script ad-hoc `pkill qemu-system`
 // invocations that the Forbidden Command List would otherwise reject —
@@ -118,11 +67,11 @@ func (osKiller) Exists(pid int) bool {
 //
 //	Mutation: loosen the prefix matcher from "qemu-system-" to "qemu-"
 //	Observed: TestCleanup_StrictPrefix asserts that a synthetic
-//	          /proc fixture containing "qemu-img" is NOT collected;
+//	          fixture containing "qemu-img" is NOT collected;
 //	          the loosened matcher would include it, failing the test.
 //	Reverted: yes
 func Cleanup(ctx context.Context) (CleanupReport, error) {
-	return cleanupWithDeps(ctx, osProcWalker{}, osKiller{})
+	return cleanupWithDeps(ctx, newOSProcWalker(runtime.GOOS), osKiller{})
 }
 
 // cleanupWithDeps is the testable core. Production uses Cleanup; tests
@@ -250,7 +199,7 @@ type KillReport struct {
 //	          contains "5554" as a substring.
 //	Reverted: yes
 func KillByPort(ctx context.Context, port int) (KillReport, error) {
-	return killByPortWithDeps(ctx, port, osProcWalker{}, osKiller{})
+	return killByPortWithDeps(ctx, port, newOSProcWalker(runtime.GOOS), osKiller{})
 }
 
 // killByPortWithDeps is the testable core; production KillByPort wires

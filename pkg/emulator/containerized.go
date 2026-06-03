@@ -5,10 +5,92 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// kvmDevicePath is the path to the KVM device. Package-level so tests
+// can redirect it to a synthetic path without needing a real /dev/kvm.
+// Production value is "/dev/kvm".
+//
+// Anti-bluff: TestContainerized_KVMPresence_Absent verifies that when
+// this path does not exist, Boot omits "--device /dev/kvm" from the
+// container arguments.
+var kvmDevicePath = "/dev/kvm"
+
+// kvmAvailable returns true iff the host exposes the KVM device node
+// at kvmDevicePath. On Linux x86_64 the device is present when KVM is
+// enabled; on macOS the podman VM kernel does NOT expose /dev/kvm (HVF
+// is a macOS-host-only API, unreachable from the container's Linux VM).
+//
+// This function reads the filesystem; it does not call any kernel
+// ioctl. A stat(2) is the least-privilege check — we want to know the
+// device exists, not that we can open it for writing.
+//
+// Anti-bluff posture (§6.J/§6.L):
+//   - Production Containerized.Boot calls this to decide whether to
+//     include "--device /dev/kvm" in the `podman run` arguments.
+//   - Tests override kvmDevicePath to a temp dir path to exercise both
+//     branches without requiring a real KVM device.
+func kvmAvailable() bool {
+	_, err := os.Stat(kvmDevicePath)
+	return err == nil
+}
+
+// buildContainerRunArgs constructs the `podman run` / `docker run`
+// argument slice for Containerized.Boot. Separated from Boot so the
+// no-KVM branch is unit-testable without running a real container.
+//
+// When /dev/kvm is present, "--device /dev/kvm" is included → hardware-
+// accelerated KVM emulation (Linux x86_64 gate path).
+//
+// When /dev/kvm is absent, the flag is omitted → TCG software emulation.
+// The emulator starts with "-no-accel" injected via the container's
+// entrypoint env var ANDROID_EMULATOR_EXTRA_ARGS (if the entrypoint
+// respects it) OR relies on the emulator's own auto-fallback from
+// kvm to tcg when /dev/kvm is absent inside the container.
+//
+// Anti-bluff (Bluff-Audit — recorded in commit body):
+//
+//	Mutation: always include "--device /dev/kvm" regardless of kvmAvailable().
+//	Observed: TestContainerized_KVMPresence_Absent fails — the returned
+//	          args slice contains "--device" "/dev/kvm" when the test
+//	          expects those to be absent.
+//	Reverted: yes — post-revert the slice correctly omits the device flag.
+func buildContainerRunArgs(
+	runtimeBinary string,
+	containerName string,
+	hostPort int,
+	avd AVD,
+	coldBoot bool,
+	image string,
+) []string {
+	args := []string{
+		"run",
+		"-d",
+		"--name", containerName,
+		"--rm",
+	}
+
+	// KVM passthrough: include only when the host exposes /dev/kvm.
+	// On Linux x86_64 this enables hardware acceleration.
+	// On macOS the podman VM has no /dev/kvm (HVF is unreachable from
+	// a Linux container) — omitting the flag falls back to TCG.
+	if kvmAvailable() {
+		args = append(args, "--device", kvmDevicePath)
+	}
+
+	args = append(args,
+		"-p", fmt.Sprintf("%d:5555/tcp", hostPort),
+		"-p", fmt.Sprintf("%d:5554/tcp", hostPort-1),
+		"-e", "ANDROID_AVD_NAME="+avd.Name,
+		"-e", fmt.Sprintf("ANDROID_COLD_BOOT=%t", coldBoot),
+		image,
+	)
+	return args
+}
 
 // defaultGradleModule is the neutral module name used when a caller
 // supplies no GradleModule. It is deliberately generic — the
@@ -240,30 +322,16 @@ func (c *Containerized) Boot(
 	c.containerName = containerName
 	c.hostADBPort = hostPort
 
-	// Build `podman run -d --name X --device /dev/kvm -p ...` args.
-	// The image's entrypoint takes responsibility for invoking
-	// `emulator -avd <name>` with appropriate flags. AVD name +
-	// cold-boot flag are passed via env vars so the image can read
-	// them generically (avoids baking AVD names into the image).
-	args := []string{
-		"run",
-		"-d",
-		"--name", containerName,
-		"--rm",
-		// --device /dev/kvm is the KVM passthrough required for
-		// hardware-accelerated x86_64 emulation. On darwin/arm64
-		// this path is not satisfiable; see incident JSON.
-		"--device", "/dev/kvm",
-		// Port forwarding: host ephemeral → container 5555. We
-		// also expose 5554 (console) for forensics — the matrix
-		// runner uses it via `adb -s emulator-<port> emu kill` in
-		// Teardown.
-		"-p", fmt.Sprintf("%d:5555/tcp", hostPort),
-		"-p", fmt.Sprintf("%d:5554/tcp", hostPort-1),
-		"-e", "ANDROID_AVD_NAME=" + avd.Name,
-		"-e", fmt.Sprintf("ANDROID_COLD_BOOT=%t", coldBoot),
-		c.image,
-	}
+	// Build `podman run -d --name X [-device /dev/kvm] -p ...` args.
+	// --device /dev/kvm is included only when the KVM device is
+	// present on the host (Linux x86_64 with KVM enabled). On macOS
+	// the podman VM has no /dev/kvm; omitting the flag lets the
+	// emulator inside the container fall back to TCG software
+	// emulation. buildContainerRunArgs centralises this decision so
+	// it is unit-testable without running a real container.
+	args := buildContainerRunArgs(
+		c.runtimeBinary, containerName, hostPort, avd, coldBoot, c.image,
+	)
 
 	out, err := c.executor.Execute(ctx, c.runtimeBinary, args...)
 	if err != nil {

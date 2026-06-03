@@ -3,6 +3,7 @@ package emulator
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -60,12 +61,31 @@ func TestContainerized_NewContainerized_RejectsEmptyImage(t *testing.T) {
 //   - `-p <hostPort-1>:5554/tcp` (the console-port forward)
 //   - the image reference verbatim
 //
-// Bluff-Audit (mutation rehearsal): removing the `--device /dev/kvm`
-// arg in Boot() makes this test fail with "captured args missing
-// --device /dev/kvm" — which is the user-visible signal that the
-// container would NOT have KVM access and emulator boot would fail
-// with `qemu-system-x86_64: Could not access KVM kernel module`.
+// Bluff-Audit (mutation rehearsal): removing the conditional
+// `--device <kvm>` append in buildContainerRunArgs() makes this test
+// fail with "captured args missing --device <kvm>" — which is the
+// user-visible signal that the container would NOT have KVM access and
+// emulator boot would fail with `qemu-system-x86_64: Could not access
+// KVM kernel module`.
+//
+// §6.AH-debt note: KVM passthrough is now CONDITIONAL on the host
+// exposing the KVM device (kvmAvailable()) — on macOS the podman VM has
+// no /dev/kvm and the flag is correctly omitted (TCG fallback;
+// see TestContainerized_KVMPresence_Absent). This test pins the
+// KVM-PRESENT branch by redirecting kvmDevicePath to an existing file,
+// so the passthrough contract is asserted deterministically on any host.
 func TestContainerized_Boot_InvokesRuntimeRunWithKvmAndPortForward(t *testing.T) {
+	// Pin the KVM-present branch host-independently: point kvmDevicePath
+	// at a file that exists so kvmAvailable() is true even on a macOS
+	// host where the real /dev/kvm is absent.
+	presentKVM := t.TempDir() + "/kvm"
+	if err := os.WriteFile(presentKVM, nil, 0o644); err != nil {
+		t.Fatalf("seed fake kvm device: %v", err)
+	}
+	origKVM := kvmDevicePath
+	kvmDevicePath = presentKVM
+	t.Cleanup(func() { kvmDevicePath = origKVM })
+
 	fake := &fakeExecutor{
 		scripts: map[string]fakeScript{
 			"podman": {Out: []byte("container-id\n"), Err: nil},
@@ -107,7 +127,7 @@ func TestContainerized_Boot_InvokesRuntimeRunWithKvmAndPortForward(t *testing.T)
 	hasRm := false
 	hasColdBoot := false
 	for i, a := range call.Args {
-		if a == "--device" && i+1 < len(call.Args) && call.Args[i+1] == "/dev/kvm" {
+		if a == "--device" && i+1 < len(call.Args) && call.Args[i+1] == kvmDevicePath {
 			hasKvm = true
 		}
 		if a == "-p" && i+1 < len(call.Args) {
@@ -133,7 +153,7 @@ func TestContainerized_Boot_InvokesRuntimeRunWithKvmAndPortForward(t *testing.T)
 		}
 	}
 	if !hasKvm {
-		t.Errorf("captured args missing --device /dev/kvm (§6.X clause 1 KVM passthrough): %v", call.Args)
+		t.Errorf("captured args missing --device %s (§6.X clause 1 KVM passthrough, KVM-present branch): %v", kvmDevicePath, call.Args)
 	}
 	if !hasADBPort {
 		t.Errorf("captured args missing -p <hostPort>:5555/tcp ADB port forward: %v", call.Args)
@@ -283,7 +303,7 @@ func TestContainerized_WaitForBoot_PollsGetpropUntilCompleted(t *testing.T) {
 		},
 		sequencedScripts: map[string][]fakeScript{
 			"adb -s localhost:5555 shell getprop sys.boot_completed": {
-				{Out: []byte("\n")},     // not yet booted
+				{Out: []byte("\n")},  // not yet booted
 				{Out: []byte("1\n")}, // booted
 			},
 		},
