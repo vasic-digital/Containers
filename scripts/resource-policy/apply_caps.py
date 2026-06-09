@@ -37,12 +37,10 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
-import io
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 try:
     from ruamel.yaml import YAML
@@ -154,7 +152,7 @@ def load_policy(path: Path) -> Policy:
     if not isinstance(data, dict) or "defaults" not in data or "patterns" not in data:
         raise ValueError(f"{path}: missing 'defaults' / 'patterns' top-level keys")
 
-    def make_cap(d: dict, fallback: Optional[Cap] = None) -> Cap:
+    def make_cap(d: dict, fallback: Cap | None = None) -> Cap:
         return Cap(
             mem=str(d.get("mem", fallback.mem if fallback else "")),
             memswap=str(d.get("memswap", fallback.memswap if fallback else "")),
