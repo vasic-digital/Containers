@@ -305,7 +305,7 @@ def process_compose(
         if n_changed and not dry_run:
             with path.open("w") as fh:
                 yaml.dump(doc, fh)
-        return n_changed, log + ["  (no services section)"]
+        return n_changed, [*log, "  (no services section)"]
 
     for svc_name, svc in services.items():
         if not isinstance(svc, CommentedMap):
@@ -378,7 +378,7 @@ def main(argv: list[str]) -> int:
             print(f"loaded {len(project_skips)} skip-path fragment(s) from {args.skip_paths_file}")
             effective_skip = effective_skip + project_skips
     if args.exclude:
-        effective_skip = effective_skip + (args.exclude,)
+        effective_skip = (*effective_skip, args.exclude)
     SKIP_PATH_FRAGMENTS = effective_skip
 
     files = find_compose_files(args.root.resolve())

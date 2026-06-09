@@ -86,62 +86,61 @@ class TestPolicyMatching(unittest.TestCase):
 
     def test_default_cap(self) -> None:
         cap = self.policy.cap_for("totally-unknown-service-name")
-        self.assertEqual(cap.mem, "2g")
-        self.assertEqual(cap.pids, 1024)
-        self.assertEqual(cap.oom_adj, 500)
+        assert cap.mem == "2g"
+        assert cap.pids == 1024
+        assert cap.oom_adj == 500
 
     def test_postgres_pattern(self) -> None:
         cap = self.policy.cap_for("postgres")
-        self.assertEqual(cap.mem, "4g")
+        assert cap.mem == "4g"
         cap = self.policy.cap_for("postgres-test")
-        self.assertEqual(cap.mem, "4g")
+        assert cap.mem == "4g"
         cap = self.policy.cap_for("helixagent-postgres")
-        self.assertEqual(cap.mem, "4g")
+        assert cap.mem == "4g"
 
     def test_redis_pattern(self) -> None:
         cap = self.policy.cap_for("redis")
-        self.assertEqual(cap.mem, "1g")
+        assert cap.mem == "1g"
         cap = self.policy.cap_for("redis-test")
-        self.assertEqual(cap.mem, "1g")
+        assert cap.mem == "1g"
 
     def test_mcp_generic_pattern(self) -> None:
         cap = self.policy.cap_for("mcp-fetch")
-        self.assertEqual(cap.mem, "1g")
+        assert cap.mem == "1g"
         cap = self.policy.cap_for("mcp-some-new-server")
-        self.assertEqual(cap.mem, "1g")
+        assert cap.mem == "1g"
 
     def test_mcp_browser_specific_takes_priority(self) -> None:
         for name in ("mcp-puppeteer", "mcp-playwright", "mcp-browserbase"):
             cap = self.policy.cap_for(name)
-            self.assertEqual(cap.mem, "3g", name)
-            self.assertEqual(cap.pids, 4096, name)
+            assert cap.mem == "3g", name
+            assert cap.pids == 4096, name
 
     def test_llm_pattern(self) -> None:
         cap = self.policy.cap_for("ollama")
-        self.assertEqual(cap.mem, "12g")
-        self.assertEqual(cap.pids, 2048)
+        assert cap.mem == "12g"
+        assert cap.pids == 2048
         cap = self.policy.cap_for("vllm-runner")
-        self.assertEqual(cap.mem, "12g")
+        assert cap.mem == "12g"
 
     def test_helix_app_servers(self) -> None:
         cap = self.policy.cap_for("helixagent")
-        self.assertEqual(cap.mem, "4g")
-        self.assertEqual(cap.pids, 2048)
+        assert cap.mem == "4g"
+        assert cap.pids == 2048
         cap = self.policy.cap_for("helixllm-server")
-        self.assertEqual(cap.mem, "4g")
+        assert cap.mem == "4g"
 
     def test_case_insensitive(self) -> None:
         cap = self.policy.cap_for("POSTGRES")
-        self.assertEqual(cap.mem, "4g")
+        assert cap.mem == "4g"
         cap = self.policy.cap_for("Redis-Cache")
-        self.assertEqual(cap.mem, "1g")
+        assert cap.mem == "1g"
 
     def test_oom_adj_always_positive(self) -> None:
         for name in ("postgres", "redis", "mcp-fetch", "ollama", "elasticsearch",
                      "unknown-svc"):
             cap = self.policy.cap_for(name)
-            self.assertGreater(cap.oom_adj, 0,
-                               f"{name} oom_adj must be >0 to protect user manager")
+            assert cap.oom_adj > 0, f"{name} oom_adj must be >0 to protect user manager"
 
     def test_memswap_never_smaller_than_mem(self) -> None:
         """memswap is the TOTAL memory + swap budget; in cgroup v2 semantics
@@ -149,9 +148,7 @@ class TestPolicyMatching(unittest.TestCase):
         for name in ("postgres", "redis", "mcp-fetch", "ollama", "elasticsearch",
                      "unknown-svc", "neo4j", "sonarqube"):
             cap = self.policy.cap_for(name)
-            self.assertGreaterEqual(parse_size_to_bytes(cap.memswap),
-                                    parse_size_to_bytes(cap.mem),
-                                    f"{name}: memswap {cap.memswap} < mem {cap.mem}")
+            assert parse_size_to_bytes(cap.memswap) >= parse_size_to_bytes(cap.mem), f"{name}: memswap {cap.memswap} < mem {cap.mem}"
 
 
 # ---------------------------------------------------------------------------
@@ -165,8 +162,7 @@ class TestComposeFiles(unittest.TestCase):
             raise unittest.SkipTest("no compose files found")
 
     def test_files_discovered(self) -> None:
-        self.assertGreater(len(self.files), 30,
-                           "expected at least 30 user-owned compose files")
+        assert len(self.files) > 30, "expected at least 30 user-owned compose files"
 
     def test_every_service_has_all_caps(self) -> None:
         missing: list[tuple[str, str, list[str]]] = []
@@ -280,7 +276,7 @@ class TestTotalBudget(unittest.TestCase):
                 continue
             doc = load_compose(path)
             total = 0
-            for name, svc in (doc.get("services") or {}).items():
+            for _name, svc in (doc.get("services") or {}).items():
                 if not isinstance(svc, dict):
                     continue
                 mem = svc.get("mem_limit")
@@ -300,10 +296,7 @@ class TestTotalBudget(unittest.TestCase):
         repo — the exemption list shouldn't be a list of phantom names."""
         names = {p.name for p in self.files}
         seen = self.PROFILE_HEAVY_FILES & names
-        self.assertGreater(
-            len(seen), 0,
-            "PROFILE_HEAVY_FILES is empty in this repo — the exemption "
-            "list is stale or no longer needed.")
+        assert len(seen) > 0, "PROFILE_HEAVY_FILES is empty in this repo — the exemption " "list is stale or no longer needed."
 
 
 # ---------------------------------------------------------------------------
@@ -372,19 +365,19 @@ class TestSmoke(unittest.TestCase):
             r = subprocess.run(
                 [sys.executable, str(APPLY_SCRIPT), "--root", td],
                 capture_output=True, text=True, env=env)
-            self.assertEqual(r.returncode, 0, r.stderr)
+            assert r.returncode == 0, r.stderr
             doc = load_compose(f)
             for name in ("postgres", "redis", "some-mcp"):
                 svc = doc["services"][name]
                 for k in ac.CAP_KEYS:
-                    self.assertIn(k, svc, f"{name} missing {k} after first apply")
+                    assert k in svc, f"{name} missing {k} after first apply"
             # Second run must be no-op
             r2 = subprocess.run(
                 [sys.executable, str(APPLY_SCRIPT), "--root", td],
                 capture_output=True, text=True, env=env)
-            self.assertEqual(r2.returncode, 0, r2.stderr)
+            assert r2.returncode == 0, r2.stderr
             doc2 = load_compose(f)
-            self.assertEqual(doc, doc2, "second run was not idempotent")
+            assert doc == doc2, "second run was not idempotent"
 
     def test_pattern_matches_correct_pid_limits(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -396,12 +389,12 @@ class TestSmoke(unittest.TestCase):
                 capture_output=True, text=True,
                 env={**os.environ, "PYTHONPATH": str(HERE)})
             doc = load_compose(f)
-            self.assertEqual(doc["services"]["postgres"]["mem_limit"], "4g")
-            self.assertEqual(doc["services"]["redis"]["mem_limit"], "1g")
+            assert doc["services"]["postgres"]["mem_limit"] == "4g"
+            assert doc["services"]["redis"]["mem_limit"] == "1g"
             # `some-mcp` should match `mcp-*` pattern → 1g, but the service
             # is named `some-mcp` (does NOT match `mcp-*`). It falls to
             # default 2g. This validates left-anchored pattern matching.
-            self.assertEqual(doc["services"]["some-mcp"]["mem_limit"], "2g")
+            assert doc["services"]["some-mcp"]["mem_limit"] == "2g"
 
 
 # ---------------------------------------------------------------------------
