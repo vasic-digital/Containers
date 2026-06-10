@@ -1,0 +1,349 @@
+<h1 id="ota-device-emulation">OTA Device Emulation</h1>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Revision</td>
+<td>1</td>
+</tr>
+<tr>
+<td>Last modified</td>
+<td>2026-06-10T00:00:00Z</td>
+</tr>
+<tr>
+<td>Status</td>
+<td>active</td>
+</tr>
+<tr>
+<td>Scope</td>
+<td>Tier-1 OTA control-plane testing via a podman/docker device-emulator
+container</td>
+</tr>
+</tbody>
+</table>
+<p>This document describes the <code>ota-device-emu</code> container
+image (<code>images/ota-device-emu/</code>) and the on-demand
+boot/health recipe (<code>cmd/ota-device-emu-boot/</code>) added to the
+<code>digital.vasic.containers</code> module so a consuming project can
+run an <strong>emulated OTA “device”</strong> as a container in place of
+live hardware for control-plane testing.</p>
+<p>The image and recipe are <strong>project-agnostic</strong>
+(Constitution CONST-051(B)): every project-specific value (the binary,
+the control-plane image, the OTA_* configuration) is supplied by the
+consumer at run time. Nothing about any particular consumer is baked
+into the module.</p>
+<h2 id="what-this-is-and-what-it-is-not-honest-tiered-boundary">What
+this is — and what it is NOT (honest tiered boundary)</h2>
+<p>The OTA update system has two layers, and this image addresses only
+the first.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Layer</th>
+<th>What it exercises</th>
+<th>This image?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Tier-1: control-plane protocol</strong></td>
+<td>enrollment, update-check, version reporting, campaign/rollout
+assignment, heartbeat — the HTTP request/response contract between a
+device and the OTA server</td>
+<td><strong>YES</strong> — a Linux container running a Go client binary
+that speaks the protocol</td>
+</tr>
+<tr>
+<td><strong>Tier-2: on-device A/B apply</strong></td>
+<td>real Android A/B <code>update_engine</code> + AVB/dm-verity slot
+flip + auto-rollback on the RK3588 / Orange Pi 5 Max target</td>
+<td><strong>NO</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Why Tier-2 is out of scope here (FACT, not guess).</strong>
+The real Android A/B flow needs <code>update_engine</code>,
+AVB/dm-verity, and a bootloader slot mechanism running under an Android
+system image. On this host that means <strong>Cuttlefish on Linux with
+KVM</strong> (<code>/dev/kvm</code>) — see the existing
+<code>pkg/emulator</code> notes on the Linux-x86_64-KVM requirement. The
+macOS/applehv development host used to build and validate this image has
+<strong>no KVM and no Android <code>emulator</code></strong>, so the
+runnable mechanism here is a <strong>podman container</strong>, not a
+host-AVD/Cuttlefish device. Driving the genuine
+<code>update_engine</code> apply belongs to a Cuttlefish-on-Linux-KVM
+image (a separate, future deliverable), NOT to this control-plane
+emulator.</p>
+<p>A consumer that needs the real apply flow runs the Tier-2 path on a
+Linux+KVM host (or real hardware); this Tier-1 image lets the
+control-plane server be developed and tested continuously, on any host,
+without that hardware.</p>
+<h2 id="the-contract-who-builds-what">The contract: who builds what</h2>
+<pre><code>┌────────────────────────────┐        ┌───────────────────────────────────┐
+│ consuming project           │        │ digital.vasic.containers (this    │
+│ (an OTA control-plane consumer)     │        │ submodule)                         │
+├────────────────────────────┤        ├───────────────────────────────────┤
+│ builds the static Go binary │ ─────▶ │ images/ota-device-emu/Dockerfile  │
+│   ota-device-emu            │ binary │   provides RUNTIME + entrypoint    │
+│ (CGO_ENABLED=0, linux)      │        │ cmd/ota-device-emu-boot           │
+│ supplies it via volume      │        │   provides pkg/boot + pkg/health   │
+│ mount or a derived image    │        │   on-demand bring-up recipe        │
+└────────────────────────────┘        └───────────────────────────────────┘</code></pre>
+<ul>
+<li><strong>The submodule provides the runtime, not the binary.</strong>
+The image is a minimal Alpine base + CA certs + a POSIX entrypoint. It
+does <strong>not</strong> build <code>ota-device-emu</code> — that
+binary lives in (and is built by) the consuming project, which knows the
+OTA protocol.</li>
+<li><strong>Two supply paths</strong>, both validated:
+<ol type="1">
+<li><p><strong>Volume mount</strong> (dev default):
+<code>-v ./bin/ota-device-emu:/usr/local/bin/ota-device-emu:ro</code></p></li>
+<li><p><strong>Derived image</strong> (CI / pinned):</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode dockerfile"><code class="sourceCode dockerfile"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> ota-device-emu:dev</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> bin/ota-device-emu /usr/local/bin/ota-device-emu</span></code></pre></div></li>
+</ol></li>
+</ul>
+<h2 id="env-var-interface">Env-var interface</h2>
+<p>The entrypoint reads these and hands them to the binary (the binary
+itself consumes them — the entrypoint only validates the required one
+and prints the contract on <code>--help</code>).</p>
+<table>
+<colgroup>
+<col style="width: 27%" />
+<col style="width: 45%" />
+<col style="width: 27%" />
+</colgroup>
+<thead>
+<tr>
+<th>Variable</th>
+<th style="text-align: center;">Required</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>OTA_BASE_URL</code></td>
+<td style="text-align: center;"><strong>yes</strong></td>
+<td>Control-plane base URL,
+e.g. <code>http://control-plane:8080</code></td>
+</tr>
+<tr>
+<td><code>OTA_ADMIN_USER</code></td>
+<td style="text-align: center;">no</td>
+<td>Enrollment/admin user (if the binary authenticates)</td>
+</tr>
+<tr>
+<td><code>OTA_ADMIN_PASS</code></td>
+<td style="text-align: center;">no</td>
+<td>Enrollment/admin password — <strong>never logged</strong>
+(Constitution §11.4.10)</td>
+</tr>
+<tr>
+<td><code>OTA_HARDWARE_ID</code></td>
+<td style="text-align: center;">no</td>
+<td>Stable hardware id this emulated device reports</td>
+</tr>
+<tr>
+<td><code>OTA_MODEL</code></td>
+<td style="text-align: center;">no</td>
+<td>Device model, e.g. <code>orangepi-5-max</code></td>
+</tr>
+<tr>
+<td><code>OTA_OS</code></td>
+<td style="text-align: center;">no</td>
+<td>Device OS, e.g. <code>android</code> / <code>linux</code></td>
+</tr>
+<tr>
+<td><code>OTA_CURRENT_VERSION</code></td>
+<td style="text-align: center;">no</td>
+<td>Version the emulated device currently runs</td>
+</tr>
+<tr>
+<td><code>OTA_DEVICE_EMU_BIN</code></td>
+<td style="text-align: center;">no</td>
+<td>Binary path (default
+<code>/usr/local/bin/ota-device-emu</code>)</td>
+</tr>
+<tr>
+<td><code>OTA_DEVICE_EMU_EXTRA_ARGS</code></td>
+<td style="text-align: center;">no</td>
+<td>Extra args appended to the binary invocation</td>
+</tr>
+</tbody>
+</table>
+<p>Entrypoint exit codes (honest, no silent success):</p>
+<table>
+<colgroup>
+<col style="width: 62%" />
+<col style="width: 37%" />
+</colgroup>
+<thead>
+<tr>
+<th style="text-align: center;">Exit</th>
+<th>Condition</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center;"><code>0</code></td>
+<td><code>--help</code>/<code>-h</code> (prints the contract), or the
+binary ran and exited 0</td>
+</tr>
+<tr>
+<td style="text-align: center;"><code>2</code></td>
+<td><code>OTA_BASE_URL</code> unset when a binary is present</td>
+</tr>
+<tr>
+<td style="text-align: center;"><code>3</code></td>
+<td>binary absent/not-executable at <code>OTA_DEVICE_EMU_BIN</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="on-demand-infra-invariant-constitution-11.4.76">On-demand-infra
+invariant (Constitution §11.4.76)</h2>
+<p>Operators must <strong>never</strong> be required to run
+<code>podman compose up</code> by hand. The boot is part of the test
+entry point: <code>cmd/ota-device-emu-boot</code> brings the stack up
+via <code>pkg/boot.BootManager</code> (which runs the compose
+<code>Up</code>) and health-checks it via <code>pkg/health</code>. It
+composes with — and does not reimplement — the existing
+<code>pkg/boot</code> + <code>pkg/compose</code> +
+<code>pkg/health</code> surfaces (§11.4.74
+extend-don’t-reimplement).</p>
+<h3 id="how-it-composes-with-a-control-plane-container">How it composes
+with a control-plane container</h3>
+<p>The example compose file
+(<code>images/ota-device-emu/docker-compose.example.yml</code>) declares
+two services:</p>
+<ul>
+<li><code>control-plane</code> — the OTA server under test, exposing an
+HTTP health endpoint (e.g. <code>/health</code> on
+<code>:8080</code>);</li>
+<li><code>ota-device-emu</code> — this image, with
+<code>OTA_BASE_URL</code> pointing at
+<code>http://control-plane:8080</code> and the device-identity env
+set.</li>
+</ul>
+<p><code>ota-device-emu-boot</code> then asserts <strong>positive
+evidence two ways</strong> (anti-bluff, §11.4 / §11.4.69):</p>
+<ol type="1">
+<li>the <strong>control plane answers its HTTP health endpoint</strong>
+(<code>pkg/health</code> HTTP checker) — proof the server the device
+talks to is actually up;</li>
+<li>the <strong>device-emulator container is genuinely RUNNING</strong>,
+queried from the container runtime
+(<code>ContainerRuntime.Status</code>), <strong>not</strong> a fake port
+probe. The emulator is an <em>outbound</em> client (it polls/heartbeats
+the control plane) and has no inbound port, so its real liveness oracle
+is “the container the runtime reports is in state <code>running</code>”,
+not a synthetic TCP check. Asserting a port that doesn’t exist would be
+exactly the metadata-only PASS-bluff §11.4 forbids.</li>
+</ol>
+<p>A consumer wanting a stronger end-to-end proof (the device actually
+appeared in the control plane’s registry) adds a control-plane-side
+query — e.g. an HTTP check of
+<code>/v1/devices/&lt;OTA_HARDWARE_ID&gt;</code> — as a third
+<code>pkg/health</code> HTTP target. That is the genuine sink-side
+evidence (§11.4.13) and is the recommended next step once the
+control-plane image is wired.</p>
+<h2 id="quick-start">Quick start</h2>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 0. (consumer) build the static device-emulator binary in the OTA control-plane consumer:</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co">#    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o bin/ota-device-emu ./cmd/ota-device-emu</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. build the runtime image (this submodule):</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> build <span class="at">-f</span> images/ota-device-emu/Dockerfile <span class="dt">\</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">-t</span> ota-device-emu:dev images/ota-device-emu/</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. inspect the contract:</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> run <span class="at">--rm</span> ota-device-emu:dev <span class="at">--help</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. bring the stack up on-demand + health-check it (no manual compose up):</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> run ./cmd/ota-device-emu-boot <span class="dt">\</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">--compose</span> images/ota-device-emu/docker-compose.example.yml <span class="dt">\</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>  <span class="at">--control-port</span> 8080 <span class="at">--control-health-path</span> /health</span></code></pre></div>
+<h2 id="host-requirements">Host requirements</h2>
+<ul>
+<li><strong>podman</strong> (or docker) with a running machine/daemon.
+On macOS/applehv the podman machine provides a Linux arm64 VM; the image
+is multi-arch (Alpine).</li>
+<li><strong>No KVM / no Android <code>emulator</code> needed</strong> —
+that is the whole point of the Tier-1 container path. The Tier-2
+Cuttlefish path (future) does need Linux + <code>/dev/kvm</code>.</li>
+</ul>
+<h2 id="anti-bluff-posture-constitution-11.4">Anti-bluff posture
+(Constitution §11.4)</h2>
+<ul>
+<li>The image’s <code>--help</code>, missing-binary (exit 3), and
+missing-<code>OTA_BASE_URL</code> (exit 2) paths were each run under
+real podman and produce honest, distinguishable results — never a silent
+PASS.</li>
+<li>The boot recipe asserts the <strong>real</strong> observable for
+each service (HTTP health for the control plane; runtime
+<code>running</code> state for the emulator), not a config-only or
+absence-of-error check.</li>
+<li>This image addresses Tier-1 only; the Tier-2 boundary above is
+stated as fact with its cause (no KVM / no host emulator), per the
+no-guessing mandate (§11.4.6).</li>
+</ul>
+<h2 id="files">Files</h2>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Path</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>images/ota-device-emu/Dockerfile</code></td>
+<td>Runtime image (Alpine + CA certs + entrypoint)</td>
+</tr>
+<tr>
+<td><code>images/ota-device-emu/entrypoint.sh</code></td>
+<td>Env validation + contract + binary hand-off</td>
+</tr>
+<tr>
+<td><code>images/ota-device-emu/docker-compose.example.yml</code></td>
+<td>Example control-plane + emulator stack</td>
+</tr>
+<tr>
+<td><code>cmd/ota-device-emu-boot/main.go</code></td>
+<td>On-demand boot + health recipe (pkg/boot + pkg/health)</td>
+</tr>
+<tr>
+<td><code>docs/ota-device-emulation.md</code></td>
+<td>This document</td>
+</tr>
+</tbody>
+</table>
+<h2 id="sibling-exports-constitution-11.4.65">Sibling exports
+(Constitution §11.4.65)</h2>
+<p><code>.html</code> and <code>.pdf</code> siblings of this document
+are generated via pandoc + weasyprint and committed alongside the
+markdown. This submodule has no in-repo
+<code>sync_all_markdown_exports.sh</code>; the parent project’s export
+tooling keeps the wider doc fleet in sync. To regenerate locally:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pandoc</span> docs/ota-device-emulation.md <span class="at">-o</span> docs/ota-device-emulation.html</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">weasyprint</span> docs/ota-device-emulation.html docs/ota-device-emulation.pdf</span></code></pre></div>
