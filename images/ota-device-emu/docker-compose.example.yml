@@ -1,0 +1,48 @@
+# Example compose stack for cmd/ota-device-emu-boot.
+#
+# Brings up an OTA control plane + one OTA device emulator. This file is an
+# EXAMPLE — the consuming OTA control-plane project supplies its own with the
+# real control-plane image and the real ota-device-emu binary. Nothing here is
+# hardcoded into the Go module; the names below are the cmd defaults.
+#
+# Build the emulator image first:
+#   podman build -f images/ota-device-emu/Dockerfile \
+#     -t ota-device-emu:dev images/ota-device-emu/
+#
+# Then bring the stack up on-demand:
+#   go run ./cmd/ota-device-emu-boot \
+#     --compose images/ota-device-emu/docker-compose.example.yml \
+#     --control-port 8080 --control-health-path /health
+#
+# The ota-device-emu binary is supplied to the container via the bind mount
+# below; replace ./bin/ota-device-emu with the consumer's built static binary.
+
+services:
+  control-plane:
+    # Replace with the consuming project's OTA control-plane image.
+    image: ${OTA_CONTROL_PLANE_IMAGE:-ota-control-plane:dev}
+    ports:
+      - "8080:8080"
+    environment:
+      # control-plane-specific config goes here (DB, admin seed, etc.)
+      OTA_LISTEN_ADDR: ":8080"
+
+  ota-device-emu:
+    image: ota-device-emu:dev
+    depends_on:
+      - control-plane
+    # Supply the consumer-built static binary into the runtime image.
+    volumes:
+      - ./bin/ota-device-emu:/usr/local/bin/ota-device-emu:ro
+    environment:
+      # The env-var interface — point the emulator at the control plane and
+      # describe the device it impersonates.
+      OTA_BASE_URL: "http://control-plane:8080"
+      OTA_ADMIN_USER: "${OTA_ADMIN_USER:-}"
+      OTA_ADMIN_PASS: "${OTA_ADMIN_PASS:-}"
+      OTA_HARDWARE_ID: "emu-orangepi-001"
+      OTA_MODEL: "orangepi-5-max"
+      OTA_OS: "android"
+      OTA_CURRENT_VERSION: "1.0.0"
+    # Memory limit per Constitution container-hygiene rule (explicit limit).
+    mem_limit: 256m

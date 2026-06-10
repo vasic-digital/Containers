@@ -439,6 +439,34 @@ emulator-matrix \
 `--runner auto` selects the OS-correct runner: `containerized` on Linux
 (requires `--container-image`), `host-direct` on macOS/Windows.
 
+## OTA Device Emulator (images/ota-device-emu + cmd/ota-device-emu-boot)
+
+`images/ota-device-emu/` provides a podman/docker **OTA device-emulator
+runtime image**: a minimal Alpine + CA-certs base that runs a
+consumer-supplied static `ota-device-emu` Go binary impersonating one OTA
+target device against an OTA control plane — for **Tier-1 control-plane
+protocol testing in place of live hardware**. The binary is built in the
+consuming project and supplied via volume mount or a derived image (see the
+env-var contract in `images/ota-device-emu/entrypoint.sh`).
+
+`cmd/ota-device-emu-boot` is the on-demand bring-up recipe: it composes
+`pkg/boot` + `pkg/health` to start a control-plane + emulator stack and
+health-check it (HTTP health for the control plane; runtime `running`-state
+for the emulator). No manual `compose up` (Constitution §11.4.76).
+
+Honest boundary: this is Tier-1 (control-plane protocol) only. The real
+Android A/B `update_engine` + AVB/dm-verity apply flow needs
+Cuttlefish-on-Linux-KVM and is NOT this image's job. Full design:
+[docs/ota-device-emulation.md](docs/ota-device-emulation.md).
+
+```bash
+podman build -f images/ota-device-emu/Dockerfile \
+  -t ota-device-emu:dev images/ota-device-emu/
+podman run --rm ota-device-emu:dev --help
+go run ./cmd/ota-device-emu-boot \
+  --compose images/ota-device-emu/docker-compose.example.yml
+```
+
 ## License
 
 MIT
