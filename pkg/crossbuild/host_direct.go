@@ -168,19 +168,82 @@ func tailString(s string, n int) string {
 	return "…" + s[len(s)-n:]
 }
 
+// copyFile copies a produced artifact to its host-output destination.
+// Regular files are copied byte-for-byte. Directory artifacts (e.g. a
+// jpackage app-image / runtime image — see each backend's
+// Capabilities().ArtifactNotes) are copied recursively: a real, non-empty
+// directory app-image is a valid artifact and MUST NOT be reported as a
+// build failure (§11.4.1 — a successful build with a directory artifact
+// reported as FAIL is a FAIL-bluff).
 func copyFile(src, dst string) error {
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return copyDir(src, dst)
+	}
+	return copyRegularFile(src, dst, info.Mode())
+}
+
+func copyRegularFile(src, dst string, mode os.FileMode) error {
 	srcFile, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer srcFile.Close()
-	dstFile, err := os.Create(dst)
+	dstFile, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode.Perm())
 	if err != nil {
 		return err
 	}
-	defer dstFile.Close()
 	if _, err := dstFile.ReadFrom(srcFile); err != nil {
+		dstFile.Close()
 		return err
+	}
+	return dstFile.Close()
+}
+
+// copyDir recursively copies the directory tree at src to dst, preserving
+// the relative structure. Symlinks are copied as symlinks (not followed)
+// so a malicious or accidental link inside the artifact cannot make the
+// orchestrator read outside the tree.
+func copyDir(src, dst string) error {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dst, srcInfo.Mode().Perm()); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+		info, err := os.Lstat(srcPath)
+		if err != nil {
+			return err
+		}
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			target, err := os.Readlink(srcPath)
+			if err != nil {
+				return err
+			}
+			if err := os.Symlink(target, dstPath); err != nil {
+				return err
+			}
+		case info.IsDir():
+			if err := copyDir(srcPath, dstPath); err != nil {
+				return err
+			}
+		default:
+			if err := copyRegularFile(srcPath, dstPath, info.Mode()); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
