@@ -63,13 +63,34 @@ func (h *HelixServiceHealthChecker) Check(ctx context.Context) (HealthStatus, er
 
 	var lastErr error
 	for i := 0; i <= h.Retries; i++ {
+		// Bail out promptly if the caller's context is already done,
+		// rather than running every remaining attempt + sleep.
+		if err := ctx.Err(); err != nil {
+			if lastErr == nil {
+				lastErr = err
+			}
+			break
+		}
 		status, err := h.checkOnce(ctx)
 		if err == nil && status.Healthy {
 			return status, nil
 		}
 		lastErr = err
 		if i < h.Retries {
-			time.Sleep(time.Second)
+			// Honor context cancellation during the inter-retry wait
+			// instead of an unconditional time.Sleep.
+			select {
+			case <-ctx.Done():
+				lastErr = ctx.Err()
+				return HealthStatus{
+					Healthy: false,
+					Message: fmt.Sprintf(
+						"service %s health check cancelled: %v",
+						h.ServiceName, lastErr,
+					),
+				}, lastErr
+			case <-time.After(time.Second):
+			}
 		}
 	}
 	return HealthStatus{
