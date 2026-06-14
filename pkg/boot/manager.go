@@ -239,18 +239,28 @@ func (bm *BootManager) BootAll(
 			if hcErr != nil {
 				ep := bm.endpoints[name]
 				if ep.Required {
+					// Decrement the counter the endpoint was actually
+					// counted in, keyed off its PREVIOUS status — not a
+					// blanket Remote/Started guess. A "discovered"
+					// endpoint was counted in Discovered (never in
+					// Started/Remote), so a flat Started-- here would
+					// corrupt the summary into negative counts.
+					if prev, ok := bm.results[name]; ok {
+						switch prev.Status {
+						case "started":
+							summary.Started--
+						case "remote", "distributed":
+							summary.Remote--
+						case "discovered":
+							summary.Discovered--
+						}
+					}
 					bm.results[name] = &BootResult{
 						Name:   name,
 						Status: "failed",
 						Error:  hcErr,
 					}
 					summary.Failed++
-					// Decrement the previous count.
-					if ep.Remote {
-						summary.Remote--
-					} else {
-						summary.Started--
-					}
 				}
 			}
 		}
