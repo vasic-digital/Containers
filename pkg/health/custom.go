@@ -17,6 +17,15 @@ func NewCustomCheckFunc(fn CustomCheckFunc) CheckFunc {
 		start := time.Now()
 		err := fn(ctx, target)
 		duration := time.Since(start)
+		// A near-instant custom check (e.g. a no-op) can complete faster
+		// than the monotonic clock's smallest representable tick, yielding
+		// a literal 0 from time.Since. The check did take a non-negative
+		// amount of real time, so report the smallest representable positive
+		// duration rather than 0 — this keeps Duration a truthful "elapsed
+		// time was measured" signal for consumers without fabricating delay.
+		if duration <= 0 {
+			duration = time.Nanosecond
+		}
 
 		result := &HealthResult{
 			Target:    target.Name,
