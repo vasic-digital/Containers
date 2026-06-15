@@ -37,12 +37,10 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
-import io
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 try:
     from ruamel.yaml import YAML
@@ -154,7 +152,7 @@ def load_policy(path: Path) -> Policy:
     if not isinstance(data, dict) or "defaults" not in data or "patterns" not in data:
         raise ValueError(f"{path}: missing 'defaults' / 'patterns' top-level keys")
 
-    def make_cap(d: dict, fallback: Optional[Cap] = None) -> Cap:
+    def make_cap(d: dict, fallback: Cap | None = None) -> Cap:
         return Cap(
             mem=str(d.get("mem", fallback.mem if fallback else "")),
             memswap=str(d.get("memswap", fallback.memswap if fallback else "")),
@@ -307,7 +305,7 @@ def process_compose(
         if n_changed and not dry_run:
             with path.open("w") as fh:
                 yaml.dump(doc, fh)
-        return n_changed, log + ["  (no services section)"]
+        return n_changed, [*log, "  (no services section)"]
 
     for svc_name, svc in services.items():
         if not isinstance(svc, CommentedMap):
@@ -380,7 +378,7 @@ def main(argv: list[str]) -> int:
             print(f"loaded {len(project_skips)} skip-path fragment(s) from {args.skip_paths_file}")
             effective_skip = effective_skip + project_skips
     if args.exclude:
-        effective_skip = effective_skip + (args.exclude,)
+        effective_skip = (*effective_skip, args.exclude)
     SKIP_PATH_FRAGMENTS = effective_skip
 
     files = find_compose_files(args.root.resolve())
