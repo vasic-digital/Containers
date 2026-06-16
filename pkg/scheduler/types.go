@@ -51,6 +51,25 @@ type ContainerRequirements struct {
 	ServiceName string
 	// GPU is optional; nil = no GPU needed.
 	GPU *GPURequirement
+	// Ports publishes container ports to host ports on the placement host
+	// (remote deploy path). Empty = no published ports. Without a published
+	// port a container's service is reachable only inside its network
+	// namespace, so a cross-host health check cannot reach it.
+	Ports []PortMapping
+}
+
+// PortMapping publishes a container port to a host port on the host where the
+// container is placed. The remote deploy path renders each mapping as a
+// `-p`/`--publish` flag on the `run` command so the service is reachable for
+// health checks and real use.
+type PortMapping struct {
+	// HostPort is the published port on the placement host. 0 lets the
+	// runtime choose an ephemeral host port.
+	HostPort int
+	// ContainerPort is the port inside the container. Required (> 0).
+	ContainerPort int
+	// Protocol is "tcp" (default when empty) or "udp".
+	Protocol string
 }
 
 // PlacementDecision records where a single container was placed.

@@ -3,6 +3,7 @@ package distribution
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -292,6 +293,29 @@ func (d *DefaultDistributor) deployLocal(
 	)
 }
 
+// buildPublishFlags renders the `-p host:container[/proto]` fragment (each with
+// a leading space) for the remote `run` command. Mappings with a non-positive
+// ContainerPort are skipped; an empty/zero HostPort lets the runtime pick an
+// ephemeral host port. Empty input returns "".
+func buildPublishFlags(ports []scheduler.PortMapping) string {
+	var b strings.Builder
+	for _, p := range ports {
+		if p.ContainerPort <= 0 {
+			continue
+		}
+		proto := p.Protocol
+		if proto == "" {
+			proto = "tcp"
+		}
+		if p.HostPort > 0 {
+			fmt.Fprintf(&b, " -p %d:%d/%s", p.HostPort, p.ContainerPort, proto)
+		} else {
+			fmt.Fprintf(&b, " -p %d/%s", p.ContainerPort, proto)
+		}
+	}
+	return b.String()
+}
+
 func (d *DefaultDistributor) deployRemote(
 	ctx context.Context, dc *DistributedContainer,
 ) error {
@@ -318,8 +342,10 @@ func (d *DefaultDistributor) deployRemote(
 	d.opts.Executor.Execute(ctx, *host, removeCmd)
 
 	cmd := fmt.Sprintf(
-		"%s run -d --name %s %s",
-		rt, dc.Requirement.Name, dc.Requirement.Image,
+		"%s run -d --name %s%s %s",
+		rt, dc.Requirement.Name,
+		buildPublishFlags(dc.Requirement.Ports),
+		dc.Requirement.Image,
 	)
 
 	d.opts.Logger.Info("deploying %s on %s: %s",
