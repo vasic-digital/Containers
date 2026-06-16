@@ -303,9 +303,19 @@ func buildPublishFlags(ports []scheduler.PortMapping) string {
 		if p.ContainerPort <= 0 {
 			continue
 		}
-		proto := p.Protocol
-		if proto == "" {
+		// Allowlist the protocol — it is interpolated into the remote shell
+		// `run` command, so an unvalidated value would be a command-injection
+		// vector. HostPort/ContainerPort are ints (%d) and inherently safe.
+		var proto string
+		switch strings.ToLower(p.Protocol) {
+		case "", "tcp":
 			proto = "tcp"
+		case "udp":
+			proto = "udp"
+		case "sctp":
+			proto = "sctp"
+		default:
+			continue // skip mappings with an unrecognized protocol
 		}
 		if p.HostPort > 0 {
 			fmt.Fprintf(&b, " -p %d:%d/%s", p.HostPort, p.ContainerPort, proto)
