@@ -119,6 +119,15 @@ func (e *SSHExecutor) ExecuteStream(
 	if err != nil {
 		return nil, err
 	}
+	// sshArgs may have acquired a pooled ControlMaster ref (refs++). On the
+	// success path the returned streamReader releases it via Close(); on the
+	// early error paths below (before that reader exists) release it here or it
+	// leaks. Release is a no-op when nothing was acquired.
+	releaseOnErr := func() {
+		if e.pool != nil {
+			e.pool.Release(host)
+		}
+	}
 	args = append(args, command)
 
 	e.logger.Debug(
@@ -128,10 +137,12 @@ func (e *SSHExecutor) ExecuteStream(
 	cmd := exec.CommandContext(ctx, "ssh", args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		releaseOnErr()
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
+		releaseOnErr()
 		return nil, fmt.Errorf(
 			"ssh stream start on %s: %w", host.Name, err,
 		)
