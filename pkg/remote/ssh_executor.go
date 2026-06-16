@@ -67,6 +67,14 @@ func (e *SSHExecutor) Execute(
 	if err != nil {
 		return nil, err
 	}
+	// sshArgs may have acquired a pooled ControlMaster connection (refs++).
+	// Release on EVERY return path (defer), not just the success path below —
+	// otherwise the ref-count leaks on the error returns and the socket is
+	// never ControlPersist-reaped (a long-lived consumer pins one socket per
+	// host that ever errored). Release is a no-op when nothing was acquired.
+	if e.pool != nil {
+		defer e.pool.Release(host)
+	}
 	args = append(args, command)
 
 	e.logger.Debug("ssh exec on %s: %s", host.Name, command)
@@ -95,10 +103,6 @@ func (e *SSHExecutor) Execute(
 		return result, fmt.Errorf(
 			"ssh exec on %s: %w", host.Name, runErr,
 		)
-	}
-
-	if e.pool != nil {
-		e.pool.Release(host)
 	}
 
 	return result, nil
@@ -188,8 +192,8 @@ func (e *SSHExecutor) CopyFile(
 // basename(remoteDir) — the universal case for the helixagent build
 // context flow — the result is deterministic regardless of pre-state:
 //
-//   scp -r /local/external/cognee user@host:/remote/external
-//     → creates/merges at /remote/external/cognee
+//	scp -r /local/external/cognee user@host:/remote/external
+//	  → creates/merges at /remote/external/cognee
 //
 // Forensic note (2026-04-29): the previous implementation passed
 // remoteDir directly to scp. When a sibling CopyFile created remoteDir
