@@ -30,7 +30,7 @@ func TestSSHExecutor_Execute_ReleasesPoolRefOnCommandError(t *testing.T) {
 	user := os.Getenv("TMX_TEST_SSH_USER")
 	key := os.Getenv("TMX_TEST_SSH_KEY")
 	if addr == "" || user == "" {
-		t.Skip("set TMX_TEST_SSH_ADDR + TMX_TEST_SSH_USER (+ TMX_TEST_SSH_KEY) to run")
+		t.Skip("SKIP-OK: set TMX_TEST_SSH_ADDR + TMX_TEST_SSH_USER (+ TMX_TEST_SSH_KEY) to run")
 	}
 
 	exec, err := NewSSHExecutor(logging.NewStdLogger("t"))
@@ -39,7 +39,7 @@ func TestSSHExecutor_Execute_ReleasesPoolRefOnCommandError(t *testing.T) {
 	}
 	defer func() { _ = exec.Close() }()
 	if exec.pool == nil {
-		t.Skip("ControlMaster pool not enabled in this build/config")
+		t.Skip("SKIP-OK: ControlMaster pool not enabled in this build/config")
 	}
 
 	host := RemoteHost{Name: "t", Address: addr, Port: 22, User: user, KeyPath: key, Runtime: "podman"}
@@ -63,7 +63,7 @@ func TestSSHExecutor_Execute_ReleasesPoolRefOnCommandError(t *testing.T) {
 	exec.pool.mu.Unlock()
 
 	if !ok {
-		t.Skip("ControlMaster fell back to direct (no pooled entry) — cannot assert refs")
+		t.Skip("SKIP-OK: ControlMaster fell back to direct (no pooled entry) — cannot assert refs")
 	}
 	if refs != 0 {
 		t.Fatalf("connection-pool refs leaked: got %d, want 0 — Execute did not Release on the command-error path", refs)

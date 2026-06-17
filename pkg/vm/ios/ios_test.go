@@ -260,7 +260,7 @@ func TestIOSBuilder_ListSimulators_HappyPath(t *testing.T) {
 // TestIOSBuilder_BootSimulator_NonMacOS verifies the non-macOS guard.
 func TestIOSBuilder_BootSimulator_NonMacOS(t *testing.T) {
 	if runtime.GOOS == "darwin" {
-		t.Skip("this test verifies the non-macOS fast-path; skip on macOS")
+		t.Skip("SKIP-OK: this test verifies the non-macOS fast-path; skip on macOS")
 	}
 	b := NewIOSBuilder()
 	err := b.BootSimulator(context.Background(), "fake-udid", 0)
