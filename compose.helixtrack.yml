@@ -1,0 +1,73 @@
+# HelixTrack Core Stack
+# Multi-service stack for running HelixTrack Core within the containers submodule.
+# Supports multi-space data isolation via --space-root flag.
+#
+# Usage:
+#   cd containers && docker compose -f compose.helixtrack.yml up -d
+#   OR via containers pkg/boot: boot --compose ./containers/compose.helixtrack.yml
+
+services:
+  # ============================================
+  # HELIXTRACK CORE (Go Backend)
+  # ============================================
+  helixtrack-core:
+    build:
+      context: ../helix_track/core/Application
+      dockerfile: Dockerfile
+    container_name: helixtrack-core
+    environment:
+      HT_CONFIG: /config/default.json
+      HT_SPACE_ROOT: /data/spaces/_default
+      HT_DB_TYPE: sqlite
+    ports:
+      - "8080:8080"
+    volumes:
+      # Space data (per-project isolated databases + assets)
+      - ../helix_track/spaces:/data/spaces
+      # Core configuration
+      - ../helix_track/core/Application/Configurations:/config
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - helixtrack-net
+    restart: unless-stopped
+    command: ["./htCore", "--space-root=/data/spaces/_default"]
+
+  # ============================================
+  # POSTGRESQL (optional, production target)
+  # ============================================
+  helixtrack-postgres:
+    image: postgres:16-alpine
+    container_name: helixtrack-postgres
+    environment:
+      POSTGRES_DB: helixtrack
+      POSTGRES_USER: helixtrack
+      POSTGRES_PASSWORD: ${HT_PG_PASSWORD:-helixtrack_dev}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U helixtrack -d helixtrack"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - helixtrack-net
+    volumes:
+      - helixtrack-pg-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    profiles:
+      - production
+
+networks:
+  helixtrack-net:
+    name: helixtrack-network
+    driver: bridge
+
+volumes:
+  helixtrack-pg-data:
