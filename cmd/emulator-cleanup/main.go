@@ -1,6 +1,6 @@
 // Package main is the thin CLI wrapping pkg/emulator.Cleanup.
 //
-// Invoked by Lava's scripts/run-emulator-tests.sh as a pre-boot
+// Invoked by the consuming project's scripts/run-emulator-tests.sh as a pre-boot
 // zombie-cleanup step. Best-effort: returns 0 even when no matches
 // were found OR some PIDs survived (the matrix runner SHOULD continue
 // regardless — the cleanup is a hygiene improvement, not a gate).

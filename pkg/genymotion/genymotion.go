@@ -2,7 +2,7 @@
 // Desktop Android virtual devices for the vasic-digital container ecosystem.
 //
 // Genymotion runs Android in a VM (VirtualBox/QEMU/Hypervisor.framework), so it
-// satisfies the Lava §6.AH mandate ("virtual devices / emulators MUST run in
+// satisfies the consuming project's §6.AH mandate ("virtual devices / emulators MUST run in
 // Containers or VMs — never host-direct"): a Genymotion VM is NOT a host-direct
 // `emulator -avd` AVD, it is a managed virtual machine. This package is the
 // Containers-submodule landing that makes bringing such a device up/down

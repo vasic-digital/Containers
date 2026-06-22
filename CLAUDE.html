@@ -239,7 +239,7 @@ code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; }
 </header>
 <h2 id="inherited-from-helix-constitution">INHERITED FROM Helix
 Constitution</h2>
-<p>This module is a submodule of an ATMOSphere-family project that
+<p>This module is a submodule of a consuming project that
 includes the Helix Constitution submodule at the parent&#39;s
 <code>constitution/</code> path. All rules in
 <code>constitution/CLAUDE.md</code> and the
@@ -261,13 +261,13 @@ constitution/CLAUDE.md</h2>
 <code>constitution/Constitution.md</code> it references) apply
 unconditionally. This file&#39;s rules below extend them — they MUST NOT
 weaken any inherited rule. See parent root <code>CLAUDE.md</code> §6.AD
-for the Lava-specific incorporation context (29th §6.L cycle,
+for the consuming-project-specific incorporation context (29th §6.L cycle,
 2026-05-14) and §6.AD-debt for the implementation-gap inventory. Use
 <code>constitution/find_constitution.sh</code> from the parent project
 root to resolve the absolute path of the submodule from any nested
 location.</p>
 <h2 id="definition-of-done">Definition of Done</h2>
-<p>This module inherits HelixAgent&#39;s universal Definition of Done — see
+<p>This module inherits the consuming project&#39;s universal Definition of Done — see
 the root <code>CLAUDE.md</code> and
 <code>docs/development/definition-of-done.md</code>. In one line:
 <strong>no task is done without pasted output from a real run of the
@@ -276,7 +276,7 @@ green suites are not evidence.</p>
 <h3 id="acceptance-demo-for-this-module">Acceptance demo for this
 module</h3>
 <div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Real orchestration flow (Hard Stop #2 canonical demo)</span></span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Builds HelixAgent and boots every container declared in Containers/.env.</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Builds the consuming project and boots every container declared in Containers/.env.</span></span>
 <span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> /run/media/milosvasic/DATA4TB/Projects/HelixAgent</span>
 <span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> build</span>
 <span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="va">GOMAXPROCS</span><span class="op">=</span>2 <span class="fu">nice</span> <span class="at">-n</span> 19 ./bin/helixagent <span class="kw">&amp;</span></span>
@@ -371,7 +371,7 @@ library API, operator directives) + parent
 <code>scripts/lib/host_session_safety.sh</code>.</p>
 <h2 id="mandatory-anti-bluff-validation-constitution-81--11">MANDATORY
 ANTI-BLUFF VALIDATION (Constitution §8.1 + §11)</h2>
-<p><strong>This submodule inherits the parent ATMOSphere project&#39;s
+<p><strong>This submodule inherits the parent project&#39;s
 anti-bluff covenant. A test that PASSes while the feature it claims to
 validate is unusable to an end user is the single most damaging failure
 mode in this codebase. It has shipped working-on-paper /
@@ -431,7 +431,7 @@ DEVELOPMENT PRINCIPLES&quot;, parent AGENTS.md &quot;NO BLUFF&quot; section, par
 Project-Agnostic / 100% Decoupled</h2>
 <p><strong>This module is part of HelixQA&#39;s dependency graph and MUST
 remain 100% decoupled from any consuming project. It is designed for
-generic use with ANY project, not just ATMOSphere.</strong></p>
+generic use with ANY project, not just the consuming project.</strong></p>
 <ul>
 <li><strong>NEVER</strong> hardcode project-specific package names,
 endpoints, device serials, or region-specific data.</li>
@@ -614,10 +614,10 @@ network + volume</li>
 </ul>
 <h2 id="composition-how-the-pieces-combine">Composition: how the pieces
 combine</h2>
-<p>The adapter layer that HelixAgent uses
+<p>The adapter layer that the consuming project uses
 (<code>internal/adapters/containers/adapter.go</code>) wires the module
 together as follows:</p>
-<pre><code>HelixAgent BootManager → Adapter.BootAll(endpoints)
+<pre><code>the consuming project BootManager → Adapter.BootAll(endpoints)
          │
          ├── ContainerRuntime  (auto-detected: Docker / Podman / containerd)
          ├── ComposeOrchestrator  (compose file parse + up/down, local or remote)
@@ -636,12 +636,12 @@ either calls the local runtime directly or wraps it in RemoteRuntime for
 SSH execution.</p>
 <h2 id="mandatory-container-orchestration-flow-inline">Mandatory
 Container Orchestration Flow (inline)</h2>
-<p>This is what the root HelixAgent <code>CLAUDE.md</code> Hard Stop #2
+<p>This is what the consuming project's root <code>CLAUDE.md</code> Hard Stop #2
 refers to. The flow is:</p>
 <ol type="1">
 <li><strong>Build:</strong> <code>make build</code> →
 <code>./bin/helixagent</code>.</li>
-<li><strong>Env load:</strong> HelixAgent reads
+<li><strong>Env load:</strong> the consuming project reads
 <code>Containers/.env</code> via <code>envconfig.LoadFromFile()</code>:
 <ul>
 <li><code>CONTAINERS_REMOTE_ENABLED</code> (bool)</li>
@@ -754,7 +754,7 @@ failing. Use a realistic deadline.</li>
 SCPs build contexts to the remote host <em>except</em> when the context
 path matches the project root (via <code>filepath.Clean</code>
 comparison). <code>build: { context: . }</code> pointing at the
-HelixAgent root is silently skipped so the whole 27 GB tree isn&#39;t
+consuming project's root is silently skipped so the whole 27 GB tree isn&#39;t
 shipped. This is intentional.</li>
 <li><strong>Volume timing:</strong> VolumeManager mounts volumes
 <em>after</em> container start. If a container needs the volume at
@@ -781,7 +781,7 @@ auto-discovery / state callbacks here.</li>
 <code>CONTAINERS_REMOTE_*</code> variables here.</li>
 <li><code>pkg/orchestrator/orchestrator.go</code> — multi-service boot
 ordering, rollback.</li>
-<li>HelixAgent side:
+<li>the consuming project side:
 <code>internal/adapters/containers/adapter.go</code> — the single
 integration point.</li>
 </ul>
@@ -791,7 +791,7 @@ integration point.</li>
 <li><strong>Downstream (sibling modules):</strong>
 <code>Challenges</code>, <code>HelixLLM</code>,
 <code>HelixQA</code>.</li>
-<li><strong>HelixAgent consumers:</strong>
+<li><strong>the consuming project consumers:</strong>
 <code>internal/adapters/containers/adapter.go</code>,
 <code>internal/services/boot_manager.go</code>.</li>
 <li><strong>Hard external dependencies:</strong> SSH client binaries, a
@@ -809,7 +809,7 @@ rule workable — use it instead of sudo.)</p>
 <h2 id="universal-mandatory-constraints">Universal Mandatory
 Constraints</h2>
 <p>These rules are non-negotiable across every project, submodule, and
-sibling repository. They are derived from the HelixAgent root
+sibling repository. They are derived from the consuming project's root
 <code>CLAUDE.md</code>. Each project MUST surface them in its own
 <code>CLAUDE.md</code>, <code>AGENTS.md</code>, and
 <code>CONSTITUTION.md</code>. Project-specific addenda are welcome but
@@ -1155,15 +1155,15 @@ not silently absorb that as a generic PASS-bluff banner.</li>
 </ul>
 <p>Non-compliance is a release blocker regardless of context.</p>
 <hr />
-<h2 id="lava-sixth-law-inheritance-consumer-side-anchor-2026-04-29">Lava
+<h2 id="lava-sixth-law-inheritance-consumer-side-anchor-2026-04-29">The consuming project
 Sixth Law inheritance (consumer-side anchor, 2026-04-29)</h2>
-<p>When this submodule is consumed by the <strong>Lava</strong> project
-(<code>vasic-digital/Lava</code>), it inherits Lava&#39;s Sixth Law (&quot;Real
+<p>When this submodule is consumed by the <strong>the consuming project</strong> project
+(<code>vasic-digital/Lava</code>), it inherits the consuming project&#39;s Sixth Law (&quot;Real
 User Verification — Anti-Pseudo-Test Rule&quot;) from the consumer&#39;s
-<code>CLAUDE.md</code>. Lava&#39;s Sixth Law is functionally equivalent to
+<code>CLAUDE.md</code>. The consuming project&#39;s Sixth Law is functionally equivalent to
 (and strictly stricter than) the anti-bluff rules already present in
 this submodule; the verbatim user mandate recorded 2026-04-28 by the
-operator of the Lava codebase that motivated both is:</p>
+operator of the consuming project's codebase that motivated both is:</p>
 <blockquote>
 <p>&quot;We had been in position that all tests do execute with success and
 all Challenges as well, but in reality the most of the features does not
@@ -1174,9 +1174,9 @@ of our project, its CLAUDE.MD and AGENTS.MD if it is not there already,
 and to be applied to all Submodules&#39;s Constitution, CLAUDE.MD and
 AGENTS.MD as well (if not there already)!&quot;</p>
 </blockquote>
-<p>The 2026-04-29 lessons-learned addenda recorded in Lava&#39;s
+<p>The 2026-04-29 lessons-learned addenda recorded in the consuming project&#39;s
 <code>CLAUDE.md</code> apply to any code path of this submodule that
-participates in a Lava feature:</p>
+participates in a consuming-project feature:</p>
 <ul>
 <li><strong>6.A — Real-binary contract tests.</strong> Every
 script/compose invocation of a binary we own MUST have a contract test
@@ -1198,18 +1198,18 @@ converge to the same SHA at HEAD&quot;. <code>scripts/tag.sh</code> MUST
 verify post-push tip-SHA convergence across every configured
 mirror.</li>
 </ul>
-<p>Both anti-bluff rule sets — this submodule&#39;s own and Lava&#39;s Sixth Law
-— are binding when this submodule is consumed by Lava; the stricter of
-the two applies. No consumer&#39;s rule may <em>relax</em> Lava&#39;s six
+<p>Both anti-bluff rule sets — this submodule&#39;s own and the consuming project&#39;s Sixth Law
+— are binding when this submodule is consumed by the consuming project; the stricter of
+the two applies. No consumer&#39;s rule may <em>relax</em> the consuming project&#39;s six
 Sixth-Law clauses without changing this submodule&#39;s classification (i.e.
-demoting it from Lava-compatible).</p>
-<h2 id="lava-seventh-law-inheritance-anti-bluff-enforcement-2026-04-30">Lava
+demoting it from consuming-project-compatible).</p>
+<h2 id="lava-seventh-law-inheritance-anti-bluff-enforcement-2026-04-30">The consuming project
 Seventh Law inheritance (Anti-Bluff Enforcement, 2026-04-30)</h2>
-<p>When this submodule is consumed by the <strong>Lava</strong> project
-(<code>vasic-digital/Lava</code>), it inherits Lava&#39;s <strong>Seventh
+<p>When this submodule is consumed by the <strong>the consuming project</strong> project
+(<code>vasic-digital/Lava</code>), it inherits the consuming project&#39;s <strong>Seventh
 Law — Tests MUST Confirm User-Reachable Functionality (Anti-Bluff
 Enforcement)</strong> in addition to the Sixth Law inherited above. The
-Seventh Law was added to Lava&#39;s <code>CLAUDE.md</code> on 2026-04-30 in
+Seventh Law was added to the consuming project&#39;s <code>CLAUDE.md</code> on 2026-04-30 in
 response to the operator&#39;s standing mandate that passing tests MUST
 guarantee user-reachable functionality and MUST NOT recur the historical
 &quot;all-tests-green / most-features-broken&quot; failure mode. The Seventh Law
@@ -1258,11 +1258,11 @@ applies recursively to every submodule, every feature, and every new
 artifact. Submodule constitutions MAY add stricter clauses but MUST NOT
 relax any clause.</li>
 </ol>
-<p>The authoritative verbatim text lives in the parent Lava
+<p>The authoritative verbatim text lives in the parent project's
 <code>CLAUDE.md</code> &quot;Seventh Law — Tests MUST Confirm User-Reachable
 Functionality (Anti-Bluff Enforcement)&quot; section. Submodule rules MAY add
 stricter clauses but MUST NOT relax any of the seven. Both the Sixth and
-Seventh Laws are binding when this submodule is consumed by Lava; the
+Seventh Laws are binding when this submodule is consumed by the consuming project; the
 stricter of the two applies.</p>
 <h2 id="clauses-6i-and-6j-added-2026-05-04-inherited-per-6f">Clauses 6.I
 and 6.J (added 2026-05-04, inherited per 6.F)</h2>
@@ -1271,7 +1271,7 @@ and 6.J (added 2026-05-04, inherited per 6.F)</h2>
 Equivalent</strong> — see root <code>/CLAUDE.md</code> §6.I. Real-stack
 verification, where this submodule&#39;s work requires it (per 6.G clause 5
 / Sixth Law clause 5 / Seventh Law clause 3), is satisfied ONLY by the
-project&#39;s container-bound multi-emulator matrix where the consuming Lava
+project&#39;s container-bound multi-emulator matrix where the consuming the consuming project
 feature touches the UI; for pure-library code paths covered here,
 real-stack means real implementations of all dependencies (real
 database, real HTTP socket, real cache backend, real timer, real
@@ -1294,7 +1294,7 @@ and 6.L (added 2026-05-04, inherited per 6.F)</h2>
 (SOURCE-OF-TRUTH variant)</strong> — see root <code>/CLAUDE.md</code>
 §6.K. <strong>This submodule is the SOURCE OF TRUTH for the project&#39;s
 container-bound build path.</strong> Every release-artifact build in the
-consuming Lava project (Android <code>:app</code> debug + release APKs,
+consuming project (Android <code>:app</code> debug + release APKs,
 Ktor <code>:proxy</code> fat JAR, <code>lava-api-go</code> static
 binaries, OCI image tarballs, anything signed for release, anything
 whose output is consumed by the clause-6.I emulator-matrix gate) MUST go
@@ -1313,7 +1313,7 @@ to add:</strong></p>
 <li><strong><code>pkg/emulator/</code></strong> — first-class Android
 emulator orchestration in containers (cold-boot per clause 6.I,
 <code>adb</code> wired to host, APK install, instrumentation drive,
-per-AVD attestation collection, teardown). Lava&#39;s
+per-AVD attestation collection, teardown). The consuming project&#39;s
 <code>scripts/run-emulator-tests.sh</code> becomes thin glue invoking
 this package&#39;s CLI.</li>
 <li><strong><code>pkg/vm/</code></strong> (or sibling under
@@ -1321,23 +1321,23 @@ this package&#39;s CLI.</li>
 cross-architecture testing (ARM, RISC-V, MIPS via KVM-accelerated
 containers); roadmap items for non-Android OS emulators
 (Alpine/Debian/Fedora/Arch, FreeBSD, minimal Windows for
-<code>gradlew.bat</code> parity); iOS/macOS out of scope until Lava
+<code>gradlew.bat</code> parity); iOS/macOS out of scope until the consuming project
 ships an iOS client.</li>
 </ul>
 <p>Until these packages ship, <strong>clause 6.K-debt is OPEN against
-this submodule</strong> and Lava-side transitional glue
+this submodule</strong> and consumer-side transitional glue
 (<code>docker-compose.test.yml</code>,
 <code>docker/emulator/Dockerfile</code>,
-<code>scripts/run-emulator-tests.sh</code>) remains in the Lava repo as
+<code>scripts/run-emulator-tests.sh</code>) remains in the consuming project's repo as
 constitutional debt. The next phase of this submodule that touches
 release tagging, build orchestration, or the emulator-matrix gate output
 MUST close 6.K-debt before its tag, and the close MUST: (1) add
 <code>pkg/emulator/</code> extending <code>pkg/runtime</code> +
 <code>pkg/lifecycle</code>, (2) add at least the QEMU baseline to
 <code>pkg/vm/</code>, (3) provide thin-glue CLI surfaces consumed by
-Lava&#39;s transitional scripts so they can be retired, (4) update
+the consuming project&#39;s transitional scripts so they can be retired, (4) update
 <code>scripts/check-constitution.sh</code> per root §6.K clause 5 to
-verify (a) the package presence, (b) Lava-side thin-glue invocation, (c)
+verify (a) the package presence, (b) consumer-side thin-glue invocation, (c)
 at least one passing real-container-emulator-boot test inside
 <code>pkg/emulator/</code>. No release tag of this submodule is cut
 while this debt is open, except for hotfixes whose changeset does not
@@ -1362,7 +1362,7 @@ existing tests and Challenges!&quot;. If you find yourself rationalizing a
 Archive stuck-on-loading bug, the broken post-login navigation, the
 credential leak in C2, the bluffed C1-C8 — these are what &quot;small
 exceptions&quot; produce. Because this submodule is the SOURCE OF TRUTH for
-build orchestration, a bluff here propagates to every Lava artifact the
+build orchestration, a bluff here propagates to every consuming-project artifact the
 gate produces — clause 6.L applies with extra weight to
 <code>pkg/emulator/</code>, <code>pkg/vm/</code>,
 <code>cmd/distributed-build</code>, and
@@ -1412,7 +1412,7 @@ making the 7-step forensic protocol scriptable rather than re-derived
 from scratch on every incident.</li>
 <li><strong>Inheritance.</strong> Submodule-internal tests and CI gates
 inherit clause 6.M; a Containers-side incident MUST be recorded in the
-consuming Lava project&#39;s
+consuming project&#39;s
 <code>.lava-ci-evidence/sixth-law-incidents/&lt;date&gt;.json</code>
 AND, where the submodule is consumed standalone, in
 <code>.evidence/host-stability/&lt;date&gt;.json</code> at the
@@ -1429,7 +1429,7 @@ Coverage (Containers source-of-truth variant)</strong> — see root
 <code>/CLAUDE.md</code> §6.N. Containers is the SOURCE OF TRUTH for the
 matrix-runner gate code (<code>pkg/emulator/</code>,
 <code>cmd/emulator-matrix/</code>); a bluff in this submodule&#39;s
-gate-shaping production code propagates to every Lava attestation that
+gate-shaping production code propagates to every consuming-project attestation that
 depends on the gate. Rules binding here:
 <ol type="1">
 <li><strong>Bluff-rehearsal on every <code>pkg/emulator/</code>
@@ -1461,7 +1461,7 @@ fix added
 multi-target / contention scenarios.</li>
 <li><strong>Inheritance.</strong> Submodule-internal CI gates inherit
 clause 6.N; a Containers-side bluff finding MUST be cross-recorded in
-the consuming Lava project&#39;s
+the consuming project&#39;s
 <code>.lava-ci-evidence/sixth-law-incidents/</code> AND in this
 submodule&#39;s <code>.evidence/bluff-hunt/</code> (or equivalent).</li>
 </ol></li>
@@ -1896,7 +1896,7 @@ relax.</p>
 — Continuation Document Maintenance Mandate (inherited 2026-05-06, per
 §6.F)</h2>
 <p>See root <code>/CLAUDE.md</code> §6.S. The file
-<code>docs/CONTINUATION.md</code> (in the parent Lava repo) is the
+<code>docs/CONTINUATION.md</code> (in the parent project's repo) is the
 single-file source-of-truth handoff document for resuming work across
 any CLI session. Every commit that changes phase status, lands a new
 spec/plan, bumps a submodule pin, ships a release artifact,
@@ -1947,7 +1947,7 @@ process INSIDE a podman/docker container managed by
 Containers-submodule code that runs on the host. The Containers
 submodule&#39;s <code>pkg/runtime/</code> (rootless podman/docker
 auto-detection) brings the container up; <code>pkg/emulator/</code>
-orchestrates the AVD lifecycle inside it. Lava-side
+orchestrates the AVD lifecycle inside it. Consumer-side
 <code>scripts/run-emulator-tests.sh</code> is thin glue forwarding to
 the Containers CLI. The container-bound path is the gate — host-direct
 emulators are permitted for workstation iteration only. §6.X-debt tracks
@@ -2527,7 +2527,7 @@ executed from the root of the cloned (added) repository - only if in it
 is Upstreams or upstreams directory present with bash script files
 (recipes) for all repository&#39;s upstreams!&quot;</em></p>
 </blockquote>
-<p>Every clone / add of a Git repository under HelixCode MUST be
+<p>Every clone / add of a Git repository under the consuming project MUST be
 followed by <code>install_upstreams</code> invocation from the
 repository&#39;s root IF its tree contains <code>upstreams/</code> (or
 legacy <code>Upstreams/</code> per CONST-052 transition) populated with

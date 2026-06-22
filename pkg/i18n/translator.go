@@ -12,7 +12,7 @@
 // implementation that loads bundles, calls an LLM, or composes from
 // configuration at runtime.
 //
-// Round 129 of the HelixCode CONST-046 sweep introduced this contract
+// Round 129 of the project's CONST-046 sweep introduced this contract
 // to externalise the most-frequently-end-user-visible literals embedded
 // across the distribution workflow phase descriptions and the buildpkg
 // executor error returns. Those strings travel verbatim into operator-

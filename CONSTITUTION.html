@@ -239,8 +239,7 @@ code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; }
 </header>
 <h2 id="inherited-from-helix-constitution">INHERITED FROM Helix
 Constitution</h2>
-<p>This module is a submodule of a Helix-family project (e.g. HelixCode,
-HelixAgent, ATMOSphere) that includes the Helix Constitution submodule
+<p>This module is a submodule of a Helix-family project (e.g. the consuming project) that includes the Helix Constitution submodule
 at the parent&#39;s <code>constitution/</code> path. All rules in
 <code>constitution/CLAUDE.md</code> and the
 <code>constitution/Constitution.md</code> it references (universal
@@ -262,14 +261,14 @@ constitution/Constitution.md</h2>
 <code>constitution/Constitution.md</code> it references) apply
 unconditionally. This file&#39;s rules below extend them — they MUST NOT
 weaken any inherited rule. See parent root <code>CLAUDE.md</code> §6.AD
-for the Lava-specific incorporation context (29th §6.L cycle,
+for the consuming-project-specific incorporation context (29th §6.L cycle,
 2026-05-14) and §6.AD-debt for the implementation-gap inventory. Use
 <code>constitution/find_constitution.sh</code> from the parent project
 root to resolve the absolute path of the submodule from any nested
 location.</p>
 <p>This Constitution governs the <code>digital.vasic.containers</code>
 module. It inherits the universal mandatory constraints cascaded from
-the HelixAgent root <code>CLAUDE.md</code> and applies them to this
+the consuming project's root <code>CLAUDE.md</code> and applies them to this
 module&#39;s scope. Module-specific addenda are welcome but cannot weaken or
 override the universal rules.</p>
 <h2 id="scope">Scope</h2>
@@ -277,13 +276,13 @@ override the universal rules.</p>
 Go module for container orchestration, health checking, lifecycle
 management, remote distribution, and service discovery across Docker,
 Podman, and Kubernetes runtimes. It is the single integration point
-through which the HelixAgent binary (and any other consumer) brings up
+through which the consuming project's binary (and any other consumer) brings up
 its full container topology — local and remote — driven entirely by the
 consumer&#39;s <code>.env</code> file (<code>Containers/.env</code> for
-HelixAgent).</p>
+the consuming project).</p>
 <p>This module is foundational: it has no upstream sibling modules and
 is consumed by <code>Challenges</code>, <code>HelixLLM</code>,
-<code>HelixQA</code>, and HelixAgent itself.</p>
+<code>HelixQA</code>, and the consuming project itself.</p>
 <h2 id="module-specific-invariants">Module-Specific Invariants</h2>
 <ol type="1">
 <li><strong>Project-agnostic.</strong> No hardcoded project-specific
@@ -316,7 +315,7 @@ distribution.</li>
 <h2 id="universal-mandatory-constraints">Universal Mandatory
 Constraints</h2>
 <p>These rules are non-negotiable across every project, submodule, and
-sibling repository. They are derived from the HelixAgent root
+sibling repository. They are derived from the consuming project's root
 <code>CLAUDE.md</code>. Each project MUST surface them in its own
 <code>CLAUDE.md</code>, <code>AGENTS.md</code>, and
 <code>CONSTITUTION.md</code>. Project-specific addenda are welcome but
@@ -459,7 +458,7 @@ any value other than <code>&#39;nothing&#39;</code> or <code>&#39;blank&#39;</co
 <p><strong>Why:</strong> The host runs mission-critical parallel
 CLI-agent and container workloads. On 2026-04-26 18:23:43 the host was
 auto- suspended by the GDM greeter&#39;s idle policy mid-session, killing
-HelixAgent and 41 dependent services. Recurring memory-pressure SIGKILLs
+the consuming project and 41 dependent services. Recurring memory-pressure SIGKILLs
 of <code>user@1000.service</code> (perceived as &quot;logged out&quot;) have the
 same outcome. Auto-suspend, hibernate, and any power-state transition
 are unsafe for this host.</p>
@@ -574,7 +573,7 @@ library API, operator directives) + parent
 <code>scripts/lib/host_session_safety.sh</code>.</p>
 <h2 id="mandatory-anti-bluff-validation-constitution-81--11">MANDATORY
 ANTI-BLUFF VALIDATION (Constitution §8.1 + §11)</h2>
-<p><strong>This submodule inherits the parent ATMOSphere project&#39;s
+<p><strong>This submodule inherits the parent project&#39;s
 anti-bluff covenant. A test that PASSes while the feature it claims to
 validate is unusable to an end user is the single most damaging failure
 mode in this codebase. It has shipped working-on-paper /
@@ -632,10 +631,10 @@ DEVELOPMENT PRINCIPLES&quot;, parent AGENTS.md &quot;NO BLUFF&quot; section, par
 <code>scripts/testing/meta_test_false_positive_proof.sh</code>.</p>
 <h2 id="seventh-law-inheritance-anti-bluff-enforcement-2026-04-30">Seventh
 Law inheritance (Anti-Bluff Enforcement, 2026-04-30)</h2>
-<p>In addition to the Sixth Law above, this submodule inherits Lava&#39;s
+<p>In addition to the Sixth Law above, this submodule inherits the consuming project&#39;s
 <strong>Seventh Law — Tests MUST Confirm User-Reachable Functionality
-(Anti-Bluff Enforcement)</strong> when consumed by the Lava project
-(<code>vasic-digital/Lava</code>). The Seventh Law was added to Lava&#39;s
+(Anti-Bluff Enforcement)</strong> when consumed by the consuming project
+(<code>vasic-digital/Lava</code>). The Seventh Law was added to the consuming project&#39;s
 <code>CLAUDE.md</code> on 2026-04-30 to mechanically enforce the Sixth
 Law: every test commit MUST carry a Bluff-Audit stamp
 (mutation/observed-failure/reverted protocol); every feature MUST pass a
@@ -644,17 +643,17 @@ real-device attestation; forbidden test patterns (mocking the SUT,
 verification-only assertions, ignored tests without follow-up,
 build-success-as-only-assertion) are pre-push-rejected; a recurring
 bluff hunt and a bluff discovery protocol apply.</p>
-<p>The authoritative verbatim text lives in the parent Lava
+<p>The authoritative verbatim text lives in the parent project's
 <code>CLAUDE.md</code> under &quot;Seventh Law — Tests MUST Confirm
 User-Reachable Functionality (Anti-Bluff Enforcement)&quot;. This submodule
 MAY add stricter clauses but MUST NOT relax any of the seven Seventh-Law
-clauses. Both the submodule&#39;s own anti-bluff rules and Lava&#39;s Sixth +
-Seventh Laws are binding when consumed by Lava; the stricter of the two
+clauses. Both the submodule&#39;s own anti-bluff rules and the consuming project&#39;s Sixth +
+Seventh Laws are binding when consumed by the consuming project; the stricter of the two
 applies.</p>
 <h2 id="clause-6l--anti-bluff-functional-reality-mandate-operators-standing-order">Clause
 6.L — Anti-Bluff Functional Reality Mandate (Operator&#39;s Standing
 Order)</h2>
-<p>Inherited verbatim from parent Lava <code>/CLAUDE.md</code> §6.L. The
+<p>Inherited verbatim from parent project's <code>/CLAUDE.md</code> §6.L. The
 operator has invoked this mandate <strong>TWENTY-THREE TIMES</strong>
 across two working days. The 10th invocation (2026-05-05, after Phase 7
 readiness was reported, when the operator commissioned the full
@@ -743,7 +742,7 @@ The operator THIRTEENTH §6.L invocation triggered this clause.</li>
 </ul>
 <h2 id="article-xi-119--anti-bluff-forensic-anchor-const-035--cascaded-from-helixcode-root">Article
 XI §11.9 — Anti-Bluff Forensic Anchor (CONST-035) — cascaded from
-HelixCode root</h2>
+the project root</h2>
 <blockquote>
 <p>Verbatim user mandate: <em>&quot;We had been in position that all tests do
 execute with success and all Challenges as well, but in reality the most
@@ -759,7 +758,7 @@ runtime evidence are critical defects regardless of how green the
 summary line looks. No false-success results are tolerable.</p>
 <p><strong>Repository scope:</strong> This anchor applies to all tests,
 all Challenges, and all CI/CD validation in this repository. It is
-cascaded from HelixCode root CONSTITUTION.md / CLAUDE.md / AGENTS.md and
+cascaded from the project root CONSTITUTION.md / CLAUDE.md / AGENTS.md and
 is identical across the HelixDevelopment + vasic-digital
 organizations.</p>
 <h2 id="const-036--continuation-document-maintenance-mandate">CONST-036
@@ -830,7 +829,7 @@ process INSIDE a podman/docker container managed by
 Containers-submodule code that runs on the host. The Containers
 submodule&#39;s <code>pkg/runtime/</code> (rootless podman/docker
 auto-detection) brings the container up; <code>pkg/emulator/</code>
-orchestrates the AVD lifecycle inside it. Lava-side
+orchestrates the AVD lifecycle inside it. Consumer-side
 <code>scripts/run-emulator-tests.sh</code> is thin glue forwarding to
 the Containers CLI. The container-bound path is the gate — host-direct
 emulators are permitted for workstation iteration only. §6.X-debt tracks
@@ -1470,7 +1469,7 @@ executed from the root of the cloned (added) repository - only if in it
 is Upstreams or upstreams directory present with bash script files
 (recipes) for all repository&#39;s upstreams!&quot;</em></p>
 </blockquote>
-<p>Every clone / add of a Git repository under HelixCode MUST be
+<p>Every clone / add of a Git repository under the consuming project MUST be
 followed by <code>install_upstreams</code> invocation from the
 repository&#39;s root IF its tree contains <code>upstreams/</code> (or
 legacy <code>Upstreams/</code> per CONST-052 transition) populated with

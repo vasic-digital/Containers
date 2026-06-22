@@ -276,7 +276,7 @@ constitution/AGENTS.md</h2>
 <code>constitution/Constitution.md</code> it references) apply
 unconditionally. This file&#39;s rules below extend them — they MUST NOT
 weaken any inherited rule. See parent root <code>CLAUDE.md</code> §6.AD
-for the Lava-specific incorporation context (29th §6.L cycle,
+for the consuming-project-specific incorporation context (29th §6.L cycle,
 2026-05-14) and §6.AD-debt for the implementation-gap inventory. Use
 <code>constitution/find_constitution.sh</code> from the parent project
 root to resolve the absolute path of the submodule from any nested
@@ -361,7 +361,7 @@ library API, operator directives) + parent
 <code>scripts/lib/host_session_safety.sh</code>.</p>
 <h2 id="mandatory-anti-bluff-validation-constitution-81--11">MANDATORY
 ANTI-BLUFF VALIDATION (Constitution §8.1 + §11)</h2>
-<p><strong>This submodule inherits the parent ATMOSphere project&#39;s
+<p><strong>This submodule inherits the parent project&#39;s
 anti-bluff covenant. A test that PASSes while the feature it claims to
 validate is unusable to an end user is the single most damaging failure
 mode in this codebase. It has shipped working-on-paper /
@@ -1132,7 +1132,7 @@ ships, it is finished.</p>
 <h2 id="universal-mandatory-constraints">Universal Mandatory
 Constraints</h2>
 <p>These rules are non-negotiable across every project, submodule, and
-sibling repository. They are derived from the HelixAgent root
+sibling repository. They are derived from the consuming project's root
 <code>CLAUDE.md</code>. Each project MUST surface them in its own
 <code>CLAUDE.md</code>, <code>AGENTS.md</code>, and
 <code>CONSTITUTION.md</code>. Project-specific addenda are welcome but
@@ -1491,15 +1491,15 @@ not silently absorb that as a generic PASS-bluff banner.</li>
 </ul>
 <p>Non-compliance is a release blocker regardless of context.</p>
 <hr />
-<h2 id="lava-sixth-law-inheritance-consumer-side-anchor-2026-04-29">Lava
+<h2 id="lava-sixth-law-inheritance-consumer-side-anchor-2026-04-29">The consuming project
 Sixth Law inheritance (consumer-side anchor, 2026-04-29)</h2>
-<p>When this submodule is consumed by the <strong>Lava</strong> project
-(<code>vasic-digital/Lava</code>), it inherits Lava&#39;s Sixth Law (&quot;Real
+<p>When this submodule is consumed by the <strong>the consuming project</strong> project
+(<code>vasic-digital/Lava</code>), it inherits the consuming project&#39;s Sixth Law (&quot;Real
 User Verification — Anti-Pseudo-Test Rule&quot;) from the consumer&#39;s
-<code>CLAUDE.md</code>. Lava&#39;s Sixth Law is functionally equivalent to
+<code>CLAUDE.md</code>. The consuming project&#39;s Sixth Law is functionally equivalent to
 (and strictly stricter than) the anti-bluff rules already present in
 this submodule; the verbatim user mandate recorded 2026-04-28 by the
-operator of the Lava codebase that motivated both is:</p>
+operator of the consuming project's codebase that motivated both is:</p>
 <blockquote>
 <p>&quot;We had been in position that all tests do execute with success and
 all Challenges as well, but in reality the most of the features does not
@@ -1510,9 +1510,9 @@ of our project, its CLAUDE.MD and AGENTS.MD if it is not there already,
 and to be applied to all Submodules&#39;s Constitution, CLAUDE.MD and
 AGENTS.MD as well (if not there already)!&quot;</p>
 </blockquote>
-<p>The 2026-04-29 lessons-learned addenda recorded in Lava&#39;s
+<p>The 2026-04-29 lessons-learned addenda recorded in the consuming project&#39;s
 <code>CLAUDE.md</code> apply to any code path of this submodule that
-participates in a Lava feature:</p>
+participates in a consuming-project feature:</p>
 <ul>
 <li><strong>6.A — Real-binary contract tests.</strong> Every
 script/compose invocation of a binary we own MUST have a contract test
@@ -1533,18 +1533,18 @@ container state alone are bluff tests under Sixth Law clauses 1 and
 the same SHA at HEAD&quot;. <code>scripts/tag.sh</code> MUST verify post-push
 tip-SHA convergence across every configured mirror.</li>
 </ul>
-<p>Both anti-bluff rule sets — this submodule&#39;s own and Lava&#39;s Sixth Law
-— are binding when this submodule is consumed by Lava; the stricter of
-the two applies. No consumer&#39;s rule may <em>relax</em> Lava&#39;s six
+<p>Both anti-bluff rule sets — this submodule&#39;s own and the consuming project&#39;s Sixth Law
+— are binding when this submodule is consumed by the consuming project; the stricter of
+the two applies. No consumer&#39;s rule may <em>relax</em> the consuming project&#39;s six
 Sixth-Law clauses without changing this submodule&#39;s classification (i.e.
-demoting it from Lava-compatible).</p>
-<h2 id="lava-seventh-law-inheritance-anti-bluff-enforcement-2026-04-30">Lava
+demoting it from consuming-project-compatible).</p>
+<h2 id="lava-seventh-law-inheritance-anti-bluff-enforcement-2026-04-30">The consuming project
 Seventh Law inheritance (Anti-Bluff Enforcement, 2026-04-30)</h2>
-<p>When this submodule is consumed by the <strong>Lava</strong> project
-(<code>vasic-digital/Lava</code>), it inherits Lava&#39;s <strong>Seventh
+<p>When this submodule is consumed by the <strong>the consuming project</strong> project
+(<code>vasic-digital/Lava</code>), it inherits the consuming project&#39;s <strong>Seventh
 Law — Tests MUST Confirm User-Reachable Functionality (Anti-Bluff
 Enforcement)</strong> in addition to the Sixth Law inherited above. The
-Seventh Law was added to Lava&#39;s <code>CLAUDE.md</code> on 2026-04-30 in
+Seventh Law was added to the consuming project&#39;s <code>CLAUDE.md</code> on 2026-04-30 in
 response to the operator&#39;s standing mandate that passing tests MUST
 guarantee user-reachable functionality and MUST NOT recur the historical
 &quot;all-tests-green / most-features-broken&quot; failure mode. The Seventh Law
@@ -1593,16 +1593,16 @@ applies recursively to every submodule, every feature, and every new
 artifact. Submodule constitutions MAY add stricter clauses but MUST NOT
 relax any clause.</li>
 </ol>
-<p>The authoritative verbatim text lives in the parent Lava
+<p>The authoritative verbatim text lives in the parent project's
 <code>CLAUDE.md</code> &quot;Seventh Law — Tests MUST Confirm User-Reachable
 Functionality (Anti-Bluff Enforcement)&quot; section. Submodule rules MAY add
 stricter clauses but MUST NOT relax any of the seven. Both the Sixth and
-Seventh Laws are binding when this submodule is consumed by Lava; the
+Seventh Laws are binding when this submodule is consumed by the consuming project; the
 stricter of the two applies.</p>
 <h2 id="anti-bluff-functional-reality-mandate-operators-standing-order--constitutional-clause-6l">Anti-Bluff
 Functional Reality Mandate (Operator&#39;s Standing Order — Constitutional
 clause 6.L)</h2>
-<p>Inherited verbatim from parent Lava <code>/CLAUDE.md</code> §6.L. The
+<p>Inherited verbatim from parent project's <code>/CLAUDE.md</code> §6.L. The
 operator has invoked this mandate <strong>TWENTY-THREE TIMES</strong>
 across two working days; the repetition itself is the forensic record.
 The 10th invocation (2026-05-05, immediately after Phase 7 readiness was
@@ -2115,7 +2115,7 @@ duplicated work.</p>
 <h2 id="6x--container-submodule-emulator-wiring-mandate-inherited-2026-05-13-per-6f">§6.X
 — Container-Submodule Emulator Wiring Mandate (inherited 2026-05-13, per
 §6.F)</h2>
-<p>Inherited verbatim from parent Lava <code>/CLAUDE.md</code> §6.X
+<p>Inherited verbatim from parent project's <code>/CLAUDE.md</code> §6.X
 (added 2026-05-13 in response to the operator&#39;s twenty-first §6.L
 invocation: &quot;when we rely / depend on emulator(s) needed for the testing
 of the System, make sure we boot up Container running Android emulator
@@ -2677,7 +2677,7 @@ executed from the root of the cloned (added) repository - only if in it
 is Upstreams or upstreams directory present with bash script files
 (recipes) for all repository&#39;s upstreams!&quot;</em></p>
 </blockquote>
-<p>Every clone / add of a Git repository under HelixCode MUST be
+<p>Every clone / add of a Git repository under the consuming project MUST be
 followed by <code>install_upstreams</code> invocation from the
 repository&#39;s root IF its tree contains <code>upstreams/</code> (or
 legacy <code>Upstreams/</code> per CONST-052 transition) populated with

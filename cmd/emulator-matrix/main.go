@@ -1,7 +1,7 @@
 // cmd/emulator-matrix — multi-AVD matrix runner for Android Compose UI
-// tests. Constitutional anchor: parent-Lava clause 6.I (Multi-Emulator
+// tests. Constitutional anchor: parent-project clause 6.I (Multi-Emulator
 // Container Matrix as Real-Device Equivalent) + clause 6.K
-// (Builds-Inside-Containers Mandate). Lava's
+// (Builds-Inside-Containers Mandate). the consuming project's
 // scripts/run-emulator-tests.sh becomes thin glue invoking this CLI
 // after this package ships.
 //
@@ -119,7 +119,7 @@ func main() {
 	flagCaptureScreenshot := flag.Bool("capture-screenshot-on-failure", true,
 		"Capture a forensic screenshot when a row fails. Default true; set false to opt out.")
 
-	// Parent Lava clause 6.X (Container-Submodule Emulator Wiring Mandate,
+	// Parent project's clause 6.X (Container-Submodule Emulator Wiring Mandate,
 	// added 2026-05-13) requires the emulator process to run INSIDE a
 	// podman/docker container for gate runs. Until §6.X-debt closes
 	// fully (Android-emulator container image baked + tested on Linux

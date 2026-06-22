@@ -77,7 +77,7 @@ type BuildResult struct {
 	// indicates either the build failed or the orchestrator could
 	// not stat the file. Useful for anti-bluff assertions (a
 	// "BUILD SUCCESSFUL" without a non-zero artifact is a bluff
-	// per Lava Sixth Law clause 6.B equivalent).
+	// per the consuming project's Sixth Law clause 6.B equivalent).
 	ArtifactSize int64
 
 	// BackendName identifies which Backend executed this build.

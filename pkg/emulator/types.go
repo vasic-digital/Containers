@@ -1,12 +1,12 @@
 // Package emulator provides multi-target emulator orchestration for the
 // vasic-digital container ecosystem. The package is the constitutional
 // landing for clause 6.K (Builds-Inside-Containers Mandate) and clause
-// 6.I (Multi-Emulator Container Matrix) — see the parent Lava project
+// 6.I (Multi-Emulator Container Matrix) — see the parent project
 // CLAUDE.md for the full clauses; this package's CLAUDE.md inheritance
 // applies them locally.
 //
 // The first supported target is Android. QEMU + non-Android OS emulators
-// are roadmap items recorded in the parent Lava plan doc
+// are roadmap items recorded in the parent project's plan doc
 // (docs/superpowers/plans/2026-05-04-pending-completion-plan.md) under
 // the 6.K-debt close criteria.
 //
@@ -204,12 +204,12 @@ type MatrixConfig struct {
 	// produced by RunInstrumentation. Empty means "skip JUnit parsing"
 	// — TestResult.FailureSummaries will be the empty slice.
 	//
-	// The convention's leakage point: Lava's connectedDebugAndroidTest
+	// The convention's leakage point: the consuming project's connectedDebugAndroidTest
 	// writes to "app/build/outputs/androidTest-results/connected/debug/
-	// TEST-*.xml" — that path is Lava-domain, not Containers-domain,
-	// per the Decoupled Reusable Architecture rule. The Lava-side
+	// TEST-*.xml" — that path is consumer-domain, not Containers-domain,
+	// per the Decoupled Reusable Architecture rule. The consumer-side
 	// thin-glue script (scripts/run-emulator-tests.sh) is the right
-	// place for the Lava-specific value; the Containers package
+	// place for the consuming-project-specific value; the Containers package
 	// stays project-agnostic.
 	//
 	// SAFETY under Concurrent>1: when this glob is non-empty AND

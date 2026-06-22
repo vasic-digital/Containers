@@ -82,7 +82,7 @@ SKIP-OK: #env-darwin-no-wine-container — wine-container backend requires Linux
 ```
 
 A PASS without an actual non-zero `.msi` is a bluff under
-CONST-035 § 11.4 + Lava Sixth Law 6.B. The Challenge enforces this
+CONST-035 § 11.4 + the consuming project's Sixth Law 6.B. The Challenge enforces this
 via `[[ -s "$OUTPUT_MSI" ]]` post-condition.
 
 ## When this approach hits its limits

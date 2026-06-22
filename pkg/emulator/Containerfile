@@ -1,6 +1,6 @@
 # Containerfile for the §6.X (Container-Submodule Emulator Wiring
 # Mandate) Android emulator image. This file is the deliverable
-# referenced by parent Lava CLAUDE.md §6.X-debt close criterion (3):
+# referenced by parent project's CLAUDE.md §6.X-debt close criterion (3):
 # "bake or fetch an Android-SDK-bearing container image".
 #
 # Buildable on: Linux x86_64 with /dev/kvm available.
@@ -24,7 +24,7 @@ FROM ${BASE_IMAGE}
 
 # Image identity — recorded in attestation rows per §6.X clause 6.
 LABEL org.opencontainers.image.title="lava-android-emulator"
-LABEL org.opencontainers.image.description="Headless Android emulator for §6.X gate runs (Lava + Containers)"
+LABEL org.opencontainers.image.description="Headless Android emulator for §6.X gate runs (the consuming project + Containers)"
 LABEL org.opencontainers.image.source="https://github.com/vasic-digital/Containers"
 LABEL org.opencontainers.image.licenses="See parent project LICENSE"
 LABEL digital.vasic.containers.clause="6.X"
