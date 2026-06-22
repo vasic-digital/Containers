@@ -1,6 +1,6 @@
 # Container Resource Limits — Policy & Reference
 
-> **One-line summary:** every container started under HelixAgent gets a
+> **One-line summary:** every container started under the consuming project gets a
 > hard memory cap, a swap cap equal to the memory cap, a pids cap, and a
 > positive `oom_score_adj` so the container is the preferred OOM-killer
 > victim — never the user's GUI session.
@@ -13,11 +13,11 @@ when adding a new container or stack.
 
 ## 1. The problem this policy solves
 
-On the dev workstation that hosts the HelixAgent stack, the user GUI
+On the dev workstation that hosts the consuming project's stack, the user GUI
 session has been observed to be torn down with
 `user@1000.service: Main process exited, code=killed, status=9/KILL`
 multiple times per day during heavy work sessions (Kimi CLI + Claude Code
-+ Podman compose stacks for Boba/MeTube + HelixAgent stacks).
++ Podman compose stacks for Boba/MeTube + the consuming project stacks).
 
 Forensics from `journalctl`:
 
@@ -283,5 +283,5 @@ generators; upgrade if you see it.
 ## 10. Change log
 
 * **2026-04-25** — Policy created. 443/443 user-owned services capped
-  across 35 compose files in the HelixAgent project. Go counterpart in
+  across 35 compose files in the consuming project. Go counterpart in
   `pkg/policy`. Comprehensive test suite (20 Python + 6 Go).

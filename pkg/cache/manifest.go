@@ -17,7 +17,7 @@ import (
 )
 
 // Manifest declares a project's pinned image artifacts. Lives outside
-// Containers (Lava ships its at tools/lava-containers/vm-images.json).
+// Containers (the consuming project ships its at tools/lava-containers/vm-images.json).
 // pkg/cache/ defines the schema; consumers populate it.
 type Manifest struct {
 	Version int          `json:"version"` // currently 1

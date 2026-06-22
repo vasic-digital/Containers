@@ -340,7 +340,7 @@ performs no sudo / suspend / hibernate / poweroff calls, never echoes secrets
 ## Android Emulator (pkg/emulator)
 
 `pkg/emulator` provides multi-target Android emulator orchestration satisfying
-parent Lava clauses 6.I (Multi-Emulator Container Matrix), 6.K
+parent project's clauses 6.I (Multi-Emulator Container Matrix), 6.K
 (Builds-Inside-Containers Mandate), 6.V (Container Emulators Mandate), and
 6.X (Container-Submodule Emulator Wiring Mandate).
 

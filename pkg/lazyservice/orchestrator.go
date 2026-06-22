@@ -1,4 +1,4 @@
-// Package lazyservice provides lazy container orchestration for HelixAgent.
+// Package lazyservice provides lazy container orchestration for the consuming project.
 // Services are started on-demand when first requested, with support for
 // dependency management, health checking, and multiple container runtimes.
 package lazyservice

@@ -323,13 +323,13 @@ sudo apt install docker-compose-plugin
 
 **Limitation**: Current design requires ALL containers on remote OR ALL local.
 
-**Workaround**: Use separate HelixAgent instances for mixed deployments.
+**Workaround**: Use separate the consuming project instances for mixed deployments.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     HelixAgent (Local)                       │
+│                     the consuming project (Local)                       │
 │                                                              │
 │  ┌─────────────────┐    ┌───────────────────────────────┐   │
 │  │   BootManager   │───▶│     Container Adapter         │   │

@@ -23,7 +23,7 @@ import (
 // auth via the LAVA_VM_SSH_KEY environment variable. The fake-driven
 // hermetic tests in qemu_test.go continue to drive QEMUVM through the
 // sshClient / qmpClient injection seams; the real impls below are
-// driven end-to-end by Lava's matrix-runner consumer rollout (Phase C).
+// driven end-to-end by the consuming project's matrix-runner consumer rollout (Phase C).
 //
 // Anti-bluff posture: every method below is exercised by an in-process
 // SSH-server / QMP-server test in clients_test.go, with the

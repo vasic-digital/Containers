@@ -1,6 +1,6 @@
 ## INHERITED FROM Helix Constitution
 
-This module is a submodule of an ATMOSphere-family project that
+This module is a submodule of a consuming project that
 includes the Helix Constitution submodule at the parent's
 `constitution/` path. All rules in `constitution/CLAUDE.md` and the
 `constitution/Constitution.md` it references (universal anti-bluff
@@ -22,12 +22,12 @@ Canonical reference: <https://github.com/HelixDevelopment/HelixConstitution>
 
 ## INHERITED FROM constitution/CLAUDE.md
 
-All rules in `constitution/CLAUDE.md` (and the `constitution/Constitution.md` it references) apply unconditionally. This file's rules below extend them — they MUST NOT weaken any inherited rule. See parent root `CLAUDE.md` §6.AD for the Lava-specific incorporation context (29th §6.L cycle, 2026-05-14) and §6.AD-debt for the implementation-gap inventory. Use `constitution/find_constitution.sh` from the parent project root to resolve the absolute path of the submodule from any nested location.
+All rules in `constitution/CLAUDE.md` (and the `constitution/Constitution.md` it references) apply unconditionally. This file's rules below extend them — they MUST NOT weaken any inherited rule. See parent root `CLAUDE.md` §6.AD for the consuming-project-specific incorporation context (29th §6.L cycle, 2026-05-14) and §6.AD-debt for the implementation-gap inventory. Use `constitution/find_constitution.sh` from the parent project root to resolve the absolute path of the submodule from any nested location.
 
 
 ## Definition of Done
 
-This module inherits HelixAgent's universal Definition of Done — see the root
+This module inherits the consuming project's universal Definition of Done — see the root
 `CLAUDE.md` and `docs/development/definition-of-done.md`. In one line: **no
 task is done without pasted output from a real run of the real system in the
 same session as the change.** Coverage and green suites are not evidence.
@@ -36,7 +36,7 @@ same session as the change.** Coverage and green suites are not evidence.
 
 ```bash
 # Real orchestration flow (Hard Stop #2 canonical demo)
-# Builds HelixAgent and boots every container declared in Containers/.env.
+# Builds the consuming project and boots every container declared in Containers/.env.
 cd /run/media/milosvasic/DATA4TB/Projects/HelixAgent
 make build
 GOMAXPROCS=2 nice -n 19 ./bin/helixagent &
@@ -122,7 +122,7 @@ parent `scripts/lib/host_session_safety.sh`.
 
 ## MANDATORY ANTI-BLUFF VALIDATION (Constitution §8.1 + §11)
 
-**This submodule inherits the parent ATMOSphere project's anti-bluff covenant.
+**This submodule inherits the parent project's anti-bluff covenant.
 A test that PASSes while the feature it claims to validate is unusable to an
 end user is the single most damaging failure mode in this codebase. It has
 shipped working-on-paper / broken-on-device builds before, and that MUST NOT
@@ -174,7 +174,7 @@ parent AGENTS.md "NO BLUFF" section, parent `scripts/testing/meta_test_false_pos
 
 ## MANDATORY: Project-Agnostic / 100% Decoupled
 
-**This module is part of HelixQA's dependency graph and MUST remain 100% decoupled from any consuming project. It is designed for generic use with ANY project, not just ATMOSphere.**
+**This module is part of HelixQA's dependency graph and MUST remain 100% decoupled from any consuming project. It is designed for generic use with ANY project, not just the consuming project.**
 
 - **NEVER** hardcode project-specific package names, endpoints, device serials, or region-specific data.
 - **NEVER** import anything from the consuming project.
@@ -272,10 +272,10 @@ go test -bench=. ./tests/benchmark/
 
 ## Composition: how the pieces combine
 
-The adapter layer that HelixAgent uses (`internal/adapters/containers/adapter.go`) wires the module together as follows:
+The adapter layer that the consuming project uses (`internal/adapters/containers/adapter.go`) wires the module together as follows:
 
 ```
-HelixAgent BootManager → Adapter.BootAll(endpoints)
+the consuming project BootManager → Adapter.BootAll(endpoints)
          │
          ├── ContainerRuntime  (auto-detected: Docker / Podman / containerd)
          ├── ComposeOrchestrator  (compose file parse + up/down, local or remote)
@@ -294,10 +294,10 @@ Distributor receives a batch of container requirements, asks Scheduler which hos
 
 ## Mandatory Container Orchestration Flow (inline)
 
-This is what the root HelixAgent `CLAUDE.md` Hard Stop #2 refers to. The flow is:
+This is what the consuming project's root `CLAUDE.md` Hard Stop #2 refers to. The flow is:
 
 1. **Build:** `make build` → `./bin/helixagent`.
-2. **Env load:** HelixAgent reads `Containers/.env` via `envconfig.LoadFromFile()`:
+2. **Env load:** the consuming project reads `Containers/.env` via `envconfig.LoadFromFile()`:
    - `CONTAINERS_REMOTE_ENABLED` (bool)
    - `CONTAINERS_REMOTE_HOST_N_*` (N = 1..100; loader stops at the first absent `_NAME`)
    - SSH pool, timeouts, scheduler strategy
@@ -346,7 +346,7 @@ Adding a host = append six env vars. No code change, N scales freely (this is CO
 1. **ControlMaster socket semantics:** the socket can outlive the last Release() by `ControlPersist`. If the network blips during that window, queued commands can hit a dead socket. Always `IsReachable()`-probe before assuming a host is live.
 2. **CommandTimeout vs. KeepAlive:** `CONTAINERS_REMOTE_COMMAND_TIMEOUT` (default 1800s) bounds the outer SSH command. `ServerAliveInterval`×`ServerAliveCountMax` = 30s × 10 = 5 min heartbeat tolerance. Never set `CommandTimeout` < `KeepAliveTotal`, or long compose builds with multi-GB image pulls will appear to hang and then die.
 3. **Context cancellation in `ScheduleBatch`:** host probes run synchronously. If ctx cancels mid-probe, Scheduler uses whatever snapshots it has — placements may be suboptimal rather than failing. Use a realistic deadline.
-4. **Build-context skip:** `RemoteComposeUp` SCPs build contexts to the remote host *except* when the context path matches the project root (via `filepath.Clean` comparison). `build: { context: . }` pointing at the HelixAgent root is silently skipped so the whole 27 GB tree isn't shipped. This is intentional.
+4. **Build-context skip:** `RemoteComposeUp` SCPs build contexts to the remote host *except* when the context path matches the project root (via `filepath.Clean` comparison). `build: { context: . }` pointing at the consuming project's root is silently skipped so the whole 27 GB tree isn't shipped. This is intentional.
 5. **Volume timing:** VolumeManager mounts volumes *after* container start. If a container needs the volume at bind-mount time (read-only config at entrypoint), it fails. Use retrying health checks or init containers that wait for the mount.
 6. **No auto-failover:** a failed container is not moved to a backup host automatically. `Distribute()` is not idempotent; `Undistribute()` is. Call `Rebalance()` or the `Undistribute → Distribute` pair to retry.
 
@@ -358,13 +358,13 @@ Adding a host = append six env vars. No code change, N scales freely (this is CO
 - `pkg/remote/host_manager.go` — host registry; add host auto-discovery / state callbacks here.
 - `pkg/envconfig/parser.go` — env-var loader; add new `CONTAINERS_REMOTE_*` variables here.
 - `pkg/orchestrator/orchestrator.go` — multi-service boot ordering, rollback.
-- HelixAgent side: `internal/adapters/containers/adapter.go` — the single integration point.
+- The consuming project side: `internal/adapters/containers/adapter.go` — the single integration point.
 
 ## Integration Seams
 
 - **Upstream:** none (this module is foundational).
 - **Downstream (sibling modules):** `Challenges`, `HelixLLM`, `HelixQA`.
-- **HelixAgent consumers:** `internal/adapters/containers/adapter.go`, `internal/services/boot_manager.go`.
+- **The consuming project consumers:** `internal/adapters/containers/adapter.go`, `internal/services/boot_manager.go`.
 - **Hard external dependencies:** SSH client binaries, a container runtime on the local machine (Docker/Podman/etc.), SSH server + container runtime on each configured remote host, SSH network reachability.
 
 ## Commit Style
@@ -379,7 +379,7 @@ Conventional Commits: `feat(runtime): add Kubernetes support`
 ## Universal Mandatory Constraints
 
 These rules are non-negotiable across every project, submodule, and sibling
-repository. They are derived from the HelixAgent root `CLAUDE.md`. Each
+repository. They are derived from the consuming project's root `CLAUDE.md`. Each
 project MUST surface them in its own `CLAUDE.md`, `AGENTS.md`, and
 `CONSTITUTION.md`. Project-specific addenda are welcome but cannot weaken
 or override these.
@@ -723,24 +723,24 @@ Non-compliance is a release blocker regardless of context.
 
 ---
 
-## Lava Sixth Law inheritance (consumer-side anchor, 2026-04-29)
+## The consuming project's Sixth Law inheritance (consumer-side anchor, 2026-04-29)
 
-When this submodule is consumed by the **Lava** project (`vasic-digital/Lava`), it inherits Lava's Sixth Law ("Real User Verification — Anti-Pseudo-Test Rule") from the consumer's `CLAUDE.md`. Lava's Sixth Law is functionally equivalent to (and strictly stricter than) the anti-bluff rules already present in this submodule; the verbatim user mandate recorded 2026-04-28 by the operator of the Lava codebase that motivated both is:
+When this submodule is consumed by the **consuming project** (`vasic-digital/Lava`), it inherits the consuming project's Sixth Law ("Real User Verification — Anti-Pseudo-Test Rule") from the consumer's `CLAUDE.md`. The consuming project's Sixth Law is functionally equivalent to (and strictly stricter than) the anti-bluff rules already present in this submodule; the verbatim user mandate recorded 2026-04-28 by the operator of the consuming project's codebase that motivated both is:
 
 > "We had been in position that all tests do execute with success and all Challenges as well, but in reality the most of the features does not work and can't be used! This MUST NOT be the case and execution of tests and Challenges MUST guarantee the quality, the completion and full usability by end users of the product! This MUST BE part of Constitution of our project, its CLAUDE.MD and AGENTS.MD if it is not there already, and to be applied to all Submodules's Constitution, CLAUDE.MD and AGENTS.MD as well (if not there already)!"
 
-The 2026-04-29 lessons-learned addenda recorded in Lava's `CLAUDE.md` apply to any code path of this submodule that participates in a Lava feature:
+The 2026-04-29 lessons-learned addenda recorded in the consuming project's `CLAUDE.md` apply to any code path of this submodule that participates in a consuming-project feature:
 
 - **6.A — Real-binary contract tests.** Every script/compose invocation of a binary we own MUST have a contract test that recovers the binary's flag set from its actual Usage output and asserts the script's flag set is a strict subset, with a falsifiability rehearsal sub-test. Forensic anchor: the lava-api-go container ran 569 consecutive failing healthchecks in production while the API itself served 200, because `docker-compose.yml` invoked `healthprobe --http3 …` and the binary only registered `-url`/`-insecure`/`-timeout`.
 - **6.B — Container "Up" is not application-healthy.** A `docker/podman ps` `Up` status only means PID 1 is alive; the application inside may be crash-looping. Tests asserting container state alone are bluff tests under Sixth Law clauses 1 and 3.
 - **6.C — Mirror-state mismatch checks before tagging.** "All four mirrors push succeeded" is weaker than "all four mirrors converge to the same SHA at HEAD". `scripts/tag.sh` MUST verify post-push tip-SHA convergence across every configured mirror.
 
-Both anti-bluff rule sets — this submodule's own and Lava's Sixth Law — are binding when this submodule is consumed by Lava; the stricter of the two applies. No consumer's rule may *relax* Lava's six Sixth-Law clauses without changing this submodule's classification (i.e. demoting it from Lava-compatible).
+Both anti-bluff rule sets — this submodule's own and the consuming project's Sixth Law — are binding when this submodule is consumed by the consuming project; the stricter of the two applies. No consumer's rule may *relax* the consuming project's six Sixth-Law clauses without changing this submodule's classification (i.e. demoting it from consuming-project-compatible).
 
 
-## Lava Seventh Law inheritance (Anti-Bluff Enforcement, 2026-04-30)
+## The consuming project's Seventh Law inheritance (Anti-Bluff Enforcement, 2026-04-30)
 
-When this submodule is consumed by the **Lava** project (`vasic-digital/Lava`), it inherits Lava's **Seventh Law — Tests MUST Confirm User-Reachable Functionality (Anti-Bluff Enforcement)** in addition to the Sixth Law inherited above. The Seventh Law was added to Lava's `CLAUDE.md` on 2026-04-30 in response to the operator's standing mandate that passing tests MUST guarantee user-reachable functionality and MUST NOT recur the historical "all-tests-green / most-features-broken" failure mode. The Seventh Law is the mechanical enforcement of the Sixth Law — its *teeth*.
+When this submodule is consumed by the **consuming project** (`vasic-digital/Lava`), it inherits the consuming project's **Seventh Law — Tests MUST Confirm User-Reachable Functionality (Anti-Bluff Enforcement)** in addition to the Sixth Law inherited above. The Seventh Law was added to the consuming project's `CLAUDE.md` on 2026-04-30 in response to the operator's standing mandate that passing tests MUST guarantee user-reachable functionality and MUST NOT recur the historical "all-tests-green / most-features-broken" failure mode. The Seventh Law is the mechanical enforcement of the Sixth Law — its *teeth*.
 
 This submodule's tests inherit the Seventh Law's seven clauses verbatim:
 
@@ -752,21 +752,21 @@ This submodule's tests inherit the Seventh Law's seven clauses verbatim:
 6. **Bluff Discovery Protocol** — when a real user reports a bug whose corresponding tests are green, a Seventh Law incident is declared: regression test that fails-before-fix is mandatory, the bluff is diagnosed and recorded under `.lava-ci-evidence/sixth-law-incidents/<date>.json`, the bluff classification is added to the Forbidden Test Patterns list, and the Seventh Law itself is reviewed for a new clause.
 7. **Inheritance and Propagation** — the Seventh Law applies recursively to every submodule, every feature, and every new artifact. Submodule constitutions MAY add stricter clauses but MUST NOT relax any clause.
 
-The authoritative verbatim text lives in the parent Lava `CLAUDE.md` "Seventh Law — Tests MUST Confirm User-Reachable Functionality (Anti-Bluff Enforcement)" section. Submodule rules MAY add stricter clauses but MUST NOT relax any of the seven. Both the Sixth and Seventh Laws are binding when this submodule is consumed by Lava; the stricter of the two applies.
+The authoritative verbatim text lives in the parent project's `CLAUDE.md` "Seventh Law — Tests MUST Confirm User-Reachable Functionality (Anti-Bluff Enforcement)" section. Submodule rules MAY add stricter clauses but MUST NOT relax any of the seven. Both the Sixth and Seventh Laws are binding when this submodule is consumed by the consuming project; the stricter of the two applies.
 
 ## Clauses 6.I and 6.J (added 2026-05-04, inherited per 6.F)
 
-- **Clause 6.I — Multi-Emulator Container Matrix as Real-Device Equivalent** — see root `/CLAUDE.md` §6.I. Real-stack verification, where this submodule's work requires it (per 6.G clause 5 / Sixth Law clause 5 / Seventh Law clause 3), is satisfied ONLY by the project's container-bound multi-emulator matrix where the consuming Lava feature touches the UI; for pure-library code paths covered here, real-stack means real implementations of all dependencies (real database, real HTTP socket, real cache backend, real timer, real filesystem) at the boundary the library claims to cover — not mocks of those dependencies. A single passing emulator (or single happy-path test) is NOT the gate.
+- **Clause 6.I — Multi-Emulator Container Matrix as Real-Device Equivalent** — see root `/CLAUDE.md` §6.I. Real-stack verification, where this submodule's work requires it (per 6.G clause 5 / Sixth Law clause 5 / Seventh Law clause 3), is satisfied ONLY by the project's container-bound multi-emulator matrix where the consuming-project feature touches the UI; for pure-library code paths covered here, real-stack means real implementations of all dependencies (real database, real HTTP socket, real cache backend, real timer, real filesystem) at the boundary the library claims to cover — not mocks of those dependencies. A single passing emulator (or single happy-path test) is NOT the gate.
 - **Clause 6.J — Anti-Bluff Functional Reality Mandate** — see root `/CLAUDE.md` §6.J. Every test, every Challenge Test, and every CI gate touched by this submodule MUST do exactly one job: confirm the feature it claims to cover actually works for an end user, end-to-end, on the gating matrix. CI green is necessary, never sufficient. Adding a test the author cannot execute against the gating matrix is itself a bluff. Tests must guarantee the product works — anything else is theatre.
 
 ## Clauses 6.K and 6.L (added 2026-05-04, inherited per 6.F)
 
-- **Clause 6.K — Builds-Inside-Containers Mandate (SOURCE-OF-TRUTH variant)** — see root `/CLAUDE.md` §6.K. **This submodule is the SOURCE OF TRUTH for the project's container-bound build path.** Every release-artifact build in the consuming Lava project (Android `:app` debug + release APKs, Ktor `:proxy` fat JAR, `lava-api-go` static binaries, OCI image tarballs, anything signed for release, anything whose output is consumed by the clause-6.I emulator-matrix gate) MUST go through this submodule's build orchestration. The existing capability surface — `pkg/runtime` (Docker/Podman/K8s runtime abstraction), `pkg/compose` (Docker Compose orchestration), `pkg/orchestrator` (multi-service boot ordering, rollback), `pkg/health` (TCP/HTTP/gRPC/Custom health checks), `pkg/lifecycle` (lazy boot, idle shutdown, semaphores), `pkg/distribution` (placement + deployment orchestration), `cmd/distributed-build`, `cmd/distributed-test` — is the foundation the clause-6.K extensions build on. **The two new packages mandated by clause 6.K are this submodule's responsibility to add:**
-  - **`pkg/emulator/`** — first-class Android emulator orchestration in containers (cold-boot per clause 6.I, `adb` wired to host, APK install, instrumentation drive, per-AVD attestation collection, teardown). Lava's `scripts/run-emulator-tests.sh` becomes thin glue invoking this package's CLI.
-  - **`pkg/vm/`** (or sibling under `pkg/emulator/qemu/`) — QEMU full-system emulation for cross-architecture testing (ARM, RISC-V, MIPS via KVM-accelerated containers); roadmap items for non-Android OS emulators (Alpine/Debian/Fedora/Arch, FreeBSD, minimal Windows for `gradlew.bat` parity); iOS/macOS out of scope until Lava ships an iOS client.
+- **Clause 6.K — Builds-Inside-Containers Mandate (SOURCE-OF-TRUTH variant)** — see root `/CLAUDE.md` §6.K. **This submodule is the SOURCE OF TRUTH for the project's container-bound build path.** Every release-artifact build in the consuming project (Android `:app` debug + release APKs, Ktor `:proxy` fat JAR, `lava-api-go` static binaries, OCI image tarballs, anything signed for release, anything whose output is consumed by the clause-6.I emulator-matrix gate) MUST go through this submodule's build orchestration. The existing capability surface — `pkg/runtime` (Docker/Podman/K8s runtime abstraction), `pkg/compose` (Docker Compose orchestration), `pkg/orchestrator` (multi-service boot ordering, rollback), `pkg/health` (TCP/HTTP/gRPC/Custom health checks), `pkg/lifecycle` (lazy boot, idle shutdown, semaphores), `pkg/distribution` (placement + deployment orchestration), `cmd/distributed-build`, `cmd/distributed-test` — is the foundation the clause-6.K extensions build on. **The two new packages mandated by clause 6.K are this submodule's responsibility to add:**
+  - **`pkg/emulator/`** — first-class Android emulator orchestration in containers (cold-boot per clause 6.I, `adb` wired to host, APK install, instrumentation drive, per-AVD attestation collection, teardown). The consuming project's `scripts/run-emulator-tests.sh` becomes thin glue invoking this package's CLI.
+  - **`pkg/vm/`** (or sibling under `pkg/emulator/qemu/`) — QEMU full-system emulation for cross-architecture testing (ARM, RISC-V, MIPS via KVM-accelerated containers); roadmap items for non-Android OS emulators (Alpine/Debian/Fedora/Arch, FreeBSD, minimal Windows for `gradlew.bat` parity); iOS/macOS out of scope until the consuming project ships an iOS client.
 
-  Until these packages ship, **clause 6.K-debt is OPEN against this submodule** and Lava-side transitional glue (`docker-compose.test.yml`, `docker/emulator/Dockerfile`, `scripts/run-emulator-tests.sh`) remains in the Lava repo as constitutional debt. The next phase of this submodule that touches release tagging, build orchestration, or the emulator-matrix gate output MUST close 6.K-debt before its tag, and the close MUST: (1) add `pkg/emulator/` extending `pkg/runtime` + `pkg/lifecycle`, (2) add at least the QEMU baseline to `pkg/vm/`, (3) provide thin-glue CLI surfaces consumed by Lava's transitional scripts so they can be retired, (4) update `scripts/check-constitution.sh` per root §6.K clause 5 to verify (a) the package presence, (b) Lava-side thin-glue invocation, (c) at least one passing real-container-emulator-boot test inside `pkg/emulator/`. No release tag of this submodule is cut while this debt is open, except for hotfixes whose changeset does not touch the emulator-matrix gate's output. Clause 6.K's falsifiability rehearsal applies recursively to the new packages' own tests (per 6.J + clause 6.A) — deliberate-mutation rehearsal recorded in commit body, observed-failure captured, reverted, before merge.
-- **Clause 6.L — Anti-Bluff Functional Reality Mandate (Operator's Standing Order)** — see root `/CLAUDE.md` §6.L. Every test, every Challenge Test, every CI gate has exactly one job: confirm the feature works for a real user end-to-end on the gating matrix. CI green is necessary, never sufficient. Tests must guarantee the product works — anything else is theatre. The operator has invoked this mandate TWENTY-THREE TIMES across two working days; the repetition itself is the forensic record. The 10th invocation (2026-05-05, immediately after Phase 7 readiness was reported, when the operator commissioned the full rebuild-and-test-everything cycle for tag Lava-Android-1.2.3): "Rebuild Go API and client app(s), put new builds into releases dir (with properly updated version codes) and execute all existing tests and Challenges!". If you find yourself rationalizing a "small exception" — STOP. There are no small exceptions. The Internet Archive stuck-on-loading bug, the broken post-login navigation, the credential leak in C2, the bluffed C1-C8 — these are what "small exceptions" produce. Because this submodule is the SOURCE OF TRUTH for build orchestration, a bluff here propagates to every Lava artifact the gate produces — clause 6.L applies with extra weight to `pkg/emulator/`, `pkg/vm/`, `cmd/distributed-build`, and `cmd/distributed-test`.
+  Until these packages ship, **clause 6.K-debt is OPEN against this submodule** and consumer-side transitional glue (`docker-compose.test.yml`, `docker/emulator/Dockerfile`, `scripts/run-emulator-tests.sh`) remains in the consuming project's repo as constitutional debt. The next phase of this submodule that touches release tagging, build orchestration, or the emulator-matrix gate output MUST close 6.K-debt before its tag, and the close MUST: (1) add `pkg/emulator/` extending `pkg/runtime` + `pkg/lifecycle`, (2) add at least the QEMU baseline to `pkg/vm/`, (3) provide thin-glue CLI surfaces consumed by the consuming project's transitional scripts so they can be retired, (4) update `scripts/check-constitution.sh` per root §6.K clause 5 to verify (a) the package presence, (b) consumer-side thin-glue invocation, (c) at least one passing real-container-emulator-boot test inside `pkg/emulator/`. No release tag of this submodule is cut while this debt is open, except for hotfixes whose changeset does not touch the emulator-matrix gate's output. Clause 6.K's falsifiability rehearsal applies recursively to the new packages' own tests (per 6.J + clause 6.A) — deliberate-mutation rehearsal recorded in commit body, observed-failure captured, reverted, before merge.
+- **Clause 6.L — Anti-Bluff Functional Reality Mandate (Operator's Standing Order)** — see root `/CLAUDE.md` §6.L. Every test, every Challenge Test, every CI gate has exactly one job: confirm the feature works for a real user end-to-end on the gating matrix. CI green is necessary, never sufficient. Tests must guarantee the product works — anything else is theatre. The operator has invoked this mandate TWENTY-THREE TIMES across two working days; the repetition itself is the forensic record. The 10th invocation (2026-05-05, immediately after Phase 7 readiness was reported, when the operator commissioned the full rebuild-and-test-everything cycle for tag Lava-Android-1.2.3): "Rebuild Go API and client app(s), put new builds into releases dir (with properly updated version codes) and execute all existing tests and Challenges!". If you find yourself rationalizing a "small exception" — STOP. There are no small exceptions. The Internet Archive stuck-on-loading bug, the broken post-login navigation, the credential leak in C2, the bluffed C1-C8 — these are what "small exceptions" produce. Because this submodule is the SOURCE OF TRUTH for build orchestration, a bluff here propagates to every consuming-project artifact the gate produces — clause 6.L applies with extra weight to `pkg/emulator/`, `pkg/vm/`, `cmd/distributed-build`, and `cmd/distributed-test`.
 
 ## Clause 6.M (added 2026-05-04 evening, inherited per 6.F — STRONGER variant: Containers is the source of truth for runtime detection)
 
@@ -774,15 +774,15 @@ The authoritative verbatim text lives in the parent Lava `CLAUDE.md` "Seventh La
   1. **Runtime privilege analysis MUST be kept current.** Any change to `pkg/runtime/` that modifies how the runtime is detected, escalated, or invoked MUST be accompanied by a re-evaluation of the host-stability impact: can the change cause Class I (suspend/poweroff/sign-out), Class II (resource pressure), or only Class III (operator-perceived) effects? The evaluation is recorded in the commit body alongside the Bluff-Audit stamp. Recorded once: rootless Podman cannot trigger logind transitions; rootful Docker is not installed on the operator's primary host; container builds + image exports are session-scoped operations that cannot cause Class I host events.
   2. **`pkg/emulator/` zombie-cleanup hook is a 6.M action item.** Per root §6.M, scripts that boot emulators MUST kill any orphan `qemu-system` processes from prior interrupted matrix runs before launching new ones. The `pkg/emulator/` package SHOULD expose a `Cleanup()` API that performs this hygienically (find by `/proc/*/comm` matching `qemu-system-*`, send SIGTERM, wait for graceful exit, then SIGKILL stragglers). This API replaces the per-script ad-hoc `pkill qemu-system` invocations that the Forbidden Command List would otherwise reject — `pkill` against session processes is forbidden, but a typed in-package cleanup that targets a strict process-name allowlist is permitted.
   3. **Audit protocol completeness.** This submodule's `pkg/runtime/` SHOULD expose a helper API (`runtime.AuditState() AuditReport`) that the root-level audit script can call to enumerate every container under both Podman and Docker, their state, image, age, and any zombie emulator processes — making the 7-step forensic protocol scriptable rather than re-derived from scratch on every incident.
-  4. **Inheritance.** Submodule-internal tests and CI gates inherit clause 6.M; a Containers-side incident MUST be recorded in the consuming Lava project's `.lava-ci-evidence/sixth-law-incidents/<date>.json` AND, where the submodule is consumed standalone, in `.evidence/host-stability/<date>.json` at the submodule's repo root. Cross-references between the two evidence locations are mandatory.
+  4. **Inheritance.** Submodule-internal tests and CI gates inherit clause 6.M; a Containers-side incident MUST be recorded in the consuming project's `.lava-ci-evidence/sixth-law-incidents/<date>.json` AND, where the submodule is consumed standalone, in `.evidence/host-stability/<date>.json` at the submodule's repo root. Cross-references between the two evidence locations are mandatory.
 
 ## Clause 6.N (added 2026-05-05, inherited per 6.F — STRONGER variant: Containers is the source of truth for matrix-runner gate code)
 
-- **Clause 6.N — Bluff-Hunt Cadence Tightening + Production Code Coverage (Containers source-of-truth variant)** — see root `/CLAUDE.md` §6.N. Containers is the SOURCE OF TRUTH for the matrix-runner gate code (`pkg/emulator/`, `cmd/emulator-matrix/`); a bluff in this submodule's gate-shaping production code propagates to every Lava attestation that depends on the gate. Rules binding here:
+- **Clause 6.N — Bluff-Hunt Cadence Tightening + Production Code Coverage (Containers source-of-truth variant)** — see root `/CLAUDE.md` §6.N. Containers is the SOURCE OF TRUTH for the matrix-runner gate code (`pkg/emulator/`, `cmd/emulator-matrix/`); a bluff in this submodule's gate-shaping production code propagates to every consuming-project attestation that depends on the gate. Rules binding here:
   1. **Bluff-rehearsal on every `pkg/emulator/` change.** Stricter than the parent §6.N.1.2: ANY commit touching `pkg/emulator/*.go` (not just the four files named in root §6.N.1.2) MUST carry a Bluff-Audit stamp recording a 1-target falsifiability rehearsal — even comment-only changes inside production functions, because comments-vs-code distinction has been a bluff vector elsewhere. Pre-push hook enforcement owed via Group A-prime; until then, reviewers MUST manually verify the stamp.
   2. **Gate-shaping production code list (Containers-internal extension).** In addition to root §6.N.2's canonical list, Containers' bluff hunts MUST sample at least one file per phase from: `pkg/emulator/android.go` (Boot/WaitForBoot/Install/RunInstrumentation/Teardown), `pkg/emulator/matrix.go` (RunMatrix + writeAttestation), `cmd/emulator-matrix/main.go` (CLI flag + invocation contract).
   3. **Forensic anchor.** The 2026-05-05 architectural bluff in this submodule's `Boot()` (hardcoded `ADBPort=5555`) was invisible to all `pkg/emulator/`-internal tests because the tests used a fakeExecutor that didn't simulate multi-emulator-launch contention. The fix added `TestAndroidEmulator_Boot_DiscoversNewSerial_WhenPriorEmulatorPersists` (commit 648a4bb) and `TestAndroidEmulator_Teardown_WaitsForEmulatorToActuallyExit` (commit f6d09cb). Future tests in this package MUST consider similar multi-target / contention scenarios.
-  4. **Inheritance.** Submodule-internal CI gates inherit clause 6.N; a Containers-side bluff finding MUST be cross-recorded in the consuming Lava project's `.lava-ci-evidence/sixth-law-incidents/` AND in this submodule's `.evidence/bluff-hunt/` (or equivalent).
+  4. **Inheritance.** Submodule-internal CI gates inherit clause 6.N; a Containers-side bluff finding MUST be cross-recorded in the consuming project's `.lava-ci-evidence/sixth-law-incidents/` AND in this submodule's `.evidence/bluff-hunt/` (or equivalent).
 
 
 ## MANDATORY §12.6 MEMORY-BUDGET CEILING — 60% MAXIMUM (User mandate, 2026-04-30)
@@ -1131,7 +1131,7 @@ See root `/CLAUDE.md` §6.R. No connection address, port, header field name, cre
 
 ## §6.S — Continuation Document Maintenance Mandate (inherited 2026-05-06, per §6.F)
 
-See root `/CLAUDE.md` §6.S. The file `docs/CONTINUATION.md` (in the parent Lava repo) is the single-file source-of-truth handoff document for resuming work across any CLI session. Every commit that changes phase status, lands a new spec/plan, bumps a submodule pin, ships a release artifact, discovers/resolves a known issue, or implements an operator scope directive MUST update `docs/CONTINUATION.md` in the SAME COMMIT. The §0 "Last updated" line MUST track HEAD. Submodule MAY add stricter rules (e.g., maintain its own CONTINUATION) but MUST NOT relax this clause.
+See root `/CLAUDE.md` §6.S. The file `docs/CONTINUATION.md` (in the parent project's repo) is the single-file source-of-truth handoff document for resuming work across any CLI session. Every commit that changes phase status, lands a new spec/plan, bumps a submodule pin, ships a release artifact, discovers/resolves a known issue, or implements an operator scope directive MUST update `docs/CONTINUATION.md` in the SAME COMMIT. The §0 "Last updated" line MUST track HEAD. Submodule MAY add stricter rules (e.g., maintain its own CONTINUATION) but MUST NOT relax this clause.
 
 ## §6.T — Universal Quality Constraints (inherited 2026-05-06, per §6.F)
 
@@ -1152,7 +1152,7 @@ See root `/CLAUDE.md` §6.W. Only GitHub (`vasic-digital/*`, `HelixDevelopment/*
 
 ## §6.X — Container-Submodule Emulator Wiring Mandate (inherited 2026-05-13, per §6.F)
 
-See root `/CLAUDE.md` §6.X. Every Android emulator instance the project depends on for testing MUST execute its emulator process INSIDE a podman/docker container managed by `Submodules/Containers/`, NOT be host-direct-launched by Containers-submodule code that runs on the host. The Containers submodule's `pkg/runtime/` (rootless podman/docker auto-detection) brings the container up; `pkg/emulator/` orchestrates the AVD lifecycle inside it. Lava-side `scripts/run-emulator-tests.sh` is thin glue forwarding to the Containers CLI. The container-bound path is the gate — host-direct emulators are permitted for workstation iteration only. §6.X-debt tracks the wiring implementation owed to `Submodules/Containers/`. This submodule MAY add stricter rules but MUST NOT relax.
+See root `/CLAUDE.md` §6.X. Every Android emulator instance the project depends on for testing MUST execute its emulator process INSIDE a podman/docker container managed by `Submodules/Containers/`, NOT be host-direct-launched by Containers-submodule code that runs on the host. The Containers submodule's `pkg/runtime/` (rootless podman/docker auto-detection) brings the container up; `pkg/emulator/` orchestrates the AVD lifecycle inside it. Consumer-side `scripts/run-emulator-tests.sh` is thin glue forwarding to the Containers CLI. The container-bound path is the gate — host-direct emulators are permitted for workstation iteration only. §6.X-debt tracks the wiring implementation owed to `Submodules/Containers/`. This submodule MAY add stricter rules but MUST NOT relax.
 
 ## CONST-035 — Anti-Bluff Tests (cascaded)
 The bar for shipping is not "tests pass" but "users can use the feature." Every PASS MUST carry positive runtime evidence. No false-success results are tolerable.
@@ -1369,7 +1369,7 @@ CONST-055 is the **enforcement engine** for every other §11.4.x and CONST-NNN r
 
 > Verbatim user mandate (2026-05-15): *"Every Submodule or Git repository we add or clone MUST BE upstreams installed using Upstreamable utility which MUST BE available through exported paths of the host system (in .bashrc or .zhrc) using install_upstreams command executed from the root of the cloned (added) repository - only if in it is Upstreams or upstreams directory present with bash script files (recipes) for all repository's upstreams!"*
 
-Every clone / add of a Git repository under HelixCode MUST be followed by `install_upstreams` invocation from the repository's root IF its tree contains `upstreams/` (or legacy `Upstreams/` per CONST-052 transition) populated with `*.sh` recipe files. The utility (installed on operator's `PATH` via `.bashrc`/`.zshrc`; implementation in the constitution submodule's `install_upstreams.sh` — already supports BOTH directory names since constitution commit `45d3678`) reads the recipe files, configures every declared upstream as a named git remote, and fans out `origin` push URLs.
+Every clone / add of a Git repository under the consuming project MUST be followed by `install_upstreams` invocation from the repository's root IF its tree contains `upstreams/` (or legacy `Upstreams/` per CONST-052 transition) populated with `*.sh` recipe files. The utility (installed on operator's `PATH` via `.bashrc`/`.zshrc`; implementation in the constitution submodule's `install_upstreams.sh` — already supports BOTH directory names since constitution commit `45d3678`) reads the recipe files, configures every declared upstream as a named git remote, and fans out `origin` push URLs.
 
 Skipping the invocation when `upstreams/` is present silently breaks §2.1 (multi-upstream push is the norm) — the next push lands on only one upstream. Gate `CM-INSTALL-UPSTREAMS-ON-CLONE` + paired mutation. Automation: the future `incorporate-submodule` per CONST-054 auto-invokes; manual invocation supported. Pre-commit check: `git remote -v | grep -c push` reports expected count.
 

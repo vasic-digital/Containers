@@ -306,7 +306,7 @@ CONTAINERS_REMOTE_HOST_1_PASSWORD=host-specific-password
 
 ## Real Deployment Example: thinker.local
 
-A complete example deploying all HelixAgent infrastructure containers to a local network host.
+A complete example deploying all the consuming project infrastructure containers to a local network host.
 
 ### Containers/.env
 
@@ -336,7 +336,7 @@ CONTAINERS_REMOTE_HOST_1_RUNTIME=docker
 CONTAINERS_REMOTE_HOST_1_LABELS=role=infrastructure,env=development
 ```
 
-### HelixAgent .env
+### The consuming project .env
 
 Add `SVC_*` overrides pointing services to the remote host:
 
@@ -353,7 +353,7 @@ SVC_QDRANT_HOST=thinker.local
 SVC_QDRANT_REMOTE=true
 ```
 
-Also duplicate the `CONTAINERS_REMOTE_*` vars so they're available at HelixAgent startup.
+Also duplicate the `CONTAINERS_REMOTE_*` vars so they're available at the consuming project startup.
 
 ### What Happens on Startup
 

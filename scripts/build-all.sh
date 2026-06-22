@@ -1,9 +1,9 @@
 #!/bin/bash
-# Build all HelixPlay service binaries for container images
+# Build all the consuming project's service binaries for container images
 
 set -euo pipefail
 
-echo "=== Building HelixPlay service binaries ==="
+echo "=== Building the consuming project's service binaries ==="
 
 mkdir -p bin
 

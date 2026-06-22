@@ -10,7 +10,7 @@
 //	"Solutions for use of Containers and Qemu MUST be all handled by
 //	 Containers Submodule on generic reusable decoupled level!"
 //
-// Consumer projects (Yole, Lava, etc.) MUST NOT bake their own
+// Consumer projects MUST NOT bake their own
 // container/QEMU wiring; they instead call into this package with a
 // minimal `BuildRequest` and receive back a `BuildResult` describing
 // where the produced artifact lives. The host-platform decision
