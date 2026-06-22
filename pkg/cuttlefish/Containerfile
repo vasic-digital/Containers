@@ -1,0 +1,111 @@
+# Containerfile for the Cuttlefish (cvd) virtual-Android image used by
+# pkg/cuttlefish. Boots a real Android system image (A/B / Virtual A/B) so
+# the consuming project can exercise the real update_engine + AVB/dm-verity
+# + auto-rollback OTA-apply path (Tier-2; see
+# docs/design/CUTTLEFISH_TIER2.md in the consuming project).
+#
+# IMAGE BUILD IS ROOTLESS-OK. THE RUN IS NOT — §11.4.161 DOCUMENTED EXCEPTION.
+# ----------------------------------------------------------------------------
+# Building this image needs no privilege (ordinary `podman build` /
+# `docker build`). RUNNING a Cuttlefish container, however, REQUIRES a
+# rootful + privileged runtime: Cuttlefish boots a real VM via crosvm/QEMU
+# and creates the `cvd-ebr` network bridge, which a rootless runtime cannot
+# do. This is the platform-has-no-rootless-option case the §11.4.161
+# rootless-container mandate explicitly carves out and requires documenting.
+#
+# The container MUST be run with ALL of (FACT — RESEARCH + AOSP docs):
+#   --privileged
+#   --network host
+#   --device /dev/kvm --device /dev/vhost-vsock --device /dev/vhost-net \
+#   --device /dev/vsock --device /dev/net/tun
+#   --group-add kvm --group-add cvdnetwork --group-add render
+# pkg/cuttlefish.buildContainerRunArgs constructs exactly these flags.
+#
+# Host prerequisites (FACT, docs/design/CUTTLEFISH_TIER2.md §3):
+#   - Debian-based Linux with KVM present (verify: find /dev -name kvm).
+#   - The cuttlefish-base + cuttlefish-user host packages installed and the
+#     host rebooted (loads kernel modules + udev rules) BEFORE running a cvd.
+#
+# Build command (Linux x86_64, rootless OK):
+#   podman build \
+#       --build-arg BASE_IMAGE=debian:12 \
+#       -f pkg/cuttlefish/Containerfile \
+#       -t cuttlefish:latest .
+#
+# Image target / artifacts (FACT, §4.2): the build target is
+# `aosp_cf_x86_64_only_phone-userdebug` from the public ci.android.com
+# (no credentials). The device image zip + cvd-host_package.tar.gz from the
+# SAME build are fetched at run time into $HOME (the entrypoint extracts
+# them) OR baked at build time via the BUILD_ID/CF_IMG_URL build args.
+
+ARG BASE_IMAGE=debian:12
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="cuttlefish"
+LABEL org.opencontainers.image.description="Cuttlefish (cvd) virtual-Android device for real update_engine A/B OTA validation"
+LABEL org.opencontainers.image.source="https://github.com/vasic-digital/containers"
+LABEL org.opencontainers.image.licenses="See parent project LICENSE"
+LABEL digital.vasic.containers.requires-privileged="true"
+LABEL digital.vasic.containers.rootless-exception="11.4.161"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Build-time deps for the cuttlefish host packages (FACT, §3:
+# `git devscripts equivs config-package-dev debhelper-compat golang curl`).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        wget \
+        unzip \
+        git \
+        sudo \
+        devscripts \
+        equivs \
+        config-package-dev \
+        debhelper-compat \
+        golang \
+        adb \
+        android-sdk-platform-tools-common \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build + install the Cuttlefish host packages from the upstream source
+# (FACT, §4.1). cuttlefish-base is REQUIRED, cuttlefish-user is RECOMMENDED;
+# cuttlefish-common is DEPRECATED and intentionally not installed. The
+# clone ref is pinned via CF_REF for reproducibility; an Artifact-Registry
+# apt path also exists upstream as an alternative to building from source.
+ARG CF_REPO=https://github.com/google/android-cuttlefish
+ARG CF_REF=main
+RUN git clone --depth 1 --branch "${CF_REF}" "${CF_REPO}" /opt/android-cuttlefish && \
+    cd /opt/android-cuttlefish && \
+    tools/buildutils/build_packages.sh && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ./cuttlefish-base_*.deb \
+        ./cuttlefish-user_*.deb && \
+    rm -rf /var/lib/apt/lists/*
+
+# Where the entrypoint extracts the device image + cvd-host_package and runs
+# launch_cvd. cvd treats $HOME as its instance root (FACT, §4.3:
+# `HOME=$PWD ./bin/launch_cvd --daemon`).
+ENV HOME=/cuttlefish
+WORKDIR /cuttlefish
+
+# Optional: bake the device image + host package at build time. When these
+# build args are empty the entrypoint fetches them at run time (the
+# default), which keeps the image small + lets the run pick a fresh build.
+ARG CF_IMG_URL=""
+ARG CF_HOST_PKG_URL=""
+RUN if [ -n "${CF_IMG_URL}" ]; then \
+        curl -fsSL "${CF_IMG_URL}" -o /cuttlefish/cf-img.zip && \
+        unzip -q /cuttlefish/cf-img.zip -d /cuttlefish && rm /cuttlefish/cf-img.zip; \
+    fi && \
+    if [ -n "${CF_HOST_PKG_URL}" ]; then \
+        curl -fsSL "${CF_HOST_PKG_URL}" -o /cuttlefish/cvd-host_package.tar.gz && \
+        tar -xzf /cuttlefish/cvd-host_package.tar.gz -C /cuttlefish && \
+        rm /cuttlefish/cvd-host_package.tar.gz; \
+    fi
+
+COPY pkg/cuttlefish/entrypoint.sh /cuttlefish/entrypoint.sh
+RUN chmod +x /cuttlefish/entrypoint.sh
+
+ENTRYPOINT ["/cuttlefish/entrypoint.sh"]
