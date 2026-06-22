@@ -1,0 +1,306 @@
+package cuttlefish
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+)
+
+// cuttlefish.go — the Cuttlefish lifecycle: Launch / Status / Stop over a
+// rootful + privileged container whose entrypoint runs `launch_cvd`, with
+// readiness via `adb devices` and teardown via `stop_cvd` + orphan
+// reaping.
+//
+// The command-constructing functions (buildContainerRunArgs,
+// buildLaunchCvdArgs, buildStopCvdArgs) are pure: they take explicit
+// inputs and return an argument slice, so the user-visible launch contract
+// is unit-testable without a real privileged container. The lifecycle
+// methods run those args through the CommandExecutor seam.
+
+// Cuttlefish implements [Lifecycle] by running Google's Cuttlefish virtual
+// Android device inside a rootful + privileged container. Per §11.4.161
+// (rootless-container mandate) this is the DOCUMENTED rootless exception:
+// the official Cuttlefish image mandates `--privileged`, the
+// vhost/vsock/tun device nodes, and `--network host`; a rootless runtime
+// cannot create the `cvd-ebr` bridge, so Cuttlefish is the platform-has-no-
+// rootless-option case the §11.4.161 escape clause covers.
+//
+// One Cuttlefish instance manages exactly one container at a time.
+type Cuttlefish struct {
+	cfg           Config
+	executor      CommandExecutor
+	containerName string
+}
+
+// NewCuttlefish constructs a Cuttlefish lifecycle from cfg, applying the
+// documented defaults and rejecting a config that cannot launch.
+// Fail-loud per §6.J — no silent default that hides a misconfiguration.
+func NewCuttlefish(cfg Config) (*Cuttlefish, error) {
+	if cfg.RuntimeBinary == "" {
+		return nil, fmt.Errorf("cuttlefish: Config.RuntimeBinary is required (e.g. \"podman\" or \"docker\")")
+	}
+	if cfg.Image == "" {
+		return nil, fmt.Errorf("cuttlefish: Config.Image is required (the Cuttlefish container image)")
+	}
+	// Privileged is mandatory for Cuttlefish (the §11.4.161 documented
+	// exception). A caller that explicitly sets Privileged=false has asked
+	// for a container that physically cannot make the cvd-ebr bridge —
+	// reject it loudly rather than launch a guaranteed-to-fail container.
+	if !cfg.Privileged {
+		return nil, fmt.Errorf(
+			"cuttlefish: Config.Privileged must be true — Cuttlefish requires a rootful + privileged " +
+				"container (the §11.4.161 documented rootless exception); a non-privileged container " +
+				"cannot create the cvd-ebr bridge and will fail to boot")
+	}
+	if cfg.Target == "" {
+		cfg.Target = DefaultCuttlefishTarget
+	}
+	if cfg.InstanceName == "" {
+		cfg.InstanceName = "default"
+	}
+	if len(cfg.Devices) == 0 {
+		cfg.Devices = DefaultDevices()
+	}
+	if len(cfg.Groups) == 0 {
+		cfg.Groups = DefaultGroups()
+	}
+	if cfg.ADBSerial == "" {
+		cfg.ADBSerial = DefaultADBSerial
+	}
+	if cfg.ADBBinaryPath == "" {
+		cfg.ADBBinaryPath = "adb"
+	}
+	if cfg.StopGracePeriod == 0 {
+		cfg.StopGracePeriod = defaultStopGracePeriod
+	}
+	executor := cfg.Executor
+	if executor == nil {
+		executor = NewOSExecutor()
+	}
+	return &Cuttlefish{cfg: cfg, executor: executor}, nil
+}
+
+// containerNameFor produces the deterministic, stable container name for
+// an instance (resolved by NAME, never an enumeration index, per
+// §11.4.111).
+func containerNameFor(instanceName string) string {
+	return "cvd-" + sanitizeContainerName(instanceName)
+}
+
+// Launch starts the privileged Cuttlefish container. It first partitions
+// the configured device nodes by host presence: only present nodes are
+// passed to `--device`, and any missing node is surfaced in the result so
+// the caller SKIPs-with-reason per §11.4.3 (a Cuttlefish container missing
+// a required vhost/vsock node cannot boot). Launch returns once the
+// container-run command completes — Android boot completion is observed
+// via Status, never assumed here (mirrors pkg/emulator Boot vs WaitForBoot).
+func (c *Cuttlefish) Launch(ctx context.Context) (LaunchResult, error) {
+	startedAt := time.Now()
+	present, missing := FilterPresentDevices(c.cfg.Devices)
+	name := containerNameFor(c.cfg.InstanceName)
+	c.containerName = name
+
+	args := buildContainerRunArgs(name, c.cfg.Image, present, c.cfg.Groups,
+		c.cfg.Privileged, c.cfg.NetworkHost)
+
+	out, err := c.executor.Execute(ctx, c.cfg.RuntimeBinary, args...)
+	if err != nil {
+		wrapped := fmt.Errorf("%s run: %w (output: %s)", c.cfg.RuntimeBinary, err, string(out))
+		return LaunchResult{
+			ContainerName:  name,
+			Target:         c.cfg.Target,
+			Started:        false,
+			PresentDevices: present,
+			MissingDevices: missing,
+			Duration:       time.Since(startedAt),
+			Error:          wrapped,
+		}, wrapped
+	}
+	return LaunchResult{
+		ContainerName:  name,
+		Target:         c.cfg.Target,
+		Started:        true,
+		PresentDevices: present,
+		MissingDevices: missing,
+		Duration:       time.Since(startedAt),
+	}, nil
+}
+
+// Status runs `adb devices` via the host adb and reports readiness for the
+// configured serial. Readiness is OBSERVED on the wire (the device is
+// listed AND online), never assumed — a non-ready result is an honest
+// "not yet booted", not a failure.
+func (c *Cuttlefish) Status(ctx context.Context) (StatusResult, error) {
+	out, err := c.executor.Execute(ctx, c.cfg.ADBBinaryPath, "devices")
+	raw := strings.TrimSpace(string(out))
+	if err != nil {
+		return StatusResult{Raw: raw}, fmt.Errorf("adb devices: %w (output: %s)", err, raw)
+	}
+	devices := ParseADBDevices(out)
+	return StatusResult{
+		Devices: devices,
+		Ready:   readinessForSerial(devices, c.cfg.ADBSerial),
+		Raw:     raw,
+	}, nil
+}
+
+// WaitForReady polls Status until the configured serial is online or the
+// timeout elapses. Returns the elapsed duration. A non-nil error means the
+// device was NOT observed online within the budget — this function does
+// NOT report "probably ready" (composes §11.4.6 no-guessing).
+func (c *Cuttlefish) WaitForReady(ctx context.Context, timeout time.Duration) (time.Duration, error) {
+	startedAt := time.Now()
+	deadline := startedAt.Add(timeout)
+	for time.Now().Before(deadline) {
+		st, err := c.Status(ctx)
+		if err == nil && st.Ready {
+			return time.Since(startedAt), nil
+		}
+		select {
+		case <-ctx.Done():
+			return time.Since(startedAt), ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return time.Since(startedAt), fmt.Errorf(
+		"cuttlefish: WaitForReady timed out after %s waiting for adb serial %q to come online",
+		timeout, c.cfg.ADBSerial)
+}
+
+// Stop tears the instance down: it runs `stop_cvd` inside the container for
+// a graceful Cuttlefish shutdown, force-removes the container, then reaps
+// any orphan crosvm/run_cvd processes. A best-effort `stop_cvd` failure
+// does NOT abort the force-remove — the container MUST be cleaned up
+// regardless (§11.4.14 leave-the-target-quiescent). The first hard error
+// (container removal) is returned; reaping always runs.
+func (c *Cuttlefish) Stop(ctx context.Context) error {
+	if c.containerName == "" {
+		// Launch was never called on this instance — defensive no-op
+		// success (callers invoke Stop in a defer).
+		return nil
+	}
+
+	// Graceful Cuttlefish shutdown via stop_cvd inside the container.
+	// Best-effort: a non-zero exit (cvd already gone) is not fatal.
+	_, _ = c.executor.Execute(ctx, c.cfg.RuntimeBinary,
+		buildContainerExecArgs(c.containerName, buildStopCvdArgs())...)
+
+	// Force-remove the container — the authoritative teardown.
+	out, rmErr := c.executor.Execute(ctx, c.cfg.RuntimeBinary, "rm", "-f", c.containerName)
+
+	// Reap orphan crosvm/run_cvd processes regardless of rm outcome.
+	graceCtx := ctx
+	_, reapErr := Cleanup(graceCtx)
+
+	c.containerName = ""
+
+	if rmErr != nil {
+		return fmt.Errorf("%s rm: %w (output: %s)", c.cfg.RuntimeBinary, rmErr, string(out))
+	}
+	if reapErr != nil {
+		return fmt.Errorf("cuttlefish: orphan reaping after stop: %w", reapErr)
+	}
+	return nil
+}
+
+// ContainerName returns the runtime-side container name set by Launch.
+// Empty before Launch or after Stop. Exposed for the caller's evidence row.
+func (c *Cuttlefish) ContainerName() string { return c.containerName }
+
+// buildContainerRunArgs constructs the `podman run` / `docker run` argument
+// slice for a privileged Cuttlefish container. It is pure: present is the
+// already-host-presence-filtered device list (see FilterPresentDevices),
+// so this function does not touch the filesystem and is fully unit-testable.
+//
+// Cuttlefish requires (FACT, docs/design/CUTTLEFISH_TIER2.md §3 + RESEARCH):
+//   - --privileged                 (the §11.4.161 documented exception)
+//   - --network host               (cvd networking)
+//   - --device <node> per present  (/dev/kvm, /dev/vhost-vsock, ...)
+//   - --group-add <grp> per group  (kvm, cvdnetwork, render)
+//
+// Anti-bluff (Bluff-Audit — recorded in the implementing commit body):
+//
+//	Mutation: drop "--privileged" from the produced args.
+//	Observed: TestBuildContainerRunArgs_Privileged asserts the slice
+//	          contains "--privileged"; the mutated builder omits it,
+//	          failing the test (a non-privileged Cuttlefish cannot boot).
+//	Reverted: yes.
+func buildContainerRunArgs(
+	containerName string,
+	image string,
+	presentDevices []string,
+	groups []string,
+	privileged bool,
+	networkHost bool,
+) []string {
+	args := []string{
+		"run",
+		"-d",
+		"--name", containerName,
+		"--rm",
+	}
+	if privileged {
+		args = append(args, "--privileged")
+	}
+	if networkHost {
+		args = append(args, "--network", "host")
+	}
+	for _, d := range presentDevices {
+		args = append(args, "--device", d)
+	}
+	for _, g := range groups {
+		args = append(args, "--group-add", g)
+	}
+	args = append(args, image)
+	return args
+}
+
+// buildContainerExecArgs constructs `exec <container> <cmd...>` for running
+// a command (e.g. stop_cvd) inside a running Cuttlefish container.
+func buildContainerExecArgs(containerName string, cmd []string) []string {
+	args := []string{"exec", containerName}
+	return append(args, cmd...)
+}
+
+// buildLaunchCvdArgs constructs the `launch_cvd --daemon` argument slice
+// the container entrypoint runs (FACT, docs/design/CUTTLEFISH_TIER2.md
+// §4.3). `instanceNum` (1-based) selects the cvd instance; <=0 omits the
+// flag so the cvd default (instance 1) is used.
+//
+// Pure + exported-shape so the entrypoint contract is unit-tested without
+// a real cvd present.
+func buildLaunchCvdArgs(instanceNum int) []string {
+	args := []string{"launch_cvd", "--daemon"}
+	if instanceNum > 0 {
+		args = append(args, fmt.Sprintf("--base_instance_num=%d", instanceNum))
+	}
+	return args
+}
+
+// buildStopCvdArgs constructs the `stop_cvd` argument slice for graceful
+// teardown (FACT, docs/design/CUTTLEFISH_TIER2.md §4.4).
+func buildStopCvdArgs() []string {
+	return []string{"stop_cvd"}
+}
+
+// sanitizeContainerName makes an instance name safe as a container name
+// (alphanumeric + dash + underscore; everything else becomes a dash).
+func sanitizeContainerName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	return b.String()
+}
+
+// Compile-time check that Cuttlefish satisfies Lifecycle.
+var _ Lifecycle = (*Cuttlefish)(nil)
