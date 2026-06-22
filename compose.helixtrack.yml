@@ -2,6 +2,12 @@
 # Multi-service stack for running HelixTrack Core within the containers submodule.
 # Supports multi-space data isolation via --space-root flag.
 #
+# §11.4.28 EXCEPTION (operator-approved 2026-06-22, documented per §11.4.112): this
+# compose file + its ../helix_track/ build-context refs are HelixTrack-specific and
+# would normally NOT live in the project-agnostic containers submodule. The operator
+# explicitly authorized keeping it here as a sanctioned reference stack for the
+# HelixTrack-class deployment. Consuming projects that do not run HelixTrack ignore it.
+#
 # Usage:
 #   cd containers && docker compose -f compose.helixtrack.yml up -d
 #   OR via containers pkg/boot: boot --compose ./containers/compose.helixtrack.yml
@@ -27,7 +33,10 @@ services:
       # Core configuration
       - ../helix_track/core/Application/Configurations:/config
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      # /health is the app's real liveness route; root `/` returns 404 (no route),
+      # which made `podman ps` mislabel the healthy container "unhealthy" (real
+      # deploy 2026-06-22, docs/qa/20260622-213843-distribute-thinker-green/).
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s
       timeout: 5s
       retries: 5
