@@ -551,7 +551,15 @@ func (f *fakeAdbExecutorStuckThenGone) Start(_ context.Context, _ string, _ ...s
 
 func TestTeardown_FastPath_SucceedsAfterKillByPort(t *testing.T) {
 	prev := killByPortHook
-	killByPortHook = func(_ context.Context, _ int) (KillReport, error) {
+	// Observable: record whether the KillByPort fast-path was actually
+	// taken AND on which port — a no-error return alone would not prove the
+	// stuck emulator went through the force-kill path (it could have exited
+	// on the first poll, exercising nothing).
+	killByPortCalls := 0
+	killByPortPort := -1
+	killByPortHook = func(_ context.Context, port int) (KillReport, error) {
+		killByPortCalls++
+		killByPortPort = port
 		return KillReport{Matched: 1, Sigtermed: []int{12345}}, nil
 	}
 	defer func() { killByPortHook = prev }()
@@ -559,11 +567,29 @@ func TestTeardown_FastPath_SucceedsAfterKillByPort(t *testing.T) {
 	teardownGracePeriod = 200 * time.Millisecond
 	defer func() { teardownGracePeriod = prevGrace }()
 
-	a := NewAndroidEmulatorWithExecutor("/opt/android-sdk", &fakeAdbExecutorStuckThenGone{port: 5554})
+	exec := &fakeAdbExecutorStuckThenGone{port: 5554}
+	a := NewAndroidEmulatorWithExecutor("/opt/android-sdk", exec)
 	err := a.Teardown(context.Background(), 5554)
-	if err != nil {
-		t.Fatalf("expected Teardown to succeed after KillByPort cleared the stuck emulator, got: %v", err)
-	}
+	require.NoError(t, err,
+		"Teardown must succeed after KillByPort cleared the stuck emulator")
+
+	// Observable post-condition 1 (fast-path taken): the grace poll exhausted
+	// while the emulator was still alive, so the KillByPort fast-path MUST
+	// have fired exactly once for the target port — proving the stuck-then-
+	// killed path, not a trivial first-poll exit.
+	assert.Equal(t, 1, killByPortCalls,
+		"KillByPort fast-path must be invoked exactly once for the stuck emulator")
+	assert.Equal(t, 5554, killByPortPort,
+		"KillByPort must target the port under teardown")
+
+	// Observable post-condition 2 (state delta): after a successful teardown
+	// the emulator is genuinely gone — a fresh `adb devices` no longer lists
+	// localhost:5554 as a connected "device". This asserts the end state the
+	// user cares about, not merely the absence of an error.
+	devicesOut, derr := exec.Execute(context.Background(), "adb", "devices")
+	require.NoError(t, derr, "post-teardown `adb devices` probe must succeed")
+	assert.NotContains(t, string(devicesOut), "localhost:5554\tdevice",
+		"emulator localhost:5554 must no longer be a connected device after teardown")
 }
 
 func TestAndroidEmulator_Boot_FailsWhenNoNewSerialAppears(t *testing.T) {
