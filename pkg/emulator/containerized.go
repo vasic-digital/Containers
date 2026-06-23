@@ -20,6 +20,43 @@ import (
 // container arguments.
 var kvmDevicePath = "/dev/kvm"
 
+// rootlessUID is the process-effective-UID probe. Package-level so tests
+// can simulate both the rootless (non-zero euid) and rootful (euid 0)
+// cases without changing the real process identity. Production value is
+// os.Geteuid.
+//
+// Anti-bluff: the userns tests in containerized_userns_test.go override
+// this to exercise both the rootless and rootful branches of
+// isRootlessPodman deterministically.
+var rootlessUID = os.Geteuid
+
+// isRootlessPodman reports whether the container will run under rootless
+// podman. In that case the container image's USER (uid 1000) maps to a
+// host subuid that does NOT hold the invoking user's /dev/kvm ACL, so
+// ProbeKVM fails with "This user doesn't have permissions to use KVM" and
+// Boot never starts. buildContainerRunArgs answers that with
+// "--userns=keep-id", which maps the container uid back to the invoking
+// host user (who holds the ACL) — see §11.4.161 (rootless container
+// runtime mandate).
+//
+// Detection (decoupled — no project context per §11.4.28):
+//   - the runtime binary basename is "podman" (path / ".exe" tolerant), AND
+//   - the invoking process is NOT root (euid != 0). Rootless podman is by
+//     definition driven by a non-root user; rootful podman runs as root,
+//     where the container uid already maps to host root and keep-id is
+//     unnecessary.
+//
+// Docker uses a root daemon and a different user-namespace model, so
+// keep-id does not apply — only podman is matched.
+func isRootlessPodman(runtimeBinary string) bool {
+	base := runtimeBinary
+	if idx := strings.LastIndexAny(base, `/\`); idx >= 0 {
+		base = base[idx+1:]
+	}
+	base = strings.ToLower(strings.TrimSuffix(base, ".exe"))
+	return base == "podman" && rootlessUID() != 0
+}
+
 // kvmAvailable returns true iff the host exposes the KVM device node
 // at kvmDevicePath. On Linux x86_64 the device is present when KVM is
 // enabled; on macOS the podman VM kernel does NOT expose /dev/kvm (HVF
@@ -72,6 +109,18 @@ func buildContainerRunArgs(
 		"-d",
 		"--name", containerName,
 		"--rm",
+	}
+
+	// Rootless-podman user-namespace remap: under rootless podman the
+	// container image's USER (uid 1000) maps to a host subuid that lacks
+	// the invoking user's /dev/kvm ACL → ProbeKVM fails with "This user
+	// doesn't have permissions to use KVM" and Boot never starts.
+	// --userns=keep-id maps the container uid back to the invoking host
+	// user, who holds the ACL. Omitted for rootful podman (container uid
+	// already maps to host root) and for docker (root-daemon model where
+	// the flag does not apply). §11.4.161 rootless container runtime.
+	if isRootlessPodman(runtimeBinary) {
+		args = append(args, "--userns=keep-id")
 	}
 
 	// KVM passthrough: include only when the host exposes /dev/kvm.
