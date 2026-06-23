@@ -61,7 +61,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         && rm -rf /var/lib/apt/lists/*
 
 # Non-root user for the emulator runtime — clause 6.U inheritance.
-RUN useradd -m -u 1000 -s /bin/bash emulator
+# ubuntu:24.04 ships a default `ubuntu` user already occupying UID 1000,
+# so a bare `useradd -u 1000` dies with `useradd: UID 1000 is not unique`
+# (exit 4). Remove whatever account currently holds UID 1000 (named or
+# not) BEFORE creating `emulator`. §11.4.124: this is a deterministic
+# build-bug fix, not a removal of a shipped end-user capability.
+RUN if getent passwd 1000 >/dev/null 2>&1; then \
+        userdel -r "$(getent passwd 1000 | cut -d: -f1)" 2>/dev/null || true; \
+    fi && \
+    useradd -m -u 1000 -s /bin/bash emulator
 USER emulator
 WORKDIR /home/emulator
 
