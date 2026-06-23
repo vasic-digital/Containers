@@ -140,7 +140,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         android-sdk-platform-tools-common \
         mesa-utils \
         mesa-vulkan-drivers \
-        sudo \
     && rm -rf /var/lib/apt/lists/*
 
 # Where the entrypoint extracts the device image + cvd-host_package and runs
