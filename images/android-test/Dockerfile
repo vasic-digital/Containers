@@ -1,4 +1,10 @@
 # syntax=docker/dockerfile:1
+# DS-0002 intentionally NOT cleared (root kept, justified): the Android emulator
+# requires root at runtime — /dev/kvm device access for hardware acceleration plus
+# write access to the root-owned SDK (/opt/android-sdk) and AVD store
+# (/root/.android/avd). The emulator-base image is built around the root user;
+# dropping to a non-root USER breaks KVM acceleration and AVD boot. Genuine root
+# requirement, not an unhardened image (test-only emulator runner).
 FROM ghcr.io/vasic-digital/android-emulator-base:latest
 
 ENV ANDROID_SDK_ROOT=/opt/android-sdk
