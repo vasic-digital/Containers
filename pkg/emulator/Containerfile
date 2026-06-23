@@ -97,9 +97,27 @@ RUN yes | sdkmanager --licenses > /dev/null 2>&1 || true && \
         "${SYSTEM_IMAGE_PACKAGE}" \
         "platforms;android-${API_LEVEL}"
 
+# RC2 (2026-06-23 thinker.local blocker blocker-emulator-boot-incontainer.json):
+# generate a FIXED adb keypair INSIDE the image BEFORE the AVD is created.
+# The emulator bakes $HOME/.android/adbkey.pub into the AVD's authorized
+# adb keys at create time (androidboot.qemu.adb.pubkey). With a baked,
+# known keypair the host-side adb client can authorise using the MATCHING
+# private key (the runner copies /home/emulator/.android/adbkey out of the
+# container and sets ADB_VENDOR_KEYS to it — see Containerized.WaitForBoot).
+# Without this, the guest authorises a random per-build key that the host
+# never has, so `adb connect` returns `offline` forever and WaitForBoot
+# times out. This is the canonical google/android-emulator-container-scripts
+# pattern (adb keygen in the image + ADB_VENDOR_KEYS on the client). The
+# keypair is generated at build time and NOT committed to git (§6.H/§11.4.10
+# compliant — no secret literal in tracked source).
+RUN mkdir -p "${HOME}/.android" && \
+    adb keygen "${HOME}/.android/adbkey" && \
+    chmod 600 "${HOME}/.android/adbkey" "${HOME}/.android/adbkey.pub"
+
 # Pre-create a default AVD matching the build-arg target. Production
 # Containerized.Boot passes the AVD name via $ANDROID_AVD_NAME; the
-# image's default AVD is the fallback for ad-hoc runs.
+# image's default AVD is the fallback for ad-hoc runs. With the adb
+# keypair already at $HOME/.android the emulator authorises it.
 RUN echo "no" | avdmanager create avd \
         --name "default" \
         --package "${SYSTEM_IMAGE_PACKAGE}" \

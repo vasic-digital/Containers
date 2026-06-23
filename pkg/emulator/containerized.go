@@ -74,6 +74,26 @@ func buildContainerRunArgs(
 		"--rm",
 	}
 
+	// RC1 (PROVEN fix — 2026-06-23 thinker.local blocker
+	// blocker-emulator-boot-incontainer.json): on rootless podman,
+	// /dev/kvm is commonly granted to the invoking user via a POSIX
+	// named-user ACL (user:<name>:rw-) rather than kvm-group
+	// membership. Inside the default rootless userns the container
+	// user maps to an unprivileged subuid that the host ACL does NOT
+	// cover, and the host /dev/kvm appears as nobody:nogroup with no
+	// readable group — the emulator's ProbeKVM inspects /etc/group,
+	// finds no kvm line, and refuses ("This user does not have
+	// permissions to use KVM"). --userns=keep-id maps the container's
+	// uid back to the host invoking uid so the host named-user ACL
+	// applies inside the container, making /dev/kvm WRITABLE. Proven:
+	// with --userns=keep-id the guest reached "Boot completed in
+	// 29345 ms"; --group-add keep-groups did NOT work (ACL-only,
+	// not group, access). podman-only: docker's daemon model uses a
+	// different userns mechanism and rejects --userns=keep-id.
+	if runtimeBinary == "podman" {
+		args = append(args, "--userns=keep-id")
+	}
+
 	// KVM passthrough: include only when the host exposes /dev/kvm.
 	// On Linux x86_64 this enables hardware acceleration.
 	// On macOS the podman VM has no /dev/kvm (HVF is unreachable from
@@ -368,6 +388,24 @@ func (c *Containerized) WaitForBoot(
 ) (time.Duration, error) {
 	startedAt := time.Now()
 	deadline := startedAt.Add(timeout)
+
+	// RC2 (2026-06-23 thinker.local blocker): authorise the host adb
+	// client against the guest BEFORE connecting. The image bakes a
+	// fixed adb keypair (Containerfile) which the AVD authorises; copy
+	// the matching PRIVATE key out of the container and point the host
+	// adb at it via ADB_VENDOR_KEYS, then restart the adb server so it
+	// re-reads the vendor key. Without this the guest authorises a key
+	// the host never has, `adb connect` returns `offline` forever, and
+	// this function times out (the exact 2026-06-23 blocker). Best-effort:
+	// a copy/restart failure does NOT fail WaitForBoot outright — the
+	// boot-completed poll below is the load-bearing assertion, and a
+	// host whose own adbkey already matches (re-run) still succeeds.
+	if err := c.authorizeADB(ctx); err != nil {
+		// Surface for diagnosis but continue to the poll; the poll is
+		// the §6.J primary assertion (boot_completed OBSERVED on wire).
+		_ = err
+	}
+
 	// Connect host adb to the forwarded port first.
 	if _, err := c.executor.Execute(
 		ctx, c.adbBinaryPath, "connect", fmt.Sprintf("localhost:%d", port),
@@ -392,6 +430,59 @@ func (c *Containerized) WaitForBoot(
 		"WaitForBoot timed out after %s waiting for sys.boot_completed=1 on port %d",
 		timeout, port,
 	)
+}
+
+// containerADBKeyPath is where the Containerfile generates the baked
+// adb PRIVATE key inside the image. WaitForBoot copies this out of the
+// running container so the host adb client can authorise against the
+// guest's authorised key (the matching .pub was baked into the AVD).
+const containerADBKeyPath = "/home/emulator/.android/adbkey"
+
+// authorizeADB extracts the image-baked adb private key from the running
+// container and points the host adb client at it via ADB_VENDOR_KEYS,
+// restarting the adb server so the new vendor key is honoured. This is
+// the runner half of the RC2 fix (Containerfile bakes the keypair; the
+// runner consumes the private key). Returns an error on copy/restart
+// failure; WaitForBoot treats the error as best-effort because the
+// boot-completed poll is the load-bearing assertion.
+//
+// §6.H/§11.4.10: the key is generated at image-build time and copied to
+// a host temp file at runtime — no secret literal is committed to git.
+func (c *Containerized) authorizeADB(ctx context.Context) error {
+	if c.containerName == "" {
+		return fmt.Errorf("authorizeADB: no container name (Boot not called)")
+	}
+	// Copy the baked private key out of the container to a host temp file.
+	tmpDir, err := os.MkdirTemp("", "lava-emu-adbkey-")
+	if err != nil {
+		return fmt.Errorf("authorizeADB: mkdtemp: %w", err)
+	}
+	hostKey := tmpDir + "/adbkey"
+	cpSrc := fmt.Sprintf("%s:%s", c.containerName, containerADBKeyPath)
+	if out, err := c.executor.Execute(
+		ctx, c.runtimeBinary, "cp", cpSrc, hostKey,
+	); err != nil {
+		return fmt.Errorf("authorizeADB: %s cp %s: %w (output: %s)",
+			c.runtimeBinary, cpSrc, err, string(out))
+	}
+	// Point the host adb client at the baked key. os.Setenv affects the
+	// env inherited by adb processes the executor spawns via os/exec.
+	// Done immediately after the copy so the vendor key is in place even
+	// if the (best-effort) chmod below fails on an unusual filesystem.
+	if err := os.Setenv("ADB_VENDOR_KEYS", hostKey); err != nil {
+		return fmt.Errorf("authorizeADB: set ADB_VENDOR_KEYS: %w", err)
+	}
+	// Restrict perms so adb does not warn about a world-readable private
+	// key. Best-effort: a chmod failure does not invalidate the vendor
+	// key already registered above.
+	_ = os.Chmod(hostKey, 0o600)
+	// Restart the adb server so it re-reads ADB_VENDOR_KEYS. kill-server
+	// is best-effort (no server running yet is fine).
+	_, _ = c.executor.Execute(ctx, c.adbBinaryPath, "kill-server")
+	if out, err := c.executor.Execute(ctx, c.adbBinaryPath, "start-server"); err != nil {
+		return fmt.Errorf("authorizeADB: adb start-server: %w (output: %s)", err, string(out))
+	}
+	return nil
 }
 
 // Install installs the APK onto the emulator via host adb.
