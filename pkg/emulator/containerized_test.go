@@ -132,7 +132,7 @@ func TestContainerized_Boot_InvokesRuntimeRunWithKvmAndPortForward(t *testing.T)
 		}
 		if a == "-p" && i+1 < len(call.Args) {
 			next := call.Args[i+1]
-			if strings.HasSuffix(next, ":5555/tcp") {
+			if strings.HasSuffix(next, ":5575/tcp") {
 				hasADBPort = true
 			}
 			if strings.HasSuffix(next, ":5554/tcp") {
@@ -156,7 +156,7 @@ func TestContainerized_Boot_InvokesRuntimeRunWithKvmAndPortForward(t *testing.T)
 		t.Errorf("captured args missing --device %s (§6.X clause 1 KVM passthrough, KVM-present branch): %v", kvmDevicePath, call.Args)
 	}
 	if !hasADBPort {
-		t.Errorf("captured args missing -p <hostPort>:5555/tcp ADB port forward: %v", call.Args)
+		t.Errorf("captured args missing -p <hostPort>:5575/tcp ADB bridge port forward (RC3 socat bridge): %v", call.Args)
 	}
 	if !hasConsolePort {
 		t.Errorf("captured args missing -p <hostPort>:5554/tcp console port forward: %v", call.Args)

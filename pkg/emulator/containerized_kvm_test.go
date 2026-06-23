@@ -55,7 +55,7 @@ func TestContainerized_KVMPresence_Present(t *testing.T) {
 		"when /dev/kvm exists, buildContainerRunArgs MUST include --device <kvm> for hardware acceleration; got %v", args)
 	// The port-forward + AVD env wiring is present regardless of KVM.
 	assert.Contains(t, args, "ANDROID_AVD_NAME=Pixel_8")
-	assert.Contains(t, args, "6555:5555/tcp")
+	assert.Contains(t, args, "6555:5575/tcp")
 }
 
 func TestContainerized_KVMPresence_Absent(t *testing.T) {
@@ -77,7 +77,7 @@ func TestContainerized_KVMPresence_Absent(t *testing.T) {
 		"when /dev/kvm is absent, buildContainerRunArgs MUST omit --device <kvm> so the container falls back to TCG; got %v", args)
 	// The rest of the launch wiring is unaffected by the KVM decision.
 	assert.Contains(t, args, "ANDROID_AVD_NAME=Pixel_8")
-	assert.Contains(t, args, "6555:5555/tcp")
+	assert.Contains(t, args, "6555:5575/tcp")
 	assert.Contains(t, args, "lava/emulator:api35")
 }
 

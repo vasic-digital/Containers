@@ -103,7 +103,13 @@ func buildContainerRunArgs(
 	}
 
 	args = append(args,
-		"-p", fmt.Sprintf("%d:5555/tcp", hostPort),
+		// RC3 (2026-06-23 thinker.local blocker): forward the host ADB
+		// port to the container's socat bridge port 5575, NOT 5555.
+		// The emulator's adbd binds container-loopback 127.0.0.1:5555,
+		// which is unreachable through podman's published-interface port
+		// forward; entrypoint.sh runs `socat TCP-LISTEN:5575 →
+		// 127.0.0.1:5555` so the published interface has a real listener.
+		"-p", fmt.Sprintf("%d:5575/tcp", hostPort),
 		"-p", fmt.Sprintf("%d:5554/tcp", hostPort-1),
 		"-e", "ANDROID_AVD_NAME="+avd.Name,
 		"-e", fmt.Sprintf("ANDROID_COLD_BOOT=%t", coldBoot),
