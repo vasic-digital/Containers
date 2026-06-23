@@ -12,10 +12,10 @@
 //	emulator-canary \
 //	  --android-sdk-root /opt/android-sdk \
 //	  --apk releases/1.2.36/android-release/app-release.apk \
-//	  --package digital.vasic.lava.client \
+//	  --package digital.vasic.app.client \
 //	  --activity .MainActivity \
 //	  --avd Pixel_8:35:phone \
-//	  --evidence-dir .lava-ci-evidence/canary-1.2.36 \
+//	  --evidence-dir .ci-evidence/canary-1.2.36 \
 //	  --cold-boot
 //
 // AVD format: Name[:APILevel[:FormFactor]] — identical to emulator-matrix.

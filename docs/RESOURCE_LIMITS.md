@@ -1,6 +1,6 @@
 # Container Resource Limits — Policy & Reference
 
-> **One-line summary:** every container started under HelixAgent gets a
+> **One-line summary:** every container started under the consuming project gets a
 > hard memory cap, a swap cap equal to the memory cap, a pids cap, and a
 > positive `oom_score_adj` so the container is the preferred OOM-killer
 > victim — never the user's GUI session.
@@ -13,11 +13,11 @@ when adding a new container or stack.
 
 ## 1. The problem this policy solves
 
-On the dev workstation that hosts the HelixAgent stack, the user GUI
+On the dev workstation that hosts the consuming project's stack, the user GUI
 session has been observed to be torn down with
 `user@1000.service: Main process exited, code=killed, status=9/KILL`
 multiple times per day during heavy work sessions (Kimi CLI + Claude Code
-+ Podman compose stacks for Boba/MeTube + HelixAgent stacks).
++ Podman compose stacks for several side projects + the consuming project stacks).
 
 Forensics from `journalctl`:
 
@@ -120,7 +120,7 @@ synchronized places:
 | Caches | `redis*`, `memcached*`, `valkey*` | 1g | 1g | 1024 | Bounded-by-config. |
 | Messaging | `kafka*`, `pulsar*`, `rabbitmq*` | 2–4g | same | 1024–2048 | Page cache + JVM. |
 | Reverse proxies | `nginx*`, `traefik*`, `caddy*` | 512m | 512m | 1024 | Stateless. |
-| Helix application | `helixagent*`, `helixllm*`, `helixqa*`, `helix*` | 3–4g | same | 2048 | Real workloads. |
+| Consuming application | `app*`, `helixllm*`, `helixqa*`, `helix*` | 3–4g | same | 2048 | Real workloads. |
 | Build / CI | `*-builder*`, `*-ci-*`, `*-test*` | 3–4g | same | 2048–4096 | Compilers fork heavily. |
 | **Default fallback** | (no match) | 2g | 2g | 1024 | Conservative. |
 
@@ -172,7 +172,7 @@ Containers/
 ### Run the bulk applier
 
 ```sh
-cd HelixAgent
+cd <project-root>
 Containers/scripts/resource-policy/apply_caps.py [--dry-run]
 ```
 
@@ -182,7 +182,7 @@ every user-owned compose file. Idempotent on repeat runs.
 ### Run the tests
 
 ```sh
-cd HelixAgent
+cd <project-root>
 python3 Containers/scripts/resource-policy/test_caps.py
 go test ./Containers/pkg/policy/...
 ```
@@ -210,9 +210,9 @@ if err := cap.Validate(); err != nil { ... }
 * `/.container-caps-backup-*` (its own backups)
 * `/MCP/submodules/`, `/external/` (third-party MCP servers)
 * `/cli_agents/{openhands,fauxpilot,gpt-engineer,claude-code-source,claude-plugins,postgres-mcp,kilo-code,roo-code,nanocoder,plandex,taskweaver,bridle,qwen-code,swe-agent}/`
-* `/cli_agents/HelixCode/HelixCode/` (nested checkout)
+* `/cli_agents/the-app/the-app/` (nested checkout)
 * `/HelixQA/tools/opensource/` (third-party tools)
-* `/mcp-servers/`, `/HelixCode/mcp-servers/`
+* `/mcp-servers/`, `/the-app/mcp-servers/`
 * `/HelixLLM/docs/`, `/docs/research/`, `/docs/specs/`, `/docs/examples/`
 
 Adding new third-party submodules? Extend `SKIP_PATH_FRAGMENTS` in
@@ -258,14 +258,14 @@ Three escape hatches:
 
 ```sh
 # Start any service:
-cd HelixAgent && compose-up up -d postgres
+cd <project-root> && compose-up up -d postgres
 
 # Inspect its cgroup:
-podman inspect helixagent-postgres -f '{{.HostConfig.Memory}}'
+podman inspect app-postgres -f '{{.HostConfig.Memory}}'
 # → 4294967296   (4 GiB)
 
 # Or directly via cgroup v2:
-cgpath=$(podman inspect helixagent-postgres -f '{{.State.CgroupPath}}')
+cgpath=$(podman inspect app-postgres -f '{{.State.CgroupPath}}')
 cat /sys/fs/cgroup${cgpath}/memory.max
 # → 4294967296
 cat /sys/fs/cgroup${cgpath}/memory.swap.max
@@ -283,5 +283,5 @@ generators; upgrade if you see it.
 ## 10. Change log
 
 * **2026-04-25** — Policy created. 443/443 user-owned services capped
-  across 35 compose files in the HelixAgent project. Go counterpart in
+  across 35 compose files in the consuming project. Go counterpart in
   `pkg/policy`. Comprehensive test suite (20 Python + 6 Go).

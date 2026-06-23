@@ -47,7 +47,7 @@ skip() { printf '[SKIP-OK] %s\n' "$1"; }
 condition_governance_anchors() {
     local file
     # Anchors actually present in this owned submodule's covenant fleet (CONST-045
-    # is meta-repo-scoped to HelixCode and intentionally NOT cascaded here per
+    # is meta-repo-scoped to the consuming project and intentionally NOT cascaded here per
     # CONST-051(B) decoupling — the submodule remains project-not-aware).
     local needed_literals=("CONST-035" "CONST-050" "CONST-051" "CONST-053" "CONST-060")
     for file in CONSTITUTION.md CLAUDE.md AGENTS.md; do

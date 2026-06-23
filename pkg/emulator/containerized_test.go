@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Bluff-Audit posture (parent Lava clauses 6.J + 6.L + 6.X):
+// Bluff-Audit posture (parent project's clauses 6.J + 6.L + 6.X):
 // Every test in this file is paired with a deliberate-mutation
 // rehearsal documented in the commit body that introduces it.
 // The §6.X-debt close requires that the Containerized type's
@@ -488,7 +488,7 @@ func TestContainerized_RunInstrumentation_SetsAndroidSerialAndChecksBuildSuccess
 // §6.X-debt / decoupling fix: the CLI's --gradle-module flag (and the
 // MatrixConfig.GradleModule field it threads into) MUST change the
 // gradle task the emulator invokes. A consumer that ships its
-// instrumentation under a non-"app" module (e.g. Lava's :api-app
+// instrumentation under a non-"app" module (e.g. the consuming project's :api-app
 // challenge classes) discovers ZERO tests when the module is hardwired
 // to :app — a false-green by construction. This test drives the
 // non-default module and asserts the synthesized shell command targets

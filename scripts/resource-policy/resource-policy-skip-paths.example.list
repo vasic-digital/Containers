@@ -16,12 +16,12 @@
 #     slashes when you mean a directory boundary.
 #
 # Example contents below — copy + adapt to your project. The example
-# entries name HelixCode-internal directories the original hardcoded
-# list used to cover; they are LEGITIMATELY HelixCode-specific and
-# now live in HelixCode's own copy of this file rather than in the
+# entries name project-internal directories the original hardcoded
+# list used to cover; they are LEGITIMATELY project-specific and
+# now live in the project's own copy of this file rather than in the
 # decoupled submodule's source.
 
-# Third-party submodules under HelixCode's tree
+# Third-party submodules under the project's tree
 /MCP/submodules/
 /cli_agents/openhands/
 /cli_agents/fauxpilot/
@@ -37,14 +37,14 @@
 /cli_agents/bridle/
 /cli_agents/qwen-code/
 /cli_agents/swe-agent/
-/cli_agents/HelixCode/HelixCode/
+/cli_agents/the-app/the-app/
 
 # Third-party tools shipped in HelixQA
 /HelixQA/tools/opensource/
 
-# Third-party MCP servers shipped beside HelixCode
+# Third-party MCP servers shipped beside the consuming project
 /mcp-servers/
-/HelixCode/mcp-servers/
+/the-app/mcp-servers/
 
 # HelixLLM example/docs compose files
 /HelixLLM/docs/

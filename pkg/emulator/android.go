@@ -844,7 +844,7 @@ func (a *AndroidEmulator) Boot(
 // WaitForBoot polls `getprop sys.boot_completed` via adb until it
 // returns "1" or the timeout elapses. Returns the elapsed duration.
 //
-// The poll interval is 5 seconds (matches Lava's
+// The poll interval is 5 seconds (matches the consuming project's
 // scripts/run-emulator-tests.sh contract before this package shipped,
 // so the new package does not change observable behaviour).
 func (a *AndroidEmulator) WaitForBoot(
@@ -975,7 +975,7 @@ func (a *AndroidEmulator) Install(
 // RunInstrumentation runs `connectedDebugAndroidTest` for the named
 // test class via gradle. The runner expects to be invoked from a
 // project root that has a gradlew + the matching `:app:connected*`
-// task wired (Lava's case). The current implementation shells out via
+// task wired (the consuming project's case). The current implementation shells out via
 // gradlew; future versions MAY drive `adb shell am instrument`
 // directly for less wrapper overhead.
 //

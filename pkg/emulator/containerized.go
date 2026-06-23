@@ -95,7 +95,7 @@ func buildContainerRunArgs(
 // defaultGradleModule is the neutral module name used when a caller
 // supplies no GradleModule. It is deliberately generic — the
 // Containers package is 100% decoupled from any consumer project, so
-// no consumer module (e.g. Lava's "api-app") is ever baked in as a
+// no consumer module (e.g. the consuming project's "api-app") is ever baked in as a
 // default or special case.
 const defaultGradleModule = "app"
 
@@ -131,7 +131,7 @@ func gradleConnectedTestArgs(module, testClass string) []string {
 // Containerized implements [Emulator] by running the Android emulator
 // process INSIDE a podman or docker container managed by the
 // vasic-digital/Containers package. This is the constitutional landing
-// for parent Lava clause 6.X (Container-Submodule Emulator Wiring
+// for parent project's clause 6.X (Container-Submodule Emulator Wiring
 // Mandate, added 2026-05-13):
 //
 //	"Every Android emulator instance the project depends on for testing
@@ -160,7 +160,7 @@ func gradleConnectedTestArgs(module, testClass string) []string {
 //     virtualization. On darwin/arm64, /dev/kvm does not exist and
 //     this implementation cannot satisfy clause 6.X clause 1 — that
 //     is recorded in
-//     `.lava-ci-evidence/sixth-law-incidents/2026-05-13-emulator-container-darwin-arm64-gap.json`
+//     `.ci-evidence/sixth-law-incidents/2026-05-13-emulator-container-darwin-arm64-gap.json`
 //     as the §6.V-debt darwin/arm64 gap. The gate runs on Linux
 //     x86_64; workstation iteration on Apple Silicon uses
 //     [AndroidEmulator] (host-direct) per the §6.X workstation
@@ -176,7 +176,7 @@ func gradleConnectedTestArgs(module, testClass string) []string {
 // inside real container" test is gated on Linux x86_64 with /dev/kvm
 // — `t.Skip("SKIP-OK: §6.X-debt — darwin/arm64 has no /dev/kvm; this
 // test runs on Linux x86_64 gate runners. See incident JSON.")` on
-// hosts where the gate cannot fire. Per parent Lava's §6.J Forbidden
+// hosts where the gate cannot fire. Per the parent project's §6.J Forbidden
 // Test Patterns, a t.Skip MUST have a tracking citation; the citation
 // here is the §6.V-debt incident JSON referenced above.
 type Containerized struct {
@@ -189,7 +189,7 @@ type Containerized struct {
 	// image is the emulator container image reference (e.g.
 	// "ghcr.io/vasic-digital/lava-android-emulator:api34-phone").
 	// Per the Decoupled Reusable Architecture rule this is generic
-	// — the consuming project (Lava) configures the per-AVD image
+	// — the consuming project configures the per-AVD image
 	// list via its own manifest (tools/lava-containers/vm-images.json).
 	image string
 

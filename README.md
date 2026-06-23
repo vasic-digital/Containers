@@ -340,7 +340,7 @@ performs no sudo / suspend / hibernate / poweroff calls, never echoes secrets
 ## Android Emulator (pkg/emulator)
 
 `pkg/emulator` provides multi-target Android emulator orchestration satisfying
-parent Lava clauses 6.I (Multi-Emulator Container Matrix), 6.K
+parent project's clauses 6.I (Multi-Emulator Container Matrix), 6.K
 (Builds-Inside-Containers Mandate), 6.V (Container Emulators Mandate), and
 6.X (Container-Submodule Emulator Wiring Mandate).
 
@@ -407,10 +407,10 @@ cannot test release-signed APKs (signature mismatch), so the canary uses
 emulator-canary \
   --android-sdk-root $ANDROID_SDK_ROOT \
   --apk releases/1.2.36/android-release/app-release.apk \
-  --package digital.vasic.lava.client \
+  --package digital.vasic.app.client \
   --activity .MainActivity \
   --avd Pixel_8:35:phone \
-  --evidence-dir .lava-ci-evidence/canary-1.2.36 \
+  --evidence-dir .ci-evidence/canary-1.2.36 \
   --cold-boot
 ```
 
@@ -429,8 +429,8 @@ The canary writes a `canary-attestation.json` and `logcat.txt` under
 emulator-matrix \
   --android-sdk-root /opt/android-sdk \
   --apk releases/1.2.36/android-debug/app-debug.apk \
-  --test-class lava.app.challenges.Challenge01AppLaunchAndTrackerSelectionTest \
-  --evidence-dir .lava-ci-evidence/1.2.36 \
+  --test-class app.example.challenges.Challenge01AppLaunchAndTrackerSelectionTest \
+  --evidence-dir .ci-evidence/1.2.36 \
   --avds Pixel_8:35:phone,Pixel_Tablet:34:tablet \
   --runner auto \
   --cold-boot

@@ -65,7 +65,7 @@ RUN ARCH="$(uname -m)" \
  && curl -fsSL "$URL" | tar -xz -C /opt/jdk --strip-components=1 \
  && /opt/jdk/bin/java -version
 
-# Gradle 8.11.1 — pinned to match Yole's gradle/wrapper version.
+# Gradle 8.11.1 — pinned to match the consuming project's gradle/wrapper version.
 ENV GRADLE_VERSION=8.11.1
 RUN curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o /tmp/gradle.zip \
  && unzip -q /tmp/gradle.zip -d /opt \
