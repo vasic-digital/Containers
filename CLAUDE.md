@@ -1,5 +1,9 @@
 # CLAUDE.md - Containers Module
 
+## INHERITED FROM constitution/CLAUDE.md
+
+All rules in `constitution/CLAUDE.md` (and the `constitution/Constitution.md` it references) apply unconditionally. This file's rules below extend them — they MUST NOT weaken any inherited rule. See parent root `CLAUDE.md` §6.AD for the Lava-specific incorporation context (29th §6.L cycle, 2026-05-14) and §6.AD-debt for the implementation-gap inventory. Use `constitution/find_constitution.sh` from the parent project root to resolve the absolute path of the submodule from any nested location.
+
 ## INHERITED FROM the Helix Constitution
 
 This module is governed by the Helix Constitution. All rules in the
@@ -191,6 +195,10 @@ Adding a host = append six env vars. No code change, N scales freely (this is CO
 - **Downstream (sibling modules):** `Challenges`, `HelixLLM`, `HelixQA`.
 - **The consuming project consumers:** `internal/adapters/containers/adapter.go`, `internal/services/boot_manager.go`.
 - **Hard external dependencies:** SSH client binaries, a container runtime on the local machine (Docker/Podman/etc.), SSH server + container runtime on each configured remote host, SSH network reachability.
+
+## §6.R — No-Hardcoding Mandate (inherited 2026-05-06, per §6.F)
+
+See root `/CLAUDE.md` §6.R. No connection address, port, header field name, credential, key, salt, secret, schedule, algorithm parameter, or domain literal in tracked source code. Every such value MUST come from `.env` (gitignored), generated config, runtime env var, or mounted file. Submodule MAY add stricter rules but MUST NOT relax.
 
 ## Commit Style
 
