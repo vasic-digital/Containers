@@ -58,6 +58,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libasound2t64 \
         qemu-kvm \
         qemu-system-x86 \
+        socat \
         && rm -rf /var/lib/apt/lists/*
 
 # Non-root user for the emulator runtime — clause 6.U inheritance.
@@ -97,17 +98,40 @@ RUN yes | sdkmanager --licenses > /dev/null 2>&1 || true && \
         "${SYSTEM_IMAGE_PACKAGE}" \
         "platforms;android-${API_LEVEL}"
 
+# RC2 (2026-06-23 thinker.local blocker blocker-emulator-boot-incontainer.json):
+# generate a FIXED adb keypair INSIDE the image BEFORE the AVD is created.
+# The emulator bakes $HOME/.android/adbkey.pub into the AVD's authorized
+# adb keys at create time (androidboot.qemu.adb.pubkey). With a baked,
+# known keypair the host-side adb client can authorise using the MATCHING
+# private key (the runner copies /home/emulator/.android/adbkey out of the
+# container and sets ADB_VENDOR_KEYS to it — see Containerized.WaitForBoot).
+# Without this, the guest authorises a random per-build key that the host
+# never has, so `adb connect` returns `offline` forever and WaitForBoot
+# times out. This is the canonical google/android-emulator-container-scripts
+# pattern (adb keygen in the image + ADB_VENDOR_KEYS on the client). The
+# keypair is generated at build time and NOT committed to git (§6.H/§11.4.10
+# compliant — no secret literal in tracked source).
+RUN mkdir -p "${HOME}/.android" && \
+    adb keygen "${HOME}/.android/adbkey" && \
+    chmod 600 "${HOME}/.android/adbkey" "${HOME}/.android/adbkey.pub"
+
 # Pre-create a default AVD matching the build-arg target. Production
 # Containerized.Boot passes the AVD name via $ANDROID_AVD_NAME; the
-# image's default AVD is the fallback for ad-hoc runs.
+# image's default AVD is the fallback for ad-hoc runs. With the adb
+# keypair already at $HOME/.android the emulator authorises it.
 RUN echo "no" | avdmanager create avd \
         --name "default" \
         --package "${SYSTEM_IMAGE_PACKAGE}" \
         --device "pixel" || true
 
-# Expose emulator console + adb ports. Containerized.Boot maps these
-# to host ephemeral ports per §6.X clause 3 (--p <host>:5554, <host>:5555).
-EXPOSE 5554/tcp 5555/tcp
+# Expose emulator console + adb ports + the RC3 socat adb bridge port.
+# Containerized.Boot maps the host ADB port to the bridge port 5575 (NOT
+# 5555 directly) because the emulator's adbd binds container-loopback
+# 127.0.0.1:5555 — unreachable through podman's published-interface port
+# forward. The entrypoint runs `socat TCP-LISTEN:5575 → 127.0.0.1:5555`
+# so the published interface has a real listener. See entrypoint.sh +
+# buildContainerRunArgs (RC3, 2026-06-23 thinker.local blocker).
+EXPOSE 5554/tcp 5555/tcp 5575/tcp
 
 # Entrypoint. Reads ANDROID_AVD_NAME + ANDROID_COLD_BOOT and invokes
 # the emulator headlessly. The emulator process IS PID 1 of the
