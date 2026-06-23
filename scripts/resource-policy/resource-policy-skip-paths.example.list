@@ -37,14 +37,14 @@
 /cli_agents/bridle/
 /cli_agents/qwen-code/
 /cli_agents/swe-agent/
-/cli_agents/HelixCode/HelixCode/
+/cli_agents/the-app/the-app/
 
 # Third-party tools shipped in HelixQA
 /HelixQA/tools/opensource/
 
 # Third-party MCP servers shipped beside the consuming project
 /mcp-servers/
-/HelixCode/mcp-servers/
+/the-app/mcp-servers/
 
 # HelixLLM example/docs compose files
 /HelixLLM/docs/

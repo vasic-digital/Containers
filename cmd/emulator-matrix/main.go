@@ -10,11 +10,11 @@
 //   emulator-matrix \
 //     --android-sdk-root /opt/android-sdk \
 //     --apk releases/1.2.1/android-debug/app-debug.apk \
-//     --test-class lava.app.challenges.Challenge01AppLaunchAndTrackerSelectionTest \
-//     --evidence-dir .lava-ci-evidence/Lava-1.2.2 \
+//     --test-class app.example.challenges.Challenge01AppLaunchAndTrackerSelectionTest \
+//     --evidence-dir .ci-evidence/App-1.2.2 \
 //     --avds CZ_API28_Phone,CZ_API30_Phone,CZ_API34_Phone,Pixel_9a \
 //     --cold-boot \
-//     --image-manifest tools/lava-containers/vm-images.json
+//     --image-manifest tools/ci-containers/vm-images.json
 //
 // Each comma-separated AVD entry MAY include the API level after a
 // colon: `Pixel_9a:36:phone` (name:apiLevel:formFactor). The api level

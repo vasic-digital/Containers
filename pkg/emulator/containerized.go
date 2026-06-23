@@ -160,7 +160,7 @@ func gradleConnectedTestArgs(module, testClass string) []string {
 //     virtualization. On darwin/arm64, /dev/kvm does not exist and
 //     this implementation cannot satisfy clause 6.X clause 1 — that
 //     is recorded in
-//     `.lava-ci-evidence/sixth-law-incidents/2026-05-13-emulator-container-darwin-arm64-gap.json`
+//     `.ci-evidence/sixth-law-incidents/2026-05-13-emulator-container-darwin-arm64-gap.json`
 //     as the §6.V-debt darwin/arm64 gap. The gate runs on Linux
 //     x86_64; workstation iteration on Apple Silicon uses
 //     [AndroidEmulator] (host-direct) per the §6.X workstation

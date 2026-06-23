@@ -23,9 +23,9 @@ import (
 //     Linux jpackage runtime image.
 //   - Host is Linux but the package set is wrong (e.g. nezha.local
 //     ALT Linux openjdk-21 lacks jmods; ticket
-//     #nezha-jdk-jmods-bootstrap in Yole KNOWN_DEFECTS).
+//     #nezha-jdk-jmods-bootstrap in the consuming project's KNOWN_DEFECTS).
 //   - The dedicated Linux build host is temporarily unreachable
-//     (operator mandate, iter-54 of Yole, 2026-05-13:
+//     (operator mandate, iter-54 of the consuming project, 2026-05-13:
 //     "If nezha.local gets unaccessible … do building using
 //     Container or Qemu like the Windows build!").
 //
