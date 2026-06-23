@@ -49,7 +49,7 @@ RUN mkdir -p /opt/jdk \
     | tar -xz -C /opt/jdk --strip-components=1 \
  && /opt/jdk/bin/java -version
 
-# Gradle 8.11.1 — matches Yole's wrapper version. Pinned so a
+# Gradle 8.11.1 — matches the consuming project's wrapper version. Pinned so a
 # transitive Gradle upgrade doesn't silently change build output.
 ENV GRADLE_VERSION=8.11.1
 RUN curl -fsSL https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip -o /tmp/gradle.zip \

@@ -5,7 +5,7 @@
 #
 # Buildable on: Linux x86_64 with /dev/kvm available.
 # NOT buildable / runnable on: darwin/arm64 (no /dev/kvm).
-# Recorded in: .lava-ci-evidence/sixth-law-incidents/2026-05-13-emulator-container-darwin-arm64-gap.json
+# Recorded in: .ci-evidence/sixth-law-incidents/2026-05-13-emulator-container-darwin-arm64-gap.json
 #
 # Build command (Linux x86_64):
 #   podman build --build-arg API_LEVEL=34 --build-arg ABI=x86_64 \

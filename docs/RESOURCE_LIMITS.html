@@ -257,7 +257,7 @@ session has been observed to be torn down with
 multiple times per day during heavy work sessions (Kimi CLI + Claude
 Code</p>
 <ul>
-<li>Podman compose stacks for Boba/MeTube + the consuming project stacks).</li>
+<li>Podman compose stacks for several side projects + the consuming project stacks).</li>
 </ul>
 <p>Forensics from <code>journalctl</code>:</p>
 <table>
@@ -493,8 +493,8 @@ tiers (full list in source)</h3>
 <td>Stateless.</td>
 </tr>
 <tr>
-<td>Helix application</td>
-<td><code>helixagent*</code>, <code>helixllm*</code>,
+<td>Consuming application</td>
+<td><code>app*</code>, <code>helixllm*</code>,
 <code>helixqa*</code>, <code>helix*</code></td>
 <td>3–4g</td>
 <td>same</td>
@@ -561,12 +561,12 @@ you&#39;re done.</p>
     ├── policy.go            # Go rules (single source of truth #2)
     └── policy_test.go       # 6 Go tests</code></pre>
 <h3 id="run-the-bulk-applier">Run the bulk applier</h3>
-<div class="sourceCode" id="cb3"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> HelixAgent</span>
+<div class="sourceCode" id="cb3"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> &lt;project-root&gt;</span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">Containers/scripts/resource-policy/apply_caps.py</span> <span class="pp">[--</span><span class="ss">dry</span><span class="pp">-</span><span class="ss">run</span><span class="pp">]</span></span></code></pre></div>
 <p>It walks the project, skips third-party submodules, applies caps to
 every user-owned compose file. Idempotent on repeat runs.</p>
 <h3 id="run-the-tests">Run the tests</h3>
-<div class="sourceCode" id="cb4"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> HelixAgent</span>
+<div class="sourceCode" id="cb4"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> &lt;project-root&gt;</span>
 <span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> Containers/scripts/resource-policy/test_caps.py</span>
 <span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> test ./Containers/pkg/policy/...</span></code></pre></div>
 <h3 id="use-the-go-policy-at-runtime">Use the Go policy at runtime</h3>
@@ -589,10 +589,10 @@ NOT touch</h2>
 <li><code>/MCP/submodules/</code>, <code>/external/</code> (third-party
 MCP servers)</li>
 <li><code>/cli_agents/{openhands,fauxpilot,gpt-engineer,claude-code-source,claude-plugins,postgres-mcp,kilo-code,roo-code,nanocoder,plandex,taskweaver,bridle,qwen-code,swe-agent}/</code></li>
-<li><code>/cli_agents/HelixCode/HelixCode/</code> (nested checkout)</li>
+<li><code>/cli_agents/the-app/the-app/</code> (nested checkout)</li>
 <li><code>/HelixQA/tools/opensource/</code> (third-party tools)</li>
 <li><code>/mcp-servers/</code>,
-<code>/HelixCode/mcp-servers/</code></li>
+<code>/the-app/mcp-servers/</code></li>
 <li><code>/HelixLLM/docs/</code>, <code>/docs/research/</code>,
 <code>/docs/specs/</code>, <code>/docs/examples/</code></li>
 </ul>
@@ -634,14 +634,14 @@ the wrapper&#39;s <code>MemoryMax</code> for that session:
 <h2 id="9-verifying-enforcement-at-runtime">9. Verifying enforcement at
 runtime</h2>
 <div class="sourceCode" id="cb6"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Start any service:</span></span>
-<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> HelixAgent <span class="kw">&amp;&amp;</span> <span class="ex">compose-up</span> up <span class="at">-d</span> postgres</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> &lt;project-root&gt; <span class="kw">&amp;&amp;</span> <span class="ex">compose-up</span> up <span class="at">-d</span> postgres</span>
 <span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Inspect its cgroup:</span></span>
-<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> inspect helixagent-postgres <span class="at">-f</span> <span class="st">&#39;{{.HostConfig.Memory}}&#39;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> inspect app-postgres <span class="at">-f</span> <span class="st">&#39;{{.HostConfig.Memory}}&#39;</span></span>
 <span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="co"># → 4294967296   (4 GiB)</span></span>
 <span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Or directly via cgroup v2:</span></span>
-<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="va">cgpath</span><span class="op">=</span><span class="va">$(</span><span class="ex">podman</span> inspect helixagent-postgres <span class="at">-f</span> <span class="st">&#39;{{.State.CgroupPath}}&#39;</span><span class="va">)</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="va">cgpath</span><span class="op">=</span><span class="va">$(</span><span class="ex">podman</span> inspect app-postgres <span class="at">-f</span> <span class="st">&#39;{{.State.CgroupPath}}&#39;</span><span class="va">)</span></span>
 <span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup<span class="va">${cgpath}</span>/memory.max</span>
 <span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="co"># → 4294967296</span></span>
 <span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup<span class="va">${cgpath}</span>/memory.swap.max</span>

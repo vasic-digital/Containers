@@ -2,13 +2,13 @@
 
 > Sub-package: `pkg/crossbuild`
 > Backend covered: `WineContainerBackend`
-> Forensic anchor: iter-54 of Yole, 2026-05-13
+> Forensic anchor: iter-54 of the consuming project, 2026-05-13
 
 ## What you are building
 
 The `pkg/crossbuild` package needs a Linux container image with
 Wine + JDK 17 + Gradle pre-installed. The image is the runtime that
-executes the Yole Gradle build inside a Linux host targeting the
+executes the consuming project's Gradle build inside a Linux host targeting the
 Windows `.msi` artifact via Wine's translation layer + the JDK's
 `jpackage` tool.
 
@@ -58,14 +58,14 @@ exercises the actual image.
 
 ```bash
 bash challenges/crossbuild_windows_msi_challenge.sh \
-    --source-dir /path/to/Yole \
-    --output-dir /path/to/Yole/releases
+    --source-dir /path/to/ExampleApp \
+    --output-dir /path/to/ExampleApp/releases
 ```
 
 Expected on Linux x86_64 hosts WITH the image provisioned:
 
 ```
-OK: produced Yole-Windows-x64-1.0.1-Release-0.0.0.1.1.msi (size N bytes)
+OK: produced ExampleApp-Windows-x64-1.0.1-Release-0.0.0.1.1.msi (size N bytes)
 PASS: crossbuild_windows_msi_challenge
 ```
 
@@ -88,7 +88,7 @@ via `[[ -s "$OUTPUT_MSI" ]]` post-condition.
 ## When this approach hits its limits
 
 Wine-in-Docker cross-builds the .msi reliably for plain Compose
-Desktop applications. If a Yole release requires Windows-specific
+Desktop applications. If a consuming-project release requires Windows-specific
 behaviour Wine cannot translate (kernel-mode drivers, codec
 licensing checks, signed-driver loaders), fall back to the
 `QEMUWindowsBackend` (sibling Backend; uses pkg/vm/qemu.go to boot
