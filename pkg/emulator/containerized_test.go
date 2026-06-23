@@ -348,6 +348,55 @@ func TestContainerized_WaitForBoot_FailsOnTimeout(t *testing.T) {
 	}
 }
 
+// TestContainerized_authorizeADB_CopiesBakedKeyAndSetsVendorKeys is the
+// RC2 anti-bluff guard (2026-06-23 thinker.local blocker). The image
+// bakes a fixed adb keypair the AVD authorises; the runner MUST copy the
+// matching PRIVATE key out of the container and point host adb at it via
+// ADB_VENDOR_KEYS, otherwise `adb connect` returns `offline` forever and
+// WaitForBoot times out. The §6.J primary assertion is the wire-observable
+// `podman cp <container>:/home/emulator/.android/adbkey <host>` command.
+//
+//	FALSIFIABILITY REHEARSAL: remove the c.authorizeADB(ctx) call from
+//	WaitForBoot (or the `cp` Execute in authorizeADB) → no cp call is
+//	recorded, this test fails ("expected podman cp of the baked adbkey"),
+//	and the real thinker.local run reverts to `device offline` / timeout.
+func TestContainerized_authorizeADB_CopiesBakedKeyAndSetsVendorKeys(t *testing.T) {
+	fake := &fakeExecutor{scripts: map[string]fakeScript{}}
+	c, _ := NewContainerized(ContainerizedConfig{
+		RuntimeBinary: "podman",
+		Image:         "any:tag",
+		Executor:      fake,
+	})
+	// Simulate a prior Boot having set the container name.
+	c.containerName = "lava-emu-Pixel_8-123"
+
+	// authorizeADB may return a non-nil error in this fake environment
+	// (os.Chmod fails because the fake `cp` writes no real file) — the
+	// load-bearing assertion is the COMMAND the runner issued, not the
+	// fake-filesystem side effect.
+	_ = c.authorizeADB(context.Background())
+
+	// §6.J primary assertion: the baked private key was copied out of the
+	// exact container at the exact image path.
+	wantSrc := "lava-emu-Pixel_8-123:" + containerADBKeyPath
+	foundCp := false
+	for _, call := range fake.calls {
+		if call.Name == "podman" && len(call.Args) >= 2 &&
+			call.Args[0] == "cp" && call.Args[1] == wantSrc {
+			foundCp = true
+		}
+	}
+	if !foundCp {
+		t.Errorf("expected podman cp of the baked adbkey (%q) so host adb can authorise the guest; calls=%v", wantSrc, fake.calls)
+	}
+
+	// ADB_VENDOR_KEYS MUST be set so the host adb client presents the
+	// baked key on connect.
+	if os.Getenv("ADB_VENDOR_KEYS") == "" {
+		t.Errorf("ADB_VENDOR_KEYS must be set to the copied baked key path; got empty")
+	}
+}
+
 // TestContainerized_Install_ChecksSuccessMarker asserts Install
 // observes "Success" in `adb install` output before reporting
 // success. Mutation rehearsal: drop the `bytes.Contains(out,
