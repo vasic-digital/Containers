@@ -69,6 +69,17 @@ type CanaryConfig struct {
 	// ColdBoot enforces no-snapshot-reload (clause 6.I clause 6) when
 	// true. Gate-mode canary runs MUST use true.
 	ColdBoot bool
+
+	// ContainerImage is the OCI image for the Android emulator container
+	// (e.g. "localhost/lava-android-emulator:api34-x86_64"). When
+	// non-empty, the canary boots via Containerized instead of host-direct.
+	// Required on Linux gate-hosts where the host-direct AVD system images
+	// are absent. §6.AH compliant — emulator runs inside container.
+	ContainerImage string
+
+	// ContainerRuntime is "podman" or "docker". Default "podman".
+	// Only used when ContainerImage is non-empty.
+	ContainerRuntime string
 }
 
 // CanaryResult captures the outcome of a single RunCanary invocation.
@@ -165,37 +176,78 @@ func RunCanary(ctx context.Context, cfg CanaryConfig) (CanaryResult, error) {
 	// interrupted previous run left it, the emulator refuses to boot.
 	clearAVDLock(cfg.AVD.Name)
 
-	emu := NewAndroidEmulator(cfg.AndroidSdkRoot)
+	// adbBin + sharedExec are shared across both boot paths and
+	// the post-launch observation so they are declared once here.
+	adbBin := filepath.Join(cfg.AndroidSdkRoot, "platform-tools", "adb")
+	sharedExec := NewOSExecutor()
 
-	bootResult, err := emu.Boot(ctx, cfg.AVD, cfg.ColdBoot)
-	result.BootDuration = bootResult.BootDuration
-	if err != nil {
-		result.Error = fmt.Sprintf("boot: %v", err)
-		result.FinishedAt = time.Now()
-		return result, fmt.Errorf("canary boot: %w", err)
-	}
-
-	defer func() { _ = emu.Teardown(ctx, bootResult.ADBPort) }()
-
-	if _, err := emu.WaitForBoot(ctx, bootResult.ADBPort, bootTimeout); err != nil {
-		result.Error = fmt.Sprintf("wait-for-boot: %v", err)
-		result.FinishedAt = time.Now()
-		return result, fmt.Errorf("canary wait-for-boot: %w", err)
-	}
-
-	// Install the release APK.
-	if err := emu.Install(ctx, bootResult.ADBPort, cfg.APKPath); err != nil {
-		result.Error = fmt.Sprintf("install: %v", err)
-		result.FinishedAt = time.Now()
-		return result, fmt.Errorf("canary install: %w", err)
+	var bootResult BootResult
+	if cfg.ContainerImage != "" {
+		// Containerized boot path (§6.AH: emulator runs inside a
+		// podman/docker container; required on gate-hosts where the
+		// host-direct system images are absent).
+		rt := cfg.ContainerRuntime
+		if rt == "" {
+			rt = "podman"
+		}
+		c, cerr := NewContainerized(ContainerizedConfig{
+			RuntimeBinary: rt,
+			Image:         cfg.ContainerImage,
+			ADBBinaryPath: adbBin,
+		})
+		if cerr != nil {
+			result.Error = fmt.Sprintf("new containerized: %v", cerr)
+			result.FinishedAt = time.Now()
+			return result, fmt.Errorf("canary init: %w", cerr)
+		}
+		br, berr := c.Boot(ctx, cfg.AVD, cfg.ColdBoot)
+		bootResult = br
+		result.BootDuration = bootResult.BootDuration
+		if berr != nil {
+			result.Error = fmt.Sprintf("boot: %v", berr)
+			result.FinishedAt = time.Now()
+			return result, fmt.Errorf("canary boot: %w", berr)
+		}
+		defer func() { _ = c.Teardown(ctx, bootResult.ADBPort) }()
+		if _, err := c.WaitForBoot(ctx, bootResult.ADBPort, bootTimeout); err != nil {
+			result.Error = fmt.Sprintf("wait-for-boot: %v", err)
+			result.FinishedAt = time.Now()
+			return result, fmt.Errorf("canary wait-for-boot: %w", err)
+		}
+		if err := c.Install(ctx, bootResult.ADBPort, cfg.APKPath); err != nil {
+			result.Error = fmt.Sprintf("install: %v", err)
+			result.FinishedAt = time.Now()
+			return result, fmt.Errorf("canary install: %w", err)
+		}
+	} else {
+		// Host-direct boot path.
+		emu := NewAndroidEmulator(cfg.AndroidSdkRoot)
+		br, berr := emu.Boot(ctx, cfg.AVD, cfg.ColdBoot)
+		bootResult = br
+		result.BootDuration = bootResult.BootDuration
+		if berr != nil {
+			result.Error = fmt.Sprintf("boot: %v", berr)
+			result.FinishedAt = time.Now()
+			return result, fmt.Errorf("canary boot: %w", berr)
+		}
+		defer func() { _ = emu.Teardown(ctx, bootResult.ADBPort) }()
+		if _, err := emu.WaitForBoot(ctx, bootResult.ADBPort, bootTimeout); err != nil {
+			result.Error = fmt.Sprintf("wait-for-boot: %v", err)
+			result.FinishedAt = time.Now()
+			return result, fmt.Errorf("canary wait-for-boot: %w", err)
+		}
+		if err := emu.Install(ctx, bootResult.ADBPort, cfg.APKPath); err != nil {
+			result.Error = fmt.Sprintf("install: %v", err)
+			result.FinishedAt = time.Now()
+			return result, fmt.Errorf("canary install: %w", err)
+		}
 	}
 
 	// Launch the activity.
-	adb := emu.adbBinary()
 	target := fmt.Sprintf("localhost:%d", bootResult.ADBPort)
 	componentSpec := cfg.PackageName + "/" + cfg.LaunchActivity
-	launchOut, launchErr := emu.executor.Execute(
-		ctx, adb, "-s", target,
+	launchOut, launchErr := sharedExec.Execute(
+		ctx, adbBin, "-s", target,
 		"shell", "am", "start", "-n", componentSpec,
 	)
 	if launchErr != nil {
@@ -204,12 +256,12 @@ func RunCanary(ctx context.Context, cfg CanaryConfig) (CanaryResult, error) {
 		return result, fmt.Errorf("canary am start: %w", launchErr)
 	}
 
-	// Poll for the activity to reach RESUMED state. `adb shell dumpsys
-	// activity | grep mResumedActivity` is the canonical check:
-	// when the package appears in mResumedActivity the activity is
-	// on-screen and interactive.
+	// Poll for the activity to reach RESUMED state. dumpsys activity
+	// uses mResumedActivity (API ≤30) or topResumedActivity / ResumedActivity
+	// (API 31+, Android 12+). Check all three patterns so the canary
+	// works on API 34 (the target container image).
 	resumed, fatalDetected, logcatOutput := observeActivityAndLogcat(
-		ctx, emu, target, adb, cfg.PackageName, activityTimeout, logcatWindow,
+		ctx, sharedExec, target, adbBin, cfg.PackageName, activityTimeout, logcatWindow,
 	)
 	result.ActivityResumed = resumed
 	result.FatalDetected = fatalDetected
@@ -244,7 +296,7 @@ func RunCanary(ctx context.Context, cfg CanaryConfig) (CanaryResult, error) {
 // + logcat; the function does NOT short-circuit on install success.
 func observeActivityAndLogcat(
 	ctx context.Context,
-	emu *AndroidEmulator,
+	executor CommandExecutor,
 	target, adb, packageName string,
 	activityTimeout, logcatWindow time.Duration,
 ) (resumed, fatalDetected bool, logcatOutput string) {
@@ -253,13 +305,13 @@ func observeActivityAndLogcat(
 	// First: poll dumpsys activity until the package appears as resumed
 	// or the timeout fires.
 	for time.Now().Before(deadline) {
-		dumpsysOut, err := emu.executor.Execute(
+		dumpsysOut, err := executor.Execute(
 			ctx, adb, "-s", target,
 			"shell", "dumpsys", "activity", "activities",
 		)
 		if err == nil {
 			for _, line := range strings.Split(string(dumpsysOut), "\n") {
-				if strings.Contains(line, "mResumedActivity") && strings.Contains(line, packageName) {
+				if (strings.Contains(line, "mResumedActivity") || strings.Contains(line, "topResumedActivity") || strings.Contains(line, "ResumedActivity")) && strings.Contains(line, packageName) {
 					resumed = true
 					break
 				}
@@ -279,7 +331,7 @@ func observeActivityAndLogcat(
 	// FATAL or AndroidRuntime entries.
 	logcatCtx, cancel := context.WithTimeout(ctx, logcatWindow)
 	defer cancel()
-	logOut, _ := emu.executor.Execute(
+	logOut, _ := executor.Execute(
 		logcatCtx, adb, "-s", target,
 		"logcat", "-d", "-v", "threadtime",
 		"AndroidRuntime:E", "*:F",
