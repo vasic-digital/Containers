@@ -1,6 +1,6 @@
 # resource-policy
 
-Container resource caps for the HelixAgent project. Prevents the user GUI
+Container resource caps for the consuming project. Prevents the user GUI
 session from being SIGKILL'd by memory pressure when multiple stacks are
 running concurrently.
 

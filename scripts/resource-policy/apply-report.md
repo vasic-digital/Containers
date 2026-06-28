@@ -1,6 +1,6 @@
 # Container Cap Application Report
 
-Policy: `/run/media/milosvasic/DATA4TB/Projects/HelixAgent/Containers/scripts/resource-policy/policy.yaml`
+Policy: `/run/media/milosvasic/DATA4TB/Projects/TheApp/Containers/scripts/resource-policy/policy.yaml`
 
 Total: 500 service(s) across 45 file(s)
 
@@ -114,19 +114,19 @@ Total: 500 service(s) across 45 file(s)
 - mcp-llamaindex  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (1g/1024p)
 - mcp-docs  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (1g/1024p)
 - mcp-microsoft  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (1g/1024p)
-- helixagent-redis  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
-- helixagent-mongo  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
-- helixagent-qdrant  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
+- app-redis  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
+- app-mongo  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
+- app-qdrant  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
 
-### `cli_agents/HelixCode/docker-compose.helix.yml` — 5 service(s) updated
+### `cli_agents/the-app/docker-compose.helix.yml` — 5 service(s) updated
 
-- helixcode  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (3g/2048p)
+- the-app  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (3g/2048p)
 - postgres  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/1024p)
 - redis  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (1g/1024p)
 - worker-1  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (2g/1024p)
 - worker-2  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (2g/1024p)
 
-### `cli_agents/HelixCode/security/docker-compose.security.yml` — 4 service(s) updated
+### `cli_agents/the-app/security/docker-compose.security.yml` — 4 service(s) updated
 
 - sonarqube  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (8g/2048p)
 - sonarqube-db  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (8g/2048p)
@@ -382,7 +382,7 @@ Total: 500 service(s) across 45 file(s)
 - tika-extraction  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (2g/1024p)
 - sentence-embedding  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (2g/1024p)
 - ollama-generation  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (12g/2048p)
-- helixagent-rag-bridge  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
+- app-rag-bridge  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
 
 ### `docker/rag/docker-compose.rag.yml` — 10 service(s) updated
 
@@ -524,13 +524,13 @@ Total: 500 service(s) across 45 file(s)
 - redis-exporter  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (1g/1024p)
 - postgres-exporter  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/1024p)
 - blackbox-exporter  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (2g/1024p)
-- helixagent-exporter  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
+- app-exporter  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
 
 ### `docker-compose.multi-provider.yaml` — 5 service(s) updated
 
 - postgres  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/1024p)
 - redis  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (1g/1024p)
-- helixagent  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
+- app  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
 - prometheus  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (2g/1024p)
 - grafana  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (1g/1024p)
 
@@ -546,7 +546,7 @@ Total: 500 service(s) across 45 file(s)
 
 ### `docker-compose.protocols.yml` — 43 service(s) updated
 
-- helixagent-mcp  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
+- app-mcp  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
 - mcp-manager  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (1g/1024p)
 - mcp-filesystem  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (1g/1024p)
 - mcp-git  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (1g/1024p)
@@ -606,7 +606,7 @@ Total: 500 service(s) across 45 file(s)
 
 - postgres-test  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/1024p)
 - redis-test  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (1g/1024p)
-- helixagent-test  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
+- app-test  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
 - test-runner  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (2g/1024p)
 
 ### `docker-compose.test.yml` — 8 service(s) updated
@@ -616,7 +616,7 @@ Total: 500 service(s) across 45 file(s)
 - postgres  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/1024p)
 - redis  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (1g/1024p)
 - ollama  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (12g/2048p)
-- helixagent  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
+- app  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
 - prometheus  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (2g/1024p)
 - grafana  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (1g/1024p)
 
@@ -625,7 +625,7 @@ Total: 500 service(s) across 45 file(s)
 - postgres  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/1024p)
 - redis  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (1g/1024p)
 - ollama  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (12g/2048p)
-- helixagent  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
+- app  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (4g/2048p)
 - prometheus  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (2g/1024p)
 - grafana  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (1g/1024p)
 - cognee  +mem_limit,memswap_limit,pids_limit,oom_score_adj  (2g/1024p)

@@ -545,11 +545,11 @@ contexts or services.</p>
 <h3 id="mixed-localremote-containers">Mixed Local/Remote Containers</h3>
 <p><strong>Limitation</strong>: Current design requires ALL containers
 on remote OR ALL local.</p>
-<p><strong>Workaround</strong>: Use separate HelixAgent instances for
+<p><strong>Workaround</strong>: Use separate the consuming project instances for
 mixed deployments.</p>
 <h2 id="architecture">Architecture</h2>
 <pre><code>┌─────────────────────────────────────────────────────────────┐
-│                     HelixAgent (Local)                       │
+│                     the consuming project (Local)                       │
 │                                                              │
 │  ┌─────────────────┐    ┌───────────────────────────────┐   │
 │  │   BootManager   │───▶│     Container Adapter         │   │

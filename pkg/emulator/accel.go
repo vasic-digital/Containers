@@ -30,7 +30,7 @@ import "fmt"
 //     The host-direct runner is the OS-correct path on Windows.
 //
 // This file makes that OS→accel→runner mapping an explicit, pure,
-// deterministic function so callers (cmd/emulator-matrix, Lava's
+// deterministic function so callers (cmd/emulator-matrix, the consuming project's
 // run-challenge-matrix.sh) can resolve the correct runner instead of
 // hardcoding one. It does NOT change containerized.go: Linux still
 // uses the existing `--device /dev/kvm` path verbatim.

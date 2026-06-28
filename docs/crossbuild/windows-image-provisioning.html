@@ -241,13 +241,13 @@ code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; }
 image provisioning</h1>
 <blockquote>
 <p>Sub-package: <code>pkg/crossbuild</code> Backend covered:
-<code>WineContainerBackend</code> Forensic anchor: iter-54 of Yole,
+<code>WineContainerBackend</code> Forensic anchor: iter-54 of the consuming project,
 2026-05-13</p>
 </blockquote>
 <h2 id="what-you-are-building">What you are building</h2>
 <p>The <code>pkg/crossbuild</code> package needs a Linux container image
 with Wine + JDK 17 + Gradle pre-installed. The image is the runtime that
-executes the Yole Gradle build inside a Linux host targeting the Windows
+executes the consuming project&#39;s Gradle build inside a Linux host targeting the Windows
 <code>.msi</code> artifact via Wine&#39;s translation layer + the JDK&#39;s
 <code>jpackage</code> tool.</p>
 <p>Until this image exists on a given host,
@@ -286,22 +286,22 @@ exercises the actual image.</p>
 <p><code>challenges/crossbuild_windows_msi_challenge.sh</code>
 (Challenge script):</p>
 <div class="sourceCode" id="cb3"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">bash</span> challenges/crossbuild_windows_msi_challenge.sh <span class="dt">\</span></span>
-<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    <span class="at">--source-dir</span> /path/to/Yole <span class="dt">\</span></span>
-<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--output-dir</span> /path/to/Yole/releases</span></code></pre></div>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    <span class="at">--source-dir</span> /path/to/ExampleApp <span class="dt">\</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--output-dir</span> /path/to/ExampleApp/releases</span></code></pre></div>
 <p>Expected on Linux x86_64 hosts WITH the image provisioned:</p>
-<pre><code>OK: produced Yole-Windows-x64-1.0.1-Release-0.0.0.1.1.msi (size N bytes)
+<pre><code>OK: produced ExampleApp-Windows-x64-1.0.1-Release-0.0.0.1.1.msi (size N bytes)
 PASS: crossbuild_windows_msi_challenge</code></pre>
 <p>Expected when the image is NOT yet provisioned:</p>
 <pre><code>SKIP-OK: #crossbuild-windows-image-provisioning — ghcr.io/vasic-digital/crossbuild-wine:latest not on host</code></pre>
 <p>Expected on darwin/aarch64 hosts (Wine-in-Docker not supported):</p>
 <pre><code>SKIP-OK: #env-darwin-no-wine-container — wine-container backend requires Linux host</code></pre>
 <p>A PASS without an actual non-zero <code>.msi</code> is a bluff under
-CONST-035 § 11.4 + Lava Sixth Law 6.B. The Challenge enforces this via
+CONST-035 § 11.4 + the consuming project's Sixth Law 6.B. The Challenge enforces this via
 <code>[[ -s &quot;$OUTPUT_MSI&quot; ]]</code> post-condition.</p>
 <h2 id="when-this-approach-hits-its-limits">When this approach hits its
 limits</h2>
 <p>Wine-in-Docker cross-builds the .msi reliably for plain Compose
-Desktop applications. If a Yole release requires Windows-specific
+Desktop applications. If a consuming-project release requires Windows-specific
 behaviour Wine cannot translate (kernel-mode drivers, codec licensing
 checks, signed-driver loaders), fall back to the
 <code>QEMUWindowsBackend</code> (sibling Backend; uses pkg/vm/qemu.go to

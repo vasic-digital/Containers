@@ -595,7 +595,7 @@ with the configured password</li>
 <span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="va">CONTAINERS_REMOTE_HOST_1_PASSWORD</span><span class="op">=</span>host-specific-password</span></code></pre></div>
 <h2 id="real-deployment-example-thinkerlocal">Real Deployment Example:
 thinker.local</h2>
-<p>A complete example deploying all HelixAgent infrastructure containers
+<p>A complete example deploying all the consuming project infrastructure containers
 to a local network host.</p>
 <h3 id="containersenv">Containers/.env</h3>
 <div class="sourceCode" id="cb17"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="va">CONTAINERS_REMOTE_ENABLED</span><span class="op">=</span>true</span>
@@ -621,7 +621,7 @@ to a local network host.</p>
 <span id="cb17-21"><a href="#cb17-21" aria-hidden="true" tabindex="-1"></a><span class="va">CONTAINERS_REMOTE_HOST_1_PASSWORD</span><span class="op">=&lt;</span>password<span class="op">&gt;</span></span>
 <span id="cb17-22"><a href="#cb17-22" aria-hidden="true" tabindex="-1"></a><span class="va">CONTAINERS_REMOTE_HOST_1_RUNTIME</span><span class="op">=</span>docker</span>
 <span id="cb17-23"><a href="#cb17-23" aria-hidden="true" tabindex="-1"></a><span class="va">CONTAINERS_REMOTE_HOST_1_LABELS</span><span class="op">=</span>role=infrastructure,env=development</span></code></pre></div>
-<h3 id="helixagent-env">HelixAgent .env</h3>
+<h3 id="helixagent-env">The consuming project .env</h3>
 <p>Add <code>SVC_*</code> overrides pointing services to the remote
 host:</p>
 <div class="sourceCode" id="cb18"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="va">DB_HOST</span><span class="op">=</span>thinker.local</span>
@@ -635,7 +635,7 @@ host:</p>
 <span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a><span class="va">SVC_QDRANT_HOST</span><span class="op">=</span>thinker.local</span>
 <span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a><span class="va">SVC_QDRANT_REMOTE</span><span class="op">=</span>true</span></code></pre></div>
 <p>Also duplicate the <code>CONTAINERS_REMOTE_*</code> vars so they&#39;re
-available at HelixAgent startup.</p>
+available at the consuming project startup.</p>
 <h3 id="what-happens-on-startup">What Happens on Startup</h3>
 <ol type="1">
 <li><code>NewAdapterFromConfig()</code> loads

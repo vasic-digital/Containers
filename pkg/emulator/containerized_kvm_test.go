@@ -55,7 +55,7 @@ func TestContainerized_KVMPresence_Present(t *testing.T) {
 		"when /dev/kvm exists, buildContainerRunArgs MUST include --device <kvm> for hardware acceleration; got %v", args)
 	// The port-forward + AVD env wiring is present regardless of KVM.
 	assert.Contains(t, args, "ANDROID_AVD_NAME=Pixel_8")
-	assert.Contains(t, args, "6555:5555/tcp")
+	assert.Contains(t, args, "6555:5575/tcp")
 }
 
 func TestContainerized_KVMPresence_Absent(t *testing.T) {
@@ -77,6 +77,39 @@ func TestContainerized_KVMPresence_Absent(t *testing.T) {
 		"when /dev/kvm is absent, buildContainerRunArgs MUST omit --device <kvm> so the container falls back to TCG; got %v", args)
 	// The rest of the launch wiring is unaffected by the KVM decision.
 	assert.Contains(t, args, "ANDROID_AVD_NAME=Pixel_8")
-	assert.Contains(t, args, "6555:5555/tcp")
+	assert.Contains(t, args, "6555:5575/tcp")
 	assert.Contains(t, args, "lava/emulator:api35")
+}
+
+// TestContainerized_Userns_KeepIdForPodman is the RC1 anti-bluff guard
+// (2026-06-23 thinker.local blocker). On rootless podman the emulator
+// could not access /dev/kvm because the host grants it via a named-user
+// ACL, not kvm-group membership; --userns=keep-id maps the container uid
+// back to the host invoking uid so the ACL applies. This was PROVEN
+// manually ("Boot completed in 29345 ms" with the flag; KVM-not-writable
+// without it).
+//
+//	FALSIFIABILITY REHEARSAL: drop the `if runtimeBinary == "podman"`
+//	--userns=keep-id append in buildContainerRunArgs → this test fails
+//	("podman run MUST include --userns=keep-id ..."), and the real
+//	thinker.local C00 run reverts to KVM-not-writable / boot failure.
+func TestContainerized_Userns_KeepIdForPodman(t *testing.T) {
+	// KVM present so the full Linux x86_64 gate-path args are built.
+	present := t.TempDir() + "/kvm"
+	require.NoError(t, os.WriteFile(present, nil, 0o644))
+	withKVMDevicePath(t, present)
+
+	avd := AVD{Name: "Pixel_8", APILevel: 35, FormFactor: "phone"}
+
+	// podman MUST carry --userns=keep-id so the host /dev/kvm named-user
+	// ACL applies inside the rootless container.
+	podmanArgs := buildContainerRunArgs("podman", "lava-emu-1", 6555, avd, true, "lava/emulator:api35")
+	assert.Contains(t, podmanArgs, "--userns=keep-id",
+		"podman run MUST include --userns=keep-id so the host named-user /dev/kvm ACL applies inside the rootless container; got %v", podmanArgs)
+
+	// docker uses a different userns model and rejects --userns=keep-id;
+	// it MUST NOT be injected for the docker runtime.
+	dockerArgs := buildContainerRunArgs("docker", "lava-emu-1", 6555, avd, true, "lava/emulator:api35")
+	assert.NotContains(t, dockerArgs, "--userns=keep-id",
+		"docker run MUST NOT include --userns=keep-id (rejected by the docker daemon userns model); got %v", dockerArgs)
 }

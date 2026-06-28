@@ -241,7 +241,7 @@ code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; }
 provisioning</h1>
 <blockquote>
 <p>Sub-package: <code>pkg/crossbuild</code> Backend covered:
-<code>LinuxContainerBackend</code> Forensic anchor: iter-54 of Yole,
+<code>LinuxContainerBackend</code> Forensic anchor: iter-54 of the consuming project,
 2026-05-13</p>
 </blockquote>
 <h2 id="what-you-are-building">What you are building</h2>
@@ -257,7 +257,7 @@ has rootless podman or docker available.</p>
 <code>LINUX_BUILD_HOST</code>) is unreachable due to a network change,
 VPN switch, or host outage.</li>
 <li>The dedicated host&#39;s system JDK lacks jmods (see ticket
-<code>#linux-build-host-jdk-jmods-bootstrap</code> in Yole&#39;s
+<code>#linux-build-host-jdk-jmods-bootstrap</code> in the consuming project&#39;s
 KNOWN_DEFECTS).</li>
 </ul>
 <p>Until this image exists on a given host,
@@ -298,7 +298,7 @@ with <code>pkg/crossbuild</code></h2>
 <h2 id="real-stack-challenge">Real-stack Challenge</h2>
 <p><code>challenges/crossbuild_linux_deb_challenge.sh</code>:</p>
 <p>Expected on a host WITH the image provisioned:</p>
-<pre><code>OK: produced Yole-Desktop-linux-x64-1.0.1-Release-0.0.0.1.1.deb (size N bytes)
+<pre><code>OK: produced ExampleApp-Desktop-linux-x64-1.0.1-Release-0.0.0.1.1.deb (size N bytes)
 PASS: crossbuild_linux_deb_challenge</code></pre>
 <p>Expected when the image is NOT yet provisioned:</p>
 <pre><code>SKIP-OK: #crossbuild-linux-image-provisioning — ghcr.io/vasic-digital/crossbuild-linux:jdk17-amd64 not on host</code></pre>
@@ -311,7 +311,7 @@ post-condition.</p>
 (<code>LINUX_BUILD_HOST</code> env var or otherwise). The Backend works
 on any host with rootless podman/docker; the operator&#39;s choice of which
 host to run it on is configuration, not code. This is the operator
-mandate from Yole iter-54 (2026-05-13): <em>&quot;Make sure nezha.local is in
+mandate from the consuming project iter-54 (2026-05-13): <em>&quot;Make sure nezha.local is in
 configuration file, not hardcoded in the project anywhere!&quot;</em></p>
 </body>
 </html>

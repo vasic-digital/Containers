@@ -1,0 +1,169 @@
+# Containerfile for the Cuttlefish (cvd) virtual-Android image used by
+# pkg/cuttlefish. Boots a real Android system image (A/B / Virtual A/B) so
+# the consuming project can exercise the real update_engine + AVB/dm-verity
+# + auto-rollback OTA-apply path (Tier-2; see
+# docs/design/CUTTLEFISH_TIER2.md in the consuming project).
+#
+# SLIM PREBUILT-.deb BUILD (FACT — google/android-cuttlefish `runner-prod`).
+# ----------------------------------------------------------------------------
+# This image installs the PREBUILT cuttlefish-base / cuttlefish-user /
+# cuttlefish-orchestration .deb packages straight from Google's public
+# Artifact Registry — NO from-source compile, NO Bazel, NO cargo. apt pulls
+# each package's declared runtime Depends automatically, so the final image
+# is slim (~1-2 GB) and builds in minutes rather than hours.
+#
+# This mirrors the upstream container/image/Containerfile `runner-prod` stage
+# (apt repo + prebuilt .debs), whose published image is ~690 MB (docker) /
+# ~1.12 GB (podman). We install cuttlefish-base + cuttlefish-user only and
+# omit cuttlefish-orchestration (the Host Orchestrator) — see the install
+# RUN below for why (its postinst needs a host-created `kvm` group).
+#
+#   Source (FACT, fetched 2026-06-22):
+#     https://github.com/google/android-cuttlefish
+#       container/image/Containerfile  — `runner-prod` stage:
+#         FROM runner-base AS runner-prod
+#         ARG REPO
+#         RUN apt install -y --no-install-recommends gnupg
+#         RUN curl https://us-apt.pkg.dev/doc/repo-signing-key.gpg | apt-key add -
+#         RUN echo "deb https://us-apt.pkg.dev/projects/android-cuttlefish-artifacts $REPO main" \
+#               | tee -a /etc/apt/sources.list.d/artifact-registry.list
+#         RUN apt update
+#         RUN apt install -y --no-install-recommends \
+#               cuttlefish-base cuttlefish-user cuttlefish-orchestration
+#       container/image/image-builder.sh  — REPO=android-cuttlefish (stable),
+#         and the README's documented apt line:
+#         deb https://us-apt.pkg.dev/projects/android-cuttlefish-artifacts android-cuttlefish main
+#       Base image upstream: mirror.gcr.io/library/debian:12.
+#
+#   WHY NOT FROM-SOURCE (FACT): the previous multi-stage from-source build ran
+#   the upstream Bazel `tools/buildutils/build_packages.sh`, whose cargo-bazel
+#   `splice` of the netsim Rust crates TIMES OUT on nezha's slow crates.io
+#   egress (proven 2× — it is the build host's network, not a rewrite defect),
+#   and the single-stage variant baked the Bazel cache + build deps + source
+#   into the final layer producing a 27.6 GB image. The prebuilt-.deb path
+#   sidesteps both: no compile (no cargo timeout) and slim layers (~1-2 GB).
+#
+#   KEYRING MODERNISATION (§11.4.8): `apt-key add` is deprecated on Debian 12.
+#   We use the recommended signed-by keyring form — de-armor the signing key
+#   into /etc/apt/keyrings/ and reference it from the sources line. Same trust
+#   anchor (us-apt.pkg.dev/doc/repo-signing-key.gpg), best-practice plumbing.
+#
+# IMAGE BUILD IS ROOTLESS-OK. THE RUN IS NOT — §11.4.161 DOCUMENTED EXCEPTION.
+# ----------------------------------------------------------------------------
+# Building this image needs no privilege (ordinary rootless `podman build`).
+# RUNNING a Cuttlefish container, however, REQUIRES a rootful + privileged
+# runtime: Cuttlefish boots a real VM via crosvm/QEMU and creates the
+# `cvd-ebr` network bridge, which a rootless runtime cannot do. This is the
+# platform-has-no-rootless-option case the §11.4.161 rootless-container
+# mandate explicitly carves out and requires documenting.
+#
+# The container MUST be run with ALL of (FACT — RESEARCH + AOSP docs):
+#   --privileged
+#   --network host
+#   --device /dev/kvm --device /dev/vhost-vsock --device /dev/vhost-net \
+#   --device /dev/vsock --device /dev/net/tun
+#   --group-add kvm --group-add cvdnetwork --group-add render
+# pkg/cuttlefish.buildContainerRunArgs constructs exactly these flags.
+#
+# Host prerequisites (FACT, docs/design/CUTTLEFISH_TIER2.md §3):
+#   - Debian-based Linux with KVM present (verify: find /dev -name kvm).
+#   - The cuttlefish-base + cuttlefish-user host packages installed and the
+#     host rebooted (loads kernel modules + udev rules) BEFORE running a cvd.
+#
+# Build command (Linux x86_64, rootless OK):
+#   podman build \
+#       --build-arg BASE_IMAGE=debian:12 \
+#       --build-arg CF_REPO_CHANNEL=android-cuttlefish \
+#       -f pkg/cuttlefish/Containerfile \
+#       -t cuttlefish:latest .
+#
+# Image target / artifacts (FACT): the device image zip + cvd-host_package.tar.gz
+# are fetched at RUN time into $HOME by the entrypoint (CF_IMG_URL / CF_HOST_PKG_URL),
+# OR baked at build time via CF_IMG_URL / CF_HOST_PKG_URL build args. No
+# build-specific assets are baked by default — the image stays project-agnostic
+# (§11.4.28).
+
+# ===========================================================================
+# SINGLE STAGE — clean debian base + prebuilt cuttlefish .debs + run deps.
+# ===========================================================================
+ARG BASE_IMAGE=debian:12
+FROM ${BASE_IMAGE} AS runtime
+
+LABEL org.opencontainers.image.title="cuttlefish"
+LABEL org.opencontainers.image.description="Cuttlefish (cvd) virtual-Android device for real update_engine A/B OTA validation"
+LABEL org.opencontainers.image.source="https://github.com/vasic-digital/containers"
+LABEL org.opencontainers.image.licenses="See parent project LICENSE"
+LABEL digital.vasic.containers.requires-privileged="true"
+LABEL digital.vasic.containers.rootless-exception="11.4.161"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# REPO channel for the Artifact Registry suite (FACT, image-builder.sh):
+#   android-cuttlefish          (stable, the default)
+#   android-cuttlefish-unstable (unstable)
+#   android-cuttlefish-nightly  (nightly)
+ARG CF_REPO_CHANNEL=android-cuttlefish
+
+# 1) base run deps + tools for adding the apt repo (gnupg for de-armor,
+#    curl/ca-certificates to fetch the signing key over TLS).
+# 2) add Google's public Artifact Registry repo via the modern signed-by
+#    keyring (NOT deprecated apt-key), [trusted=yes] omitted in favour of the
+#    real signing key.
+# 3) install the prebuilt cuttlefish .debs — apt auto-resolves each .deb's
+#    declared runtime Depends.
+#    Installed: cuttlefish-base (REQUIRED) + cuttlefish-user (drives
+#    launch_cvd directly). cuttlefish-orchestration (the Host Orchestrator
+#    web UI / multi-device manager) is intentionally NOT installed —
+#    (a) this image drives launch_cvd directly via the entrypoint, never the
+#    HO; (b) FACT (build.log 2026-06-22): its postinst runs
+#    `usermod -aG kvm` and FAILs `usermod: group 'kvm' does not exist` (exit 6)
+#    inside the build sandbox, because the `kvm` group is created at host
+#    install + reboot time (§3 host prereqs), not in the image build. base +
+#    user install cleanly (no host-group dependency). This matches the
+#    original from-source Containerfile's "HO not installed" intent.
+# 4) add the small set of runtime tools the entrypoint needs (adb/unzip/curl).
+# 5) clean apt lists so they do not bloat the final layer.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gnupg \
+    && install -d -m 0755 /etc/apt/keyrings \
+    && curl -fsSL https://us-apt.pkg.dev/doc/repo-signing-key.gpg \
+        | gpg --dearmor -o /etc/apt/keyrings/cuttlefish-artifact-registry.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/cuttlefish-artifact-registry.gpg] https://us-apt.pkg.dev/projects/android-cuttlefish-artifacts ${CF_REPO_CHANNEL} main" \
+        > /etc/apt/sources.list.d/cuttlefish-artifact-registry.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        cuttlefish-base \
+        cuttlefish-user \
+        unzip \
+        adb \
+        android-sdk-platform-tools-common \
+        mesa-utils \
+        mesa-vulkan-drivers \
+    && rm -rf /var/lib/apt/lists/*
+
+# Where the entrypoint extracts the device image + cvd-host_package and runs
+# launch_cvd. cvd treats $HOME as its instance root (FACT, §4.3:
+# `HOME=$PWD ./bin/launch_cvd`).
+ENV HOME=/cuttlefish
+WORKDIR /cuttlefish
+
+# Optional: bake the device image + host package at build time. When these
+# build args are empty the entrypoint fetches them at run time (the
+# default), which keeps the image small + lets the run pick a fresh build.
+ARG CF_IMG_URL=""
+ARG CF_HOST_PKG_URL=""
+RUN if [ -n "${CF_IMG_URL}" ]; then \
+        curl -fsSL "${CF_IMG_URL}" -o /cuttlefish/cf-img.zip && \
+        unzip -q /cuttlefish/cf-img.zip -d /cuttlefish && rm /cuttlefish/cf-img.zip; \
+    fi && \
+    if [ -n "${CF_HOST_PKG_URL}" ]; then \
+        curl -fsSL "${CF_HOST_PKG_URL}" -o /cuttlefish/cvd-host_package.tar.gz && \
+        tar -xzf /cuttlefish/cvd-host_package.tar.gz -C /cuttlefish && \
+        rm /cuttlefish/cvd-host_package.tar.gz; \
+    fi
+
+COPY pkg/cuttlefish/entrypoint.sh /cuttlefish/entrypoint.sh
+RUN chmod +x /cuttlefish/entrypoint.sh
+
+ENTRYPOINT ["/cuttlefish/entrypoint.sh"]

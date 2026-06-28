@@ -2,7 +2,7 @@
 
 > Sub-package: `pkg/crossbuild`
 > Backend covered: `LinuxContainerBackend`
-> Forensic anchor: iter-54 of Yole, 2026-05-13
+> Forensic anchor: iter-54 of the consuming project, 2026-05-13
 
 ## What you are building
 
@@ -18,7 +18,7 @@ Use this image when:
 - The dedicated Linux build host (`.env`: `LINUX_BUILD_HOST`) is
   unreachable due to a network change, VPN switch, or host outage.
 - The dedicated host's system JDK lacks jmods (see ticket
-  `#linux-build-host-jdk-jmods-bootstrap` in Yole's KNOWN_DEFECTS).
+  `#linux-build-host-jdk-jmods-bootstrap` in the consuming project's KNOWN_DEFECTS).
 
 Until this image exists on a given host,
 `pkg/crossbuild`'s `LinuxContainerBackend.Build()` returns an
@@ -71,7 +71,7 @@ Expected: PASS (uses injected fakes, doesn't need the image).
 Expected on a host WITH the image provisioned:
 
 ```
-OK: produced Yole-Desktop-linux-x64-1.0.1-Release-0.0.0.1.1.deb (size N bytes)
+OK: produced ExampleApp-Desktop-linux-x64-1.0.1-Release-0.0.0.1.1.deb (size N bytes)
 PASS: crossbuild_linux_deb_challenge
 ```
 
@@ -92,5 +92,5 @@ This package is FULLY decoupled from any specific build host
 (`LINUX_BUILD_HOST` env var or otherwise). The Backend works on any
 host with rootless podman/docker; the operator's choice of which
 host to run it on is configuration, not code. This is the operator
-mandate from Yole iter-54 (2026-05-13): _"Make sure nezha.local is
+mandate from the consuming project iter-54 (2026-05-13): _"Make sure nezha.local is
 in configuration file, not hardcoded in the project anywhere!"_

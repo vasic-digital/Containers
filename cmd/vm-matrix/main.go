@@ -5,12 +5,12 @@
 // Usage:
 //
 //	vm-matrix \
-//	  --image-manifest tools/lava-containers/vm-images.json \
+//	  --image-manifest tools/ci-containers/vm-images.json \
 //	  --targets alpine-3.20-x86_64,debian-12-x86_64,fedora-40-x86_64 \
 //	  --uploads /host/proxy.jar:/tmp/proxy.jar,/host/binary:/tmp/binary \
 //	  --script tests/vm-distro/boot-and-probe.sh \
 //	  --captures /tmp/probe-output.json:probe-output.json \
-//	  --evidence-dir .lava-ci-evidence/Lava-Android-1.2.1-127/vm-distro \
+//	  --evidence-dir .ci-evidence/App-Android-1.2.1-127/vm-distro \
 //	  --concurrent 1 --cold-boot
 //
 // Exit codes:

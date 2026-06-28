@@ -79,7 +79,7 @@ func appleContainerReady(t *testing.T) (bool, string) {
 func TestAppleContainer_RealLinuxKernel(t *testing.T) {
 	ready, reason := appleContainerReady(t)
 	if !ready {
-		t.Skipf("SKIP (honest kernel-gap per cross-platform-parity mandate): %s", reason)
+		t.Skipf("SKIP-OK: (honest kernel-gap per cross-platform-parity mandate): %s", reason)
 	}
 
 	res := crossbuild.RunInLinuxContainer(context.Background(), crossbuild.LinuxRunRequest{
@@ -107,7 +107,7 @@ func TestAppleContainer_RealLinuxKernel(t *testing.T) {
 func TestAppleContainer_HostDirMountRoundTrip(t *testing.T) {
 	ready, reason := appleContainerReady(t)
 	if !ready {
-		t.Skipf("SKIP (honest kernel-gap per cross-platform-parity mandate): %s", reason)
+		t.Skipf("SKIP-OK: (honest kernel-gap per cross-platform-parity mandate): %s", reason)
 	}
 
 	srcDir := t.TempDir()
