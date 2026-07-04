@@ -223,8 +223,8 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ```bash
 # Clone
-git clone git@github.com:vasic-digital/Containers.git
-cd Containers
+git clone git@github.com:vasic-digital/containers.git
+cd containers
 
 # Install dependencies
 go mod download
@@ -247,7 +247,7 @@ MIT License - See [LICENSE](../LICENSE) for details.
 ## Support
 
 - **Documentation:** [docs/](.)
-- **Issues:** [GitHub Issues](https://github.com/vasic-digital/Containers/issues)
+- **Issues:** [GitHub Issues](https://github.com/vasic-digital/containers/issues)
 - **Examples:** [examples/](../examples/)
 
 ---

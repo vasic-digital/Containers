@@ -39,8 +39,8 @@ CONTAINERS_REMOTE_ENABLED=true
 CONTAINERS_REMOTE_SCHEDULER=resource_aware
 
 # Define remote hosts (numbered 1, 2, 3, ...)
-CONTAINERS_REMOTE_HOST_1_NAME=thinker
-CONTAINERS_REMOTE_HOST_1_ADDRESS=thinker.local
+CONTAINERS_REMOTE_HOST_1_NAME=gpu-node-1
+CONTAINERS_REMOTE_HOST_1_ADDRESS=gpu-node-1.local
 CONTAINERS_REMOTE_HOST_1_USER=deploy
 CONTAINERS_REMOTE_HOST_1_PORT=22
 CONTAINERS_REMOTE_HOST_1_RUNTIME=podman
@@ -53,17 +53,18 @@ CONTAINERS_REMOTE_HOST_2_RUNTIME=docker
 CONTAINERS_REMOTE_HOST_2_LABELS=gpu=true,arch=amd64
 ```
 
-### Configuration File (Containers/.env)
+### Configuration File (this module's own .env)
 
-Alternatively, create `Containers/.env`:
+Alternatively, create a `.env` file at this module's own root (wherever the
+consuming project checks out this submodule, e.g. `submodules/containers/.env`):
 
 ```bash
 # Remote distribution
 CONTAINERS_REMOTE_ENABLED=true
 
 # Host 1: Podman host
-CONTAINERS_REMOTE_HOST_1_NAME=thinker
-CONTAINERS_REMOTE_HOST_1_ADDRESS=thinker.local
+CONTAINERS_REMOTE_HOST_1_NAME=gpu-node-1
+CONTAINERS_REMOTE_HOST_1_ADDRESS=gpu-node-1.local
 CONTAINERS_REMOTE_HOST_1_RUNTIME=podman
 
 # Host 2: Docker host
@@ -83,7 +84,7 @@ CONTAINERS_REMOTE_HOST_2_RUNTIME=docker
 
 2. Copy the public key to the remote host:
    ```bash
-   ssh-copy-id -i ~/.ssh/id_ed25519.pub deploy@thinker.local
+   ssh-copy-id -i ~/.ssh/id_ed25519.pub deploy@gpu-node-1.local
    ```
 
 3. Add the key to SSH agent:
@@ -95,8 +96,8 @@ CONTAINERS_REMOTE_HOST_2_RUNTIME=docker
 ### SSH Config (~/.ssh/config)
 
 ```
-Host thinker.local
-    HostName thinker.local
+Host gpu-node-1.local
+    HostName gpu-node-1.local
     User deploy
     IdentityFile ~/.ssh/id_ed25519
     ControlMaster auto
@@ -132,7 +133,7 @@ orch := NewRemoteComposeOrchestrator(
 Results are cached per host. Clear cache if runtime changes:
 
 ```go
-detector.ClearCache("thinker")  // Clear specific host
+detector.ClearCache("gpu-node-1")  // Clear specific host
 detector.ClearCache("")          // Clear all hosts
 ```
 
@@ -159,8 +160,8 @@ func main() {
 
     // Define remote host
     host := remote.RemoteHost{
-        Name:    "thinker",
-        Address: "thinker.local",
+        Name:    "gpu-node-1",
+        Address: "gpu-node-1.local",
         User:    "deploy",
         Runtime: "podman",
     }
@@ -260,7 +261,7 @@ When `CONTAINERS_REMOTE_ENABLED=true`, health checks target remote hosts:
 
 ```go
 // Health check against remote host
-healthCheck := boot.TCPCheck("thinker.local", 5432)
+healthCheck := boot.TCPCheck("gpu-node-1.local", 5432)
 ```
 
 Configure service as remote:
@@ -281,7 +282,7 @@ manager := boot.NewBootManager(
 
 // Services are automatically health-checked against remote hosts
 manager.AddService("postgresql", boot.ServiceConfig{
-    HealthCheck: boot.TCPCheck("thinker.local", 5432),
+    HealthCheck: boot.TCPCheck("gpu-node-1.local", 5432),
     Required:    true,
 })
 ```
@@ -307,7 +308,7 @@ sudo apt install docker-compose-plugin
 
 **Solutions**:
 1. Verify SSH key is added to agent: `ssh-add -l`
-2. Test manual connection: `ssh deploy@thinker.local`
+2. Test manual connection: `ssh deploy@gpu-node-1.local`
 3. Check firewall allows SSH (port 22)
 
 ### "exit 1: service not found"

@@ -11,8 +11,8 @@
 
 1. Clone the repository:
    ```bash
-   git clone <ssh-url>
-   cd Containers
+   git clone git@github.com:vasic-digital/containers.git
+   cd containers
    ```
 
 2. Verify the build:

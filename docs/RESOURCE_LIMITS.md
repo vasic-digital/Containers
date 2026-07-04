@@ -99,9 +99,9 @@ The cap for a service is chosen by **first-match-wins glob matching
 against the lowercased service name**. The full table lives in two
 synchronized places:
 
-* `Containers/scripts/resource-policy/policy.yaml` — used by the bulk
+* `containers/scripts/resource-policy/policy.yaml` — used by the bulk
   cap-applier (`apply_caps.py`).
-* `Containers/pkg/policy/policy.go::Default()` — used at runtime by Go
+* `containers/pkg/policy/policy.go::Default()` — used at runtime by Go
   callers that want to apply the same caps when starting a container
   programmatically.
 
@@ -143,7 +143,7 @@ poorly with services that *should* survive a pressure spike (Postgres);
 Two cases:
 
 1. **The service name matches an existing pattern** — nothing to do.
-   Run `Containers/scripts/resource-policy/apply_caps.py` and the four
+   Run `containers/scripts/resource-policy/apply_caps.py` and the four
    keys will be inserted at the top of the new service block.
 
 2. **It needs a custom cap (heavier than its pattern allows)** — add a
@@ -157,7 +157,8 @@ Then run the test suite (§ 5). If `test_caps.py` passes, you're done.
 ## 5. Tooling
 
 ```
-Containers/
+containers/                  # wherever the consuming project checks out
+│                             # this submodule, e.g. <project-root>/submodules/containers/
 └── scripts/resource-policy/
     ├── policy.yaml          # YAML rules (single source of truth #1)
     ├── apply_caps.py        # bulk-applier (idempotent)
@@ -173,7 +174,7 @@ Containers/
 
 ```sh
 cd <project-root>
-Containers/scripts/resource-policy/apply_caps.py [--dry-run]
+<path-to-containers-submodule>/scripts/resource-policy/apply_caps.py [--dry-run]
 ```
 
 It walks the project, skips third-party submodules, applies caps to
@@ -183,8 +184,8 @@ every user-owned compose file. Idempotent on repeat runs.
 
 ```sh
 cd <project-root>
-python3 Containers/scripts/resource-policy/test_caps.py
-go test ./Containers/pkg/policy/...
+python3 <path-to-containers-submodule>/scripts/resource-policy/test_caps.py
+go test ./<path-to-containers-submodule>/pkg/policy/...
 ```
 
 ### Use the Go policy at runtime

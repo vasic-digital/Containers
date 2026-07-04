@@ -14,14 +14,14 @@ Added 2026-04-17 as part of the OpenClaw Ultimate (OCU) foundation wave.
 - `remote.ProbeGPU` — read-only SSH probe (nvidia-smi + rocm-smi +
   docker nvidia runtime); no sudo.
 
-## Thinker.local example
+## Example remote GPU host
 
 ```bash
 # .env
 CONTAINERS_REMOTE_ENABLED=true
-CONTAINERS_REMOTE_HOST_1_NAME=thinker
-CONTAINERS_REMOTE_HOST_1_ADDRESS=thinker.local
-CONTAINERS_REMOTE_HOST_1_USER=milosvasic
+CONTAINERS_REMOTE_HOST_1_NAME=gpu-node-1
+CONTAINERS_REMOTE_HOST_1_ADDRESS=gpu-node-1.local
+CONTAINERS_REMOTE_HOST_1_USER=deploy
 CONTAINERS_REMOTE_HOST_1_LABELS=gpu=true,gpu_vendor=nvidia,gpu_model=rtx3060,cuda=12.2,nvenc=true,vulkan=true
 CONTAINERS_REMOTE_HOST_1_GPU_AUTOPROBE=true
 ```

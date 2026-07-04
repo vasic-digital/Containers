@@ -304,15 +304,15 @@ CONTAINERS_REMOTE_DEFAULT_SSH_PASSWORD=your-password
 CONTAINERS_REMOTE_HOST_1_PASSWORD=host-specific-password
 ```
 
-## Real Deployment Example: thinker.local
+## Real Deployment Example: gpu-node-1.local
 
 A complete example deploying all the consuming project infrastructure containers to a local network host.
 
-### Containers/.env
+### containers/.env
 
 ```bash
 CONTAINERS_REMOTE_ENABLED=true
-CONTAINERS_REMOTE_DEFAULT_SSH_USER=milosvasic
+CONTAINERS_REMOTE_DEFAULT_SSH_USER=deploy
 CONTAINERS_REMOTE_DEFAULT_SSH_KEY=~/.ssh/id_ed25519
 CONTAINERS_REMOTE_DEFAULT_SSH_PASSWORD=<password>
 CONTAINERS_REMOTE_DEFAULT_RUNTIME=docker
@@ -326,10 +326,10 @@ CONTAINERS_REMOTE_SSH_CONTROL_MASTER=true
 CONTAINERS_REMOTE_SSH_CONTROL_PERSIST=300
 CONTAINERS_REMOTE_SSH_MAX_CONNECTIONS=10
 
-CONTAINERS_REMOTE_HOST_1_NAME=thinker
-CONTAINERS_REMOTE_HOST_1_ADDRESS=thinker.local
+CONTAINERS_REMOTE_HOST_1_NAME=gpu-node-1
+CONTAINERS_REMOTE_HOST_1_ADDRESS=gpu-node-1.local
 CONTAINERS_REMOTE_HOST_1_PORT=22
-CONTAINERS_REMOTE_HOST_1_USER=milosvasic
+CONTAINERS_REMOTE_HOST_1_USER=deploy
 CONTAINERS_REMOTE_HOST_1_KEY=~/.ssh/id_ed25519
 CONTAINERS_REMOTE_HOST_1_PASSWORD=<password>
 CONTAINERS_REMOTE_HOST_1_RUNTIME=docker
@@ -341,15 +341,15 @@ CONTAINERS_REMOTE_HOST_1_LABELS=role=infrastructure,env=development
 Add `SVC_*` overrides pointing services to the remote host:
 
 ```bash
-DB_HOST=thinker.local
-REDIS_HOST=thinker.local
-SVC_POSTGRESQL_HOST=thinker.local
+DB_HOST=gpu-node-1.local
+REDIS_HOST=gpu-node-1.local
+SVC_POSTGRESQL_HOST=gpu-node-1.local
 SVC_POSTGRESQL_REMOTE=true
-SVC_REDIS_HOST=thinker.local
+SVC_REDIS_HOST=gpu-node-1.local
 SVC_REDIS_REMOTE=true
-SVC_CHROMADB_HOST=thinker.local
+SVC_CHROMADB_HOST=gpu-node-1.local
 SVC_CHROMADB_REMOTE=true
-SVC_QDRANT_HOST=thinker.local
+SVC_QDRANT_HOST=gpu-node-1.local
 SVC_QDRANT_REMOTE=true
 ```
 
@@ -357,7 +357,7 @@ Also duplicate the `CONTAINERS_REMOTE_*` vars so they're available at the consum
 
 ### What Happens on Startup
 
-1. `NewAdapterFromConfig()` loads `Containers/.env`
+1. `NewAdapterFromConfig()` loads this module's own `.env` file (e.g. `submodules/containers/.env`)
 2. Detects `CONTAINERS_REMOTE_ENABLED=true`
 3. For each host, checks if key auth works (`NeedsBootstrap`)
 4. If not, bootstraps key auth using the configured password
@@ -369,8 +369,8 @@ Also duplicate the `CONTAINERS_REMOTE_*` vars so they're available at the consum
 ### Verification
 
 ```bash
-ssh milosvasic@thinker.local echo ok
-ssh milosvasic@thinker.local docker ps
+ssh deploy@gpu-node-1.local echo ok
+ssh deploy@gpu-node-1.local docker ps
 curl http://localhost:7061/health
 ```
 
