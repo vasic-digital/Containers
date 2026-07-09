@@ -33,14 +33,14 @@ import (
 // same containerRunner seam, same anti-bluff post-conditions on the
 // produced artifact). The differences from the Wine path:
 //
-//   1. Target restricts to {linux, amd64} / {linux, arm64}. Wine is
-//      not involved.
-//   2. RequiresHostOS is empty — Linux containers run on every host
-//      OS where rootless podman or docker is present (macOS via
-//      Podman Machine on Apple Silicon works; Linux native works;
-//      Windows via Docker Desktop or podman-on-WSL works).
-//   3. Image reference defaults to a vanilla JDK 17 + Gradle image,
-//      not the heavier Wine layer.
+//  1. Target restricts to {linux, amd64} / {linux, arm64}. Wine is
+//     not involved.
+//  2. RequiresHostOS is empty — Linux containers run on every host
+//     OS where rootless podman or docker is present (macOS via
+//     Podman Machine on Apple Silicon works; Linux native works;
+//     Windows via Docker Desktop or podman-on-WSL works).
+//  3. Image reference defaults to a vanilla JDK 17 + Gradle image,
+//     not the heavier Wine layer.
 type LinuxContainerBackend struct {
 	imageRef string
 	arch     string // "amd64" or "arm64" — picks which image tag to pull

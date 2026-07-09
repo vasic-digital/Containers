@@ -7,14 +7,14 @@
 //
 // Usage:
 //
-//   emulator-matrix \
-//     --android-sdk-root /opt/android-sdk \
-//     --apk releases/1.2.1/android-debug/app-debug.apk \
-//     --test-class app.example.challenges.Challenge01AppLaunchAndTrackerSelectionTest \
-//     --evidence-dir .ci-evidence/App-1.2.2 \
-//     --avds CZ_API28_Phone,CZ_API30_Phone,CZ_API34_Phone,Pixel_9a \
-//     --cold-boot \
-//     --image-manifest tools/ci-containers/vm-images.json
+//	emulator-matrix \
+//	  --android-sdk-root /opt/android-sdk \
+//	  --apk releases/1.2.1/android-debug/app-debug.apk \
+//	  --test-class app.example.challenges.Challenge01AppLaunchAndTrackerSelectionTest \
+//	  --evidence-dir .ci-evidence/App-1.2.2 \
+//	  --avds CZ_API28_Phone,CZ_API30_Phone,CZ_API34_Phone,Pixel_9a \
+//	  --cold-boot \
+//	  --image-manifest tools/ci-containers/vm-images.json
 //
 // Each comma-separated AVD entry MAY include the API level after a
 // colon: `Pixel_9a:36:phone` (name:apiLevel:formFactor). The api level
@@ -22,10 +22,11 @@
 // clause 4.
 //
 // Exit codes:
-//   0 — every AVD booted, every test passed (matrix attestation green)
-//   1 — at least one AVD failed boot OR at least one test failed
-//   2 — invalid CLI arguments OR the runner errored before producing
-//       any attestation rows
+//
+//	0 — every AVD booted, every test passed (matrix attestation green)
+//	1 — at least one AVD failed boot OR at least one test failed
+//	2 — invalid CLI arguments OR the runner errored before producing
+//	    any attestation rows
 //
 // Anti-bluff posture (clauses 6.J/6.L): a CLI that exits 0 when ANY
 // AVD failed would be a bluff. The exit-code logic above means

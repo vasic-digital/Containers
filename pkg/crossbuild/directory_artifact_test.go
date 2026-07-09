@@ -19,7 +19,9 @@ type dirArtifactRunner struct {
 	runCalled   bool
 }
 
-func (d *dirArtifactRunner) ImageExists(ctx context.Context, imageRef string) bool { return d.imageExists }
+func (d *dirArtifactRunner) ImageExists(ctx context.Context, imageRef string) bool {
+	return d.imageExists
+}
 func (d *dirArtifactRunner) Run(ctx context.Context, spec containerRunSpec) (int, error) {
 	d.runCalled = true
 	// Real jpackage app-image: a directory tree, not a single file.

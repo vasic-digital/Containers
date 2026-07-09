@@ -175,17 +175,17 @@ func main() {
 	v := vm.NewQEMUVM()
 	runner := vm.NewQEMUMatrixRunner(v, store)
 	result, err := runner.RunMatrix(ctx, vm.VMMatrixConfig{
-		Targets:       targets,
-		Uploads:       uploads,
-		Script:        *flagScript,
-		Captures:      captures,
-		EvidenceDir:   *flagEvidence,
-		BootTimeout:   *flagBootTimeout,
-		ScriptTimeout: *flagScriptTimeout,
-		Concurrent:    *flagConcurrent,
-		Dev:           *flagDev,
-		ColdBoot:      *flagColdBoot,
-		ImageManifest: *flagManifest,
+		Targets:        targets,
+		Uploads:        uploads,
+		Script:         *flagScript,
+		Captures:       captures,
+		EvidenceDir:    *flagEvidence,
+		BootTimeout:    *flagBootTimeout,
+		ScriptTimeout:  *flagScriptTimeout,
+		Concurrent:     *flagConcurrent,
+		Dev:            *flagDev,
+		ColdBoot:       *flagColdBoot,
+		ImageManifest:  *flagManifest,
 		NetworkProfile: *flagNetworkProfile,
 		NetworkOverride: vm.NetworkConditions{
 			DownKbps:    *flagNetworkBandwidthDown,

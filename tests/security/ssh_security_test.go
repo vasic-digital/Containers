@@ -17,7 +17,7 @@ import (
 // fails when the target host is unreachable.
 func TestSSHExecutor_InvalidHost(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping security test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping security test in short mode") // SKIP-OK: #short-mode
 	}
 
 	executor, err := remote.NewSSHExecutor(
@@ -60,7 +60,7 @@ func TestSSHExecutor_InvalidHost(t *testing.T) {
 // error rather than a success.
 func TestSSHExecutor_EmptyCommand(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping security test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping security test in short mode") // SKIP-OK: #short-mode
 	}
 
 	executor, err := remote.NewSSHExecutor(
@@ -105,7 +105,7 @@ func TestSSHExecutor_EmptyCommand(t *testing.T) {
 // gracefully by either creating it or reporting an error.
 func TestConnectionPool_InvalidSocket(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping security test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping security test in short mode") // SKIP-OK: #short-mode
 	}
 
 	// Use a path under /proc which cannot have directories
@@ -130,7 +130,7 @@ func TestConnectionPool_InvalidSocket(t *testing.T) {
 // with a name that already exists returns an error.
 func TestHostManager_DuplicateHost(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping security test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping security test in short mode") // SKIP-OK: #short-mode
 	}
 
 	executor, err := remote.NewSSHExecutor(

@@ -13,16 +13,16 @@ const prefix = "CONTAINERS_REMOTE_"
 // environment variables.
 func LoadFromEnv() *DistributionConfig {
 	cfg := &DistributionConfig{
-		Enabled:              envBool(prefix+"ENABLED", false),
-		DefaultUser:          envString(prefix+"DEFAULT_SSH_USER", ""),
-		DefaultKeyPath:       envString(prefix+"DEFAULT_SSH_KEY", ""),
-		DefaultPassword:      envString(prefix+"DEFAULT_SSH_PASSWORD", ""),
-		DefaultRuntime:       envString(prefix+"DEFAULT_RUNTIME", "docker"),
-		Scheduler:            envString(prefix+"SCHEDULER", "resource_aware"),
-		PortRangeStart:       envInt(prefix+"PORT_RANGE_START", 20000),
-		PortRangeEnd:         envInt(prefix+"PORT_RANGE_END", 30000),
-		VolumeType:           envString(prefix+"VOLUME_TYPE", "sshfs"),
-		ConnectTimeout:       envInt(prefix+"CONNECT_TIMEOUT", 10),
+		Enabled:         envBool(prefix+"ENABLED", false),
+		DefaultUser:     envString(prefix+"DEFAULT_SSH_USER", ""),
+		DefaultKeyPath:  envString(prefix+"DEFAULT_SSH_KEY", ""),
+		DefaultPassword: envString(prefix+"DEFAULT_SSH_PASSWORD", ""),
+		DefaultRuntime:  envString(prefix+"DEFAULT_RUNTIME", "docker"),
+		Scheduler:       envString(prefix+"SCHEDULER", "resource_aware"),
+		PortRangeStart:  envInt(prefix+"PORT_RANGE_START", 20000),
+		PortRangeEnd:    envInt(prefix+"PORT_RANGE_END", 30000),
+		VolumeType:      envString(prefix+"VOLUME_TYPE", "sshfs"),
+		ConnectTimeout:  envInt(prefix+"CONNECT_TIMEOUT", 10),
 		// 30 minutes — large enough for image-build `compose up`
 		// operations (multi-GB pulls + multi-minute layer builds)
 		// without relying on operators to tune this manually.
@@ -30,7 +30,7 @@ func LoadFromEnv() *DistributionConfig {
 		// the REAL detector of dead connections; this cap catches
 		// genuinely hung remote commands. Pre-fix default of 120s
 		// routinely killed compose builds on cold hosts.
-		CommandTimeout: envInt(prefix+"COMMAND_TIMEOUT", 1800),
+		CommandTimeout:       envInt(prefix+"COMMAND_TIMEOUT", 1800),
 		ControlMasterEnabled: envBool(prefix+"SSH_CONTROL_MASTER", true),
 		ControlPersist:       envInt(prefix+"SSH_CONTROL_PERSIST", 300),
 		MaxConnections:       envInt(prefix+"SSH_MAX_CONNECTIONS", 10),

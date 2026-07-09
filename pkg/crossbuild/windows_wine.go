@@ -112,14 +112,14 @@ func (w *WineContainerBackend) Build(ctx context.Context, req BuildRequest) Buil
 
 	var stdout, stderr bytes.Buffer
 	exitCode, err := w.runner.Run(ctx, containerRunSpec{
-		Image:         w.imageRef,
-		MountSource:   req.SourceDir,
-		MountTarget:   "/work/src",
-		WorkDir:       "/work/src",
-		Command:       req.BuildCommand,
-		Environment:   req.Environment,
-		Stdout:        &stdout,
-		Stderr:        &stderr,
+		Image:       w.imageRef,
+		MountSource: req.SourceDir,
+		MountTarget: "/work/src",
+		WorkDir:     "/work/src",
+		Command:     req.BuildCommand,
+		Environment: req.Environment,
+		Stdout:      &stdout,
+		Stderr:      &stderr,
 	})
 
 	result := BuildResult{

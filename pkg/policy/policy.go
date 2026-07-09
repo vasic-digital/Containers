@@ -85,7 +85,7 @@ type Policy struct {
 // CapFor returns the cap to apply to a service named svc.
 //
 // Match is case-insensitive and uses [filepath.Match] glob semantics
-// (``*`` and ``?``). Earlier rules win, so put the most specific patterns
+// (“*“ and “?“). Earlier rules win, so put the most specific patterns
 // at the top of [Policy.Rules].
 func (p *Policy) CapFor(svc string) Cap {
 	name := strings.ToLower(svc)
@@ -112,7 +112,7 @@ func (p *Policy) Validate() error {
 }
 
 // Default returns the policy bundled with this module. It is identical to
-// the YAML at ``scripts/resource-policy/policy.yaml``; run the matching
+// the YAML at “scripts/resource-policy/policy.yaml“; run the matching
 // test suite in CI/locally to keep them in sync.
 //
 // Numbers reflect a 62 GiB / 16 GiB-swap host (typical workstation) where

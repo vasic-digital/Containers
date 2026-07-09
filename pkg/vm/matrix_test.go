@@ -599,7 +599,7 @@ func (f *fakeVMKiller) Exists(pid int) bool {
 //   - pid 4444: argv contains `-monitor tcp:127.0.0.1:114444,server,nowait`
 //     (port 114444 — substring "14444" appears inside "114444")
 //     → MUST NOT match for 14444 under strict equality. A weakened
-//       substring matcher WOULD match this; that's the bluff vector.
+//     substring matcher WOULD match this; that's the bluff vector.
 func TestKillByQEMUMonitorPort_StrictAdjacentMatch(t *testing.T) {
 	walker := fakeVMProcWalker{
 		cmdlines: map[int][]string{

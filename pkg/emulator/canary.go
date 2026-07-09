@@ -302,18 +302,18 @@ func observeActivityAndLogcat(
 // writeCanaryAttestation serialises a CanaryResult to a JSON file.
 func writeCanaryAttestation(path string, r CanaryResult) error {
 	type doc struct {
-		StartedAt       string `json:"started_at"`
-		FinishedAt      string `json:"finished_at"`
-		APKPath         string `json:"apk_path"`
-		PackageName     string `json:"package_name"`
-		LaunchActivity  string `json:"launch_activity"`
-		AVD             string `json:"avd"`
-		APILevel        int    `json:"api_level,omitempty"`
+		StartedAt       string  `json:"started_at"`
+		FinishedAt      string  `json:"finished_at"`
+		APKPath         string  `json:"apk_path"`
+		PackageName     string  `json:"package_name"`
+		LaunchActivity  string  `json:"launch_activity"`
+		AVD             string  `json:"avd"`
+		APILevel        int     `json:"api_level,omitempty"`
 		BootSeconds     float64 `json:"boot_seconds"`
-		ActivityResumed bool   `json:"activity_resumed"`
-		FatalDetected   bool   `json:"fatal_detected"`
-		Passed          bool   `json:"passed"`
-		Error           string `json:"error,omitempty"`
+		ActivityResumed bool    `json:"activity_resumed"`
+		FatalDetected   bool    `json:"fatal_detected"`
+		Passed          bool    `json:"passed"`
+		Error           string  `json:"error,omitempty"`
 	}
 	d := doc{
 		StartedAt:       r.StartedAt.Format(time.RFC3339),

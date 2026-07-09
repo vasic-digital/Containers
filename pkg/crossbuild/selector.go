@@ -13,9 +13,9 @@ import (
 // rules are documented + testable rather than buried in ad-hoc shell
 // scripts.
 type Selector struct {
-	hostOS    string
-	hostArch  string
-	backends  []Backend
+	hostOS   string
+	hostArch string
+	backends []Backend
 }
 
 // NewSelector returns a Selector wired to the runtime's host OS/Arch.

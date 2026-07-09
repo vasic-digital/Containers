@@ -23,11 +23,11 @@ func (f *fakeProcessRunner) StartDetached(name string, args ...string) error {
 
 // fakeSSHClient is the seam for SSH/SCP operations.
 type fakeSSHClient struct {
-	listenerError  error // returned by WaitForListener (I4 — listener-up probe)
-	authError      error // returned by Authenticate (I4 — handshake + userauth)
-	uploaded       []UploadSpec
-	uploadError    error
-	runRequest     string
+	listenerError error // returned by WaitForListener (I4 — listener-up probe)
+	authError     error // returned by Authenticate (I4 — handshake + userauth)
+	uploaded      []UploadSpec
+	uploadError   error
+	runRequest    string
 	// runScripts records every script Run() received, in order. The
 	// matrix-runner integration tests assert against this so a tc-qdisc
 	// invocation is observable end-to-end.
