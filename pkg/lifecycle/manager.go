@@ -116,10 +116,25 @@ func (m *DefaultManager) Start(
 		)
 	}
 
-	if entry.state == "running" {
+	// TOCTOU guard (constitution/Constitution.md §11.4.108 sibling-
+	// primitive audit of the idle.go stale-fire race): the "not yet
+	// running" check and the "starting" transition must happen inside
+	// the SAME lock hold. Previously the lock was released between the
+	// two, so two concurrent Start() calls that both observed the
+	// service as not-running could both proceed past this point and
+	// both execute the full boot sequence (double compose-up, double
+	// health check, plus a second IdleShutdown controller that silently
+	// orphans the first — its timer never Stop()'d, ticking in the
+	// background and able to fire an unexpected Stop() later). Any
+	// caller that arrives while a boot is already under way ("starting")
+	// or already done ("running") returns immediately instead of
+	// re-running the sequence.
+	switch entry.state {
+	case "running", "starting":
 		m.mu.Unlock()
 		return nil
 	}
+	entry.state = "starting"
 
 	// Start dependencies first.
 	deps := entry.spec.Dependencies
@@ -127,16 +142,15 @@ func (m *DefaultManager) Start(
 
 	for _, dep := range deps {
 		if err := m.Start(ctx, dep); err != nil {
+			m.mu.Lock()
+			entry.state = "stopped"
+			m.mu.Unlock()
 			return fmt.Errorf(
 				"lifecycle: dependency %q for %q: %w",
 				dep, name, err,
 			)
 		}
 	}
-
-	m.mu.Lock()
-	entry.state = "starting"
-	m.mu.Unlock()
 
 	// Start via compose.
 	if m.orchestrator != nil && entry.spec.ComposeFile != "" {
@@ -176,17 +190,23 @@ func (m *DefaultManager) Start(
 	entry.lastStart = time.Now()
 	m.mu.Unlock()
 
-	// Start idle shutdown monitor if configured.
+	// Start idle shutdown monitor if configured. Capture the freshly
+	// created controller into a local variable and call Start() on
+	// THAT local, rather than re-reading entry.idleCtrl after
+	// unlocking — the same unguarded-field-read hazard the fix above
+	// closes for Stop()/Acquire() applies here too (constitution/
+	// Constitution.md §11.4.108 sibling-primitive audit).
 	if entry.spec.IdleTimeout > 0 {
 		m.mu.Lock()
-		entry.idleCtrl = NewIdleShutdown(
+		idleCtrl := NewIdleShutdown(
 			entry.spec.IdleTimeout,
 			func() {
 				_ = m.Stop(context.Background(), name)
 			},
 		)
+		entry.idleCtrl = idleCtrl
 		m.mu.Unlock()
-		entry.idleCtrl.Start()
+		idleCtrl.Start()
 	}
 
 	return nil
@@ -212,11 +232,18 @@ func (m *DefaultManager) Stop(
 	}
 
 	entry.state = "stopping"
+	// entry.idleCtrl is written under m.mu by Start() (see above); read
+	// it under the same lock here rather than after unlocking, closing
+	// a data race between this read and a concurrent Start()'s write
+	// (constitution/Constitution.md §11.4.108 sibling-primitive audit
+	// of the idle.go stale-fire race — go test -race caught the
+	// unguarded access).
+	idleCtrl := entry.idleCtrl
 	m.mu.Unlock()
 
 	// Stop idle controller.
-	if entry.idleCtrl != nil {
-		entry.idleCtrl.Stop()
+	if idleCtrl != nil {
+		idleCtrl.Stop()
 	}
 
 	// Stop via compose.
@@ -296,14 +323,19 @@ func (m *DefaultManager) Acquire(
 		}
 	}
 
-	// Reset idle timer.
-	if entry.idleCtrl != nil {
-		entry.idleCtrl.Touch()
-	}
-
+	// Reset idle timer. entry.idleCtrl is written under m.mu by Start();
+	// read it under the same lock rather than unguarded, closing a data
+	// race with a concurrent Start() (constitution/Constitution.md
+	// §11.4.108 sibling-primitive audit; go test -race caught the
+	// unguarded access).
 	m.mu.Lock()
+	idleCtrl := entry.idleCtrl
 	entry.lastAcq = time.Now()
 	m.mu.Unlock()
+
+	if idleCtrl != nil {
+		idleCtrl.Touch()
+	}
 
 	released := false
 	return func() {
@@ -314,8 +346,11 @@ func (m *DefaultManager) Acquire(
 		if entry.semaphore != nil {
 			entry.semaphore.Release()
 		}
-		if entry.idleCtrl != nil {
-			entry.idleCtrl.Touch()
+		m.mu.Lock()
+		relIdleCtrl := entry.idleCtrl
+		m.mu.Unlock()
+		if relIdleCtrl != nil {
+			relIdleCtrl.Touch()
 		}
 	}, nil
 }

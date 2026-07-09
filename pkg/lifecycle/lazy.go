@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 )
@@ -49,14 +50,38 @@ func (lb *LazyBooter) EnsureStarted() error {
 		return lb.loadErr()
 	}
 
-	// Slow path: attempt to start
+	// Slow path: attempt to start.
+	//
+	// Panic recovery (constitution/Constitution.md §11.4.108
+	// sibling-primitive audit of the idle.go stale-fire race — a
+	// "TOCTOU on state flags" hazard applied to LazyBooter's own
+	// stateNotStarted/stateStarting/stateStarted flags): sync.Once
+	// marks itself done via a deferred store even when the wrapped
+	// function panics, but without an equivalent defer here, a
+	// panicking startFn would (1) propagate the panic uncontrolled to
+	// whichever caller's goroutine happened to run once.Do's body,
+	// crashing it unless that caller recovers, (2) leave `started`
+	// stuck at stateStarting forever (Started()/IsStarting() report a
+	// wrong, permanent status), and (3) because Once itself IS done,
+	// every LATER caller's EnsureStarted() would silently return a nil
+	// error — a fabricated success for a service that never actually
+	// started (a PASS-bluff at the lifecycle layer). Recovering here
+	// converts the panic into a normal, retrievable error and settles
+	// the state flag consistently for every caller, matching the
+	// contract every other EnsureStarted() failure already uses.
 	lb.once.Do(func() {
 		lb.started.Store(stateStarting)
+		defer func() {
+			if r := recover(); r != nil {
+				e := fmt.Errorf("lifecycle: startFn panicked: %v", r)
+				lb.err.Store(&e)
+			}
+			lb.started.Store(stateStarted)
+		}()
 		if lb.startFn != nil {
 			e := lb.startFn()
 			lb.err.Store(&e)
 		}
-		lb.started.Store(stateStarted)
 	})
 	return lb.loadErr()
 }
