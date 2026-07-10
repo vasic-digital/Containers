@@ -259,7 +259,16 @@ func (r *ServiceRegistry) Discover(ctx context.Context, name string, defaultPort
 			if err := r.Register(name, port); err != nil {
 				return nil, err
 			}
-			svc, _ := r.Get(name)
+			svc, ok := r.Get(name)
+			if !ok {
+				// The service was unregistered between Register and this read
+				// (a concurrent Unregister lands in the window where Discover
+				// holds no lock). Surface the absence honestly rather than
+				// returning (nil, nil), which would nil-deref any caller that
+				// checks only the error before using the returned *Service
+				// (CT-HARDEN-SR-DISCOVER).
+				return nil, fmt.Errorf("service %s was unregistered during discovery", name)
+			}
 			return svc, nil
 		}
 	}
