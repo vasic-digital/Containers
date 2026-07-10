@@ -39,14 +39,25 @@ func CheckWithRetry(
 	var result *HealthResult
 	delay := policy.Delay
 
-	for attempt := 0; attempt <= policy.MaxRetries; attempt++ {
+	// Clamp a negative retry count to 0 so at least one check always
+	// runs and a non-nil result is always returned (honouring the
+	// docstring contract "The last HealthResult is always returned").
+	// Without this, MaxRetries < 0 makes the loop guard false on the
+	// first iteration, the body never runs, and a nil *HealthResult is
+	// returned — nil-panicking a normal caller's result.Healthy deref.
+	maxRetries := policy.MaxRetries
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		result = checker.Check(ctx, target)
 		if result.Healthy {
 			return result
 		}
 
 		// Don't sleep after the last attempt.
-		if attempt < policy.MaxRetries {
+		if attempt < maxRetries {
 			select {
 			case <-ctx.Done():
 				result.Error = "context cancelled during retry: " + result.Error
