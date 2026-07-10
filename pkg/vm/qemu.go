@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -68,6 +69,9 @@ type QEMUVM struct {
 	kvmAvailable bool
 	nextSSHPort  atomic.Int32 // starts at 10022
 	nextMonPort  atomic.Int32 // starts at 14444
+
+	authMu     sync.Mutex
+	authedPort int // sshPort already authenticated; 0 = not authenticated
 }
 
 // NewQEMUVM constructs a production QEMUVM.
@@ -177,14 +181,44 @@ func (v *QEMUVM) WaitForReady(ctx context.Context, sshPort int, timeout time.Dur
 	return fmt.Errorf("vm on ssh port %d did not become ready within %s", sshPort, timeout)
 }
 
+// ensureAuthenticated performs the SSH handshake + userauth for sshPort
+// exactly once per port before any guest interaction. The I4 split
+// (see the sshClient interface doc) deliberately makes WaitForReady a
+// listener-up-only probe; the actual authentication MUST happen here,
+// before Upload/Run/Download, or every real guest call fails with
+// "not authenticated". Re-authenticating on every op would re-dial and
+// leak the prior *ssh.Client, so the authenticated port is cached and
+// reset on Teardown.
+func (v *QEMUVM) ensureAuthenticated(ctx context.Context, sshPort int) error {
+	v.authMu.Lock()
+	defer v.authMu.Unlock()
+	if v.authedPort == sshPort {
+		return nil
+	}
+	if err := v.ssh.Authenticate(ctx, sshPort, 30*time.Second); err != nil {
+		return err
+	}
+	v.authedPort = sshPort
+	return nil
+}
+
 func (v *QEMUVM) Upload(ctx context.Context, sshPort int, hostPath, vmPath string) error {
+	if err := v.ensureAuthenticated(ctx, sshPort); err != nil {
+		return fmt.Errorf("qemu upload: authenticate ssh port %d: %w", sshPort, err)
+	}
 	return v.ssh.Upload(ctx, hostPath, vmPath)
 }
 
 func (v *QEMUVM) Run(ctx context.Context, sshPort int, script string, env map[string]string, timeout time.Duration) (string, string, int, error) {
+	if err := v.ensureAuthenticated(ctx, sshPort); err != nil {
+		return "", "", -1, fmt.Errorf("qemu run: authenticate ssh port %d: %w", sshPort, err)
+	}
 	return v.ssh.Run(ctx, script, env, timeout)
 }
 
 func (v *QEMUVM) Download(ctx context.Context, sshPort int, vmPath, hostPath string) error {
+	if err := v.ensureAuthenticated(ctx, sshPort); err != nil {
+		return fmt.Errorf("qemu download: authenticate ssh port %d: %w", sshPort, err)
+	}
 	return v.ssh.Download(ctx, vmPath, hostPath)
 }

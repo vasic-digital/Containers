@@ -121,6 +121,12 @@ func (r *realSSHClient) Authenticate(ctx context.Context, port int, timeout time
 		_ = conn.Close()
 		return fmt.Errorf("realSSHClient.Authenticate: ssh handshake: %w", err)
 	}
+	// Close any prior client before replacing it so a re-Authenticate
+	// (e.g. a new VM port on a reused client) does not leak the previous
+	// *ssh.Client and its mux/keepalive goroutines.
+	if r.client != nil {
+		_ = r.client.Close()
+	}
 	r.client = ssh.NewClient(c, ch, reqs)
 	return nil
 }
@@ -280,7 +286,9 @@ func (r *realSSHClient) Download(ctx context.Context, vmPath, hostPath string) e
 
 func (r *realSSHClient) Close() error {
 	if r.client != nil {
-		return r.client.Close()
+		err := r.client.Close()
+		r.client = nil
+		return err
 	}
 	return nil
 }

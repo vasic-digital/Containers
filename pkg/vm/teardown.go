@@ -43,6 +43,21 @@ var teardownGracePeriod = 30 * time.Second
 // would silently lie about successful teardown of a stuck VM and
 // corrupt the matrix runner's row outcome.
 func (v *QEMUVM) Teardown(ctx context.Context, monitorPort, sshPort int) error {
+	// Release our SSH client handle on every exit path. The guest is
+	// shut down via QMP / KillByQEMUMonitorPort, not via this connection,
+	// so closing it here only prevents a per-lifecycle SSH connection +
+	// goroutine leak (serial matrix runs reuse one QEMUVM across N
+	// targets). Resetting authedPort forces a fresh Authenticate on the
+	// next boot's port.
+	defer func() {
+		if v.ssh != nil {
+			_ = v.ssh.Close()
+		}
+		v.authMu.Lock()
+		v.authedPort = 0
+		v.authMu.Unlock()
+	}()
+
 	// Stage 1: QMP powerdown — best-effort.
 	if v.qmp != nil {
 		if err := v.qmp.Dial(ctx, monitorPort, 5*time.Second); err == nil {
