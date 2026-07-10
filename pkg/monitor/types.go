@@ -92,6 +92,14 @@ func NewClusterSnapshot(
 		cs.TotalDiskMB = local.System.DiskTotal / (1024 * 1024)
 	}
 	for _, hr := range remoteHosts {
+		// Skip a nil host-resources value: the map values are pointers, so a
+		// caller may legitimately map a host name to nil (a host with no
+		// resource data). This mirrors the `if local != nil` guard above and
+		// avoids a nil deref on hr's fields (CT-HARDEN-MON-2). A nil host
+		// contributes nothing and is not counted toward HostCount.
+		if hr == nil {
+			continue
+		}
 		cs.HostCount++
 		cs.TotalCPUCores += hr.CPUCores
 		cs.TotalMemoryMB += hr.MemoryTotalMB

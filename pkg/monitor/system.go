@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"digital.vasic.containers/internal/platform"
@@ -32,6 +33,9 @@ func (d defaultPlatformChecker) isLinux() bool {
 // DefaultSystemCollector reads system metrics from /proc on Linux
 // and falls back to Go runtime metrics on other platforms.
 type DefaultSystemCollector struct {
+	// mu serialises the CPU-delta read-modify-write of prevIdle/prevTotal
+	// so concurrent Collect() callers do not race (CT-HARDEN-MON-1).
+	mu        sync.Mutex
 	prevIdle  uint64
 	prevTotal uint64
 	platform  platformChecker
@@ -85,6 +89,12 @@ func (c *DefaultSystemCollector) Collect() SystemResources {
 // collectCPULinux reads /proc/stat and computes CPU usage since the
 // previous sample.
 func (c *DefaultSystemCollector) collectCPULinux() float64 {
+	// Hold mu across the whole read-sample → delta → update-prev sequence so
+	// it is atomic against concurrent Collect() callers (CT-HARDEN-MON-1). The
+	// /proc/stat read is a small local file, so serialising it here does not
+	// stall an unrelated hot path.
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	idle, total := readCPUSample()
 	if total == c.prevTotal {
 		return 0
