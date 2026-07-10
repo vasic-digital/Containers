@@ -174,13 +174,22 @@ func (m *DefaultManager) Start(
 		m.mu.Lock()
 		entry.healthy = result.Healthy
 		m.mu.Unlock()
-		if !result.Healthy && result.Error != "" {
+		// An unhealthy result must fail the start regardless of whether it
+		// carries an error message. Gating on `result.Error != ""` too let an
+		// unhealthy result with an empty message slip through and mark the
+		// service "running" with a nil return — a fabricated success
+		// (launch != working, §11.4.108-class bluff).
+		if !result.Healthy {
 			m.mu.Lock()
 			entry.state = "stopped"
 			m.mu.Unlock()
+			msg := result.Error
+			if msg == "" {
+				msg = "unhealthy (no error detail)"
+			}
 			return fmt.Errorf(
 				"lifecycle: health check %q: %s",
-				name, result.Error,
+				name, msg,
 			)
 		}
 	}
