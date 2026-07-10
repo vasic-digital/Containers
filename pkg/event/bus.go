@@ -121,17 +121,36 @@ func (b *DefaultEventBus) Unsubscribe(id SubscriptionID) {
 }
 
 // Close shuts down the event bus and all active subscriptions.
+//
+// sub.stop() closes the subscription's channel and then blocks
+// (`<-s.done`) until the subscription's delivery goroutine returns. That
+// goroutine may, at the moment Close is called, be in the middle of
+// invoking the subscriber's handler — and a handler that re-enters the
+// bus (Publish/Subscribe/Unsubscribe), a normal pattern for chained or
+// derived events, needs b.mu to proceed. Previously b.mu was held for
+// Close's entire body (deferred Unlock), so that re-entrant call blocked
+// forever waiting for a lock Close would never release until the very
+// goroutine it's blocking was done — a deadlock. Unsubscribe already
+// gets this right (it releases b.mu before calling sub.stop()); Close
+// must do the same: collect+remove the subscriptions under the lock,
+// release it, then stop each subscription outside the lock.
 func (b *DefaultEventBus) Close() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	if b.closed {
+		b.mu.Unlock()
 		return
 	}
 	b.closed = true
 	close(b.closeCh)
+
+	subs := make([]*subscription, 0, len(b.subs))
 	for id, sub := range b.subs {
-		sub.stop()
+		subs = append(subs, sub)
 		delete(b.subs, id)
+	}
+	b.mu.Unlock()
+
+	for _, sub := range subs {
+		sub.stop()
 	}
 }

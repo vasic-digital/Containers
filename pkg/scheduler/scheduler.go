@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"digital.vasic.containers/pkg/logging"
 	"digital.vasic.containers/pkg/remote"
@@ -32,7 +33,17 @@ type DefaultScheduler struct {
 	hostManager remote.HostManager
 	scorer      *ResourceScorer
 	logger      logging.Logger
-	placements  map[string]int // host -> container count
+	// mu guards placements. Schedule and ScheduleBatch both mutate it
+	// (`s.placements[decision.HostName]++`) and StrategySpread reads it
+	// concurrently inside a sort.Slice comparator (scheduleSpread in
+	// strategies.go) — an unguarded concurrent map read+write on a
+	// *DefaultScheduler shared across goroutines (the normal way a
+	// Scheduler is used: one long-lived instance driving concurrent
+	// placement requests from a distribution/orchestration layer).
+	// Without this lock, Go's runtime can fatal with "concurrent map
+	// read and map write" — not just a benign data race.
+	mu         sync.Mutex
+	placements map[string]int // host -> container count
 }
 
 // NewScheduler creates a DefaultScheduler.
@@ -61,10 +72,12 @@ func (s *DefaultScheduler) Schedule(
 	snapshots := s.hostManager.ProbeAll(ctx)
 	hosts := s.hostManager.ListHosts()
 
+	s.mu.Lock()
 	decision := s.scheduleOne(snapshots, hosts, req)
 	if decision.HostName != "" {
 		s.placements[decision.HostName]++
 	}
+	s.mu.Unlock()
 
 	s.logger.Info("scheduled %s -> %s (score=%.3f, reason=%s)",
 		req.Name, decision.HostName, decision.Score,
@@ -89,6 +102,7 @@ func (s *DefaultScheduler) ScheduleBatch(
 		HostSnapshots: snapshots,
 	}
 
+	s.mu.Lock()
 	for _, req := range reqs {
 		decision := s.scheduleOne(snapshots, hosts, req)
 		if decision.HostName != "" {
@@ -101,6 +115,7 @@ func (s *DefaultScheduler) ScheduleBatch(
 			req.Name, decision.HostName, decision.Score,
 		)
 	}
+	s.mu.Unlock()
 
 	return plan, nil
 }

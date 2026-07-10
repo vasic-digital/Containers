@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"digital.vasic.containers/pkg/logging"
 	"digital.vasic.containers/pkg/remote"
@@ -31,7 +32,18 @@ type TunnelOverlay struct {
 	hostManager   remote.HostManager
 	executor      remote.RemoteExecutor
 	logger        logging.Logger
-	networks      map[string][]string // network -> container IDs
+	// mu guards networks. Every sibling stateful type in this package
+	// (DefaultTunnelManager.tunnels in tunnel.go, PortAllocator.allocated
+	// in port_allocator.go) protects its map with a mutex; networks was
+	// the sole exception, mutated by Create/Delete/Connect/Disconnect/
+	// List with no synchronization — a genuine data race (concurrent
+	// map read/write, detectable by `go test -race` and by Go's runtime
+	// concurrent-map-write fatal error) the moment two goroutines call
+	// any of those methods on the same *TunnelOverlay concurrently, a
+	// realistic pattern for a network manager shared across a
+	// distribution/orchestration flow.
+	mu       sync.Mutex
+	networks map[string][]string // network -> container IDs
 }
 
 // NewTunnelOverlay creates an overlay backed by SSH tunnels.
@@ -58,6 +70,9 @@ func NewTunnelOverlay(
 func (o *TunnelOverlay) Create(
 	ctx context.Context, name string,
 ) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
 	if _, exists := o.networks[name]; exists {
 		return fmt.Errorf(
 			"overlay network %q already exists", name,
@@ -73,6 +88,9 @@ func (o *TunnelOverlay) Create(
 func (o *TunnelOverlay) Delete(
 	ctx context.Context, name string,
 ) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
 	if _, exists := o.networks[name]; !exists {
 		return fmt.Errorf(
 			"overlay network %q not found", name,
@@ -88,6 +106,9 @@ func (o *TunnelOverlay) Delete(
 func (o *TunnelOverlay) Connect(
 	ctx context.Context, network, containerID string,
 ) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
 	containers, exists := o.networks[network]
 	if !exists {
 		return fmt.Errorf(
@@ -106,6 +127,9 @@ func (o *TunnelOverlay) Connect(
 func (o *TunnelOverlay) Disconnect(
 	ctx context.Context, network, containerID string,
 ) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
 	containers, exists := o.networks[network]
 	if !exists {
 		return fmt.Errorf(
@@ -130,6 +154,9 @@ func (o *TunnelOverlay) Disconnect(
 func (o *TunnelOverlay) List(
 	ctx context.Context,
 ) ([]string, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
 	names := make([]string, 0, len(o.networks))
 	for name := range o.networks {
 		names = append(names, name)
