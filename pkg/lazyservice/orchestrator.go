@@ -200,15 +200,24 @@ func (lo *LazyOrchestrator) StartService(ctx context.Context, name string) error
 
 // StopService stops a running service.
 func (lo *LazyOrchestrator) StopService(ctx context.Context, name string) error {
+	// Snapshot everything the blocking compose Down needs UNDER the lock,
+	// then RELEASE the lock BEFORE calling Down. orchestrator.Down shells out
+	// to an external `docker/podman compose down` process bounded only by
+	// StopTimeout (default 30s); holding lo.mu across it would stall every
+	// other lo.mu user (GetServiceStatus / ListServices / StartService —
+	// RLock; StopAll / RegisterService — Lock) for the whole Down duration
+	// (constitution/CLAUDE.md dev-principle #2 — no blocking op inside a
+	// held lock).
 	lo.mu.Lock()
-	defer lo.mu.Unlock()
 
 	svc, exists := lo.services[name]
 	if !exists {
+		lo.mu.Unlock()
 		return fmt.Errorf("service not found: %s", name)
 	}
 
 	if !lo.started[name] {
+		lo.mu.Unlock()
 		return nil // Already stopped or never started
 	}
 
@@ -216,29 +225,33 @@ func (lo *LazyOrchestrator) StopService(ctx context.Context, name string) error 
 		File:    svc.ComposeFile,
 		Profile: svc.Profile,
 	}
+	stopTimeout := svc.StopTimeout
 
-	ctx, cancel := context.WithTimeout(ctx, svc.StopTimeout)
+	lo.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, stopTimeout)
 	defer cancel()
 
 	if err := lo.orchestrator.Down(ctx, project); err != nil {
 		return fmt.Errorf("stop service %s: %w", name, err)
 	}
 
-	lo.started[name] = false
-
-	// Reset the one-shot lazy booter so a subsequent StartService
-	// genuinely restarts the service. The lifecycle.LazyBooter created
-	// in RegisterService runs its startFn EXACTLY once; after a stop its
-	// cached first-run success would make EnsureStarted() short-circuit,
+	// Re-acquire the lock only for the fast in-memory state mutation: clear
+	// the started flag and reset the one-shot lazy booter so a subsequent
+	// StartService genuinely restarts the service. The lifecycle.LazyBooter
+	// created in RegisterService runs its startFn EXACTLY once; after a stop
+	// its cached first-run success would make EnsureStarted() short-circuit,
 	// turning the next StartService into a silent no-op that invokes no
-	// compose Up yet returns nil — a fabricated success for a service
-	// that is actually down (constitution/Constitution.md §11.4
-	// lifecycle-layer PASS-bluff). Recreating the booter here (under the
-	// same lo.mu hold as every other booter mutation) restores a clean
-	// not-started booter so the service can boot again on demand.
+	// compose Up yet returns nil — a fabricated success for a service that is
+	// actually down (constitution/Constitution.md §11.4 lifecycle-layer
+	// PASS-bluff). Recreating the booter here restores a clean not-started
+	// booter so the service can boot again on demand.
+	lo.mu.Lock()
+	lo.started[name] = false
 	lo.booters[name] = lifecycle.NewLazyBooter(func() error {
 		return lo.startServiceInternal(svc)
 	})
+	lo.mu.Unlock()
 
 	lo.logger.Info("stopped service: %s", name)
 
