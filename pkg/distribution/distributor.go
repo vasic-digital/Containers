@@ -326,6 +326,48 @@ func buildPublishFlags(ports []scheduler.PortMapping) string {
 	return b.String()
 }
 
+// shellQuote wraps s in single quotes for safe interpolation into a POSIX
+// shell command. Any embedded single quote is rendered as the canonical
+// close-quote, backslash-escaped-quote, reopen-quote sequence (the ReplaceAll
+// below). Registry/requirement-controlled fields (container Name / Image)
+// reach the remote `run`/`rm` command as raw shell text, so they MUST pass
+// through this before interpolation — an unescaped shell metacharacter in a
+// registry-controlled value is remote command execution (§11.4, ATM-C056).
+// It always wraps (never leaves a value bare), so an empty value renders as an
+// empty single-quoted argument. Mirrors the proven pkg/emulator shellQuote;
+// kept local because that precedent is unexported and to keep pkg/distribution
+// decoupled (§11.4.28).
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// buildRemoteRemoveCommand renders the pre-deploy `rm -f` command. The
+// container Name is untrusted registry/requirement input, so it is shell
+// quoted before interpolation. Pure function so the built string is unit
+// testable without a live executor (§11.4.115).
+func buildRemoteRemoveCommand(rt, name string) string {
+	return fmt.Sprintf(
+		"%s rm -f %s 2>/dev/null || true",
+		rt, shellQuote(name),
+	)
+}
+
+// buildRemoteRunCommand renders the remote `run -d` command. Name and Image
+// are untrusted registry/requirement input and are shell quoted; the publish
+// flags are already allowlist-safe (buildPublishFlags); rt is host-config.
+// Pure function so the built string is unit testable without a live executor
+// (§11.4.115).
+func buildRemoteRunCommand(
+	rt, name, image string, ports []scheduler.PortMapping,
+) string {
+	return fmt.Sprintf(
+		"%s run -d --name %s%s %s",
+		rt, shellQuote(name),
+		buildPublishFlags(ports),
+		shellQuote(image),
+	)
+}
+
 func (d *DefaultDistributor) deployRemote(
 	ctx context.Context, dc *DistributedContainer,
 ) error {
@@ -345,17 +387,12 @@ func (d *DefaultDistributor) deployRemote(
 		rt = "docker"
 	}
 
-	removeCmd := fmt.Sprintf(
-		"%s rm -f %s 2>/dev/null || true",
-		rt, dc.Requirement.Name,
-	)
+	removeCmd := buildRemoteRemoveCommand(rt, dc.Requirement.Name)
 	d.opts.Executor.Execute(ctx, *host, removeCmd)
 
-	cmd := fmt.Sprintf(
-		"%s run -d --name %s%s %s",
-		rt, dc.Requirement.Name,
-		buildPublishFlags(dc.Requirement.Ports),
-		dc.Requirement.Image,
+	cmd := buildRemoteRunCommand(
+		rt, dc.Requirement.Name, dc.Requirement.Image,
+		dc.Requirement.Ports,
 	)
 
 	d.opts.Logger.Info("deploying %s on %s: %s",
