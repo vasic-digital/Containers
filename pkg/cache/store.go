@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 )
@@ -67,6 +68,33 @@ func (s *FilesystemStore) lockPath(sha string) string {
 	return filepath.Join(s.lockfilesDir(), prefix+".lock")
 }
 
+// normalizeSHA256 is the security boundary for the content-addressed blob
+// path. It lowercases the manifest SHA and requires exactly 64 hexadecimal
+// characters, returning the canonical lowercase form or an error.
+//
+// Two properties depend on this:
+//   - Path safety: a 64-char all-hex string cannot contain a path separator
+//     or "..", so it can never traverse out of blobsDir when filepath.Join'd.
+//     A value that fails this check (e.g. "../../poison.img") MUST never reach
+//     blobPath/lockPath — otherwise a Manifest that did not pass through
+//     LoadManifest could make Get return an arbitrary file as a "verified"
+//     image (integrity-verify bypass) or make Refresh os.Remove an arbitrary
+//     file (arbitrary deletion).
+//   - Case normalization: LoadManifest permits uppercase hex, but the
+//     recomputed digest is always lowercase (hex.EncodeToString), so without
+//     normalizing an uppercase-hex manifest SHA would never match the blob
+//     path nor the compare, and the image could never cache.
+func normalizeSHA256(sha string) (string, error) {
+	s := strings.ToLower(sha)
+	if len(s) != 64 {
+		return "", fmt.Errorf("invalid SHA256 %q: must be 64 hex characters (got %d)", sha, len(s))
+	}
+	if _, err := hex.DecodeString(s); err != nil {
+		return "", fmt.Errorf("invalid SHA256 %q: not hexadecimal: %w", sha, err)
+	}
+	return s, nil
+}
+
 func (s *FilesystemStore) keymu(id string) *sync.Mutex {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -93,7 +121,11 @@ func (s *FilesystemStore) Get(ctx context.Context, m *Manifest, imageID string) 
 	if err != nil {
 		return "", err
 	}
-	final := s.blobPath(entry.SHA256)
+	sha, err := normalizeSHA256(entry.SHA256)
+	if err != nil {
+		return "", fmt.Errorf("image %q: %w", entry.ID, err)
+	}
+	final := s.blobPath(sha)
 
 	// Fast path — already cached.
 	if _, err := os.Stat(final); err == nil {
@@ -117,7 +149,7 @@ func (s *FilesystemStore) Get(ctx context.Context, m *Manifest, imageID string) 
 	if err := os.MkdirAll(s.lockfilesDir(), 0o755); err != nil {
 		return "", fmt.Errorf("mkdir lockfiles: %w", err)
 	}
-	lockPath := s.lockPath(entry.SHA256)
+	lockPath := s.lockPath(sha)
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return "", fmt.Errorf("open lock %s: %w", lockPath, err)
@@ -164,13 +196,13 @@ func (s *FilesystemStore) Get(ctx context.Context, m *Manifest, imageID string) 
 	}
 
 	gotSHA := hex.EncodeToString(hasher.Sum(nil))
-	if gotSHA != entry.SHA256 {
+	if gotSHA != sha {
 		_ = os.Remove(tmpPath)
 		// Also remove the final-path blob if a partial one ever appeared
 		// at it (defensive — shouldn't normally exist).
 		_ = os.Remove(final)
 		return "", fmt.Errorf("image %q: SHA256 mismatch (got %s, want %s)",
-			entry.ID, gotSHA, entry.SHA256)
+			entry.ID, gotSHA, sha)
 	}
 	if entry.Size != 0 && written != entry.Size {
 		_ = os.Remove(tmpPath)
@@ -193,7 +225,11 @@ func (s *FilesystemStore) Verify(ctx context.Context, m *Manifest, imageID strin
 	if err != nil {
 		return err
 	}
-	path := s.blobPath(entry.SHA256)
+	sha, err := normalizeSHA256(entry.SHA256)
+	if err != nil {
+		return fmt.Errorf("verify %q: %w", entry.ID, err)
+	}
+	path := s.blobPath(sha)
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("verify %q: %w", entry.ID, err)
@@ -204,9 +240,9 @@ func (s *FilesystemStore) Verify(ctx context.Context, m *Manifest, imageID strin
 		return fmt.Errorf("verify %q: %w", entry.ID, err)
 	}
 	got := hex.EncodeToString(hasher.Sum(nil))
-	if got != entry.SHA256 {
+	if got != sha {
 		return fmt.Errorf("verify %q: SHA256 drift (got %s, want %s)",
-			entry.ID, got, entry.SHA256)
+			entry.ID, got, sha)
 	}
 	return nil
 }
@@ -218,7 +254,11 @@ func (s *FilesystemStore) Refresh(ctx context.Context, m *Manifest, imageID stri
 	if err != nil {
 		return err
 	}
-	_ = os.Remove(s.blobPath(entry.SHA256))
+	sha, err := normalizeSHA256(entry.SHA256)
+	if err != nil {
+		return fmt.Errorf("refresh %q: %w", entry.ID, err)
+	}
+	_ = os.Remove(s.blobPath(sha))
 	_, err = s.Get(ctx, m, imageID)
 	return err
 }
