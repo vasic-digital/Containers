@@ -190,6 +190,20 @@ func buildLaunchCommand(h Handle, dir string, enableLinger bool) string {
 	}
 	// Clear any prior failed/loaded instance so the unit name is reusable.
 	b.WriteString(fmt.Sprintf("systemctl --user reset-failed %s >/dev/null 2>&1 || true; ", shQuote(h.Unit)))
+	// Remove any stale sentinel + log left by a PRIOR, ALREADY-FINISHED run of
+	// this same unit BEFORE launching. Without this, a re-Launch that reuses the
+	// unit name without an intervening Stop() lets WaitForSentinel read the
+	// previous run's exit code (and FetchLog its output) in the window before the
+	// fresh wrapper writes its own — systemd-run registers the unit
+	// asynchronously and the wrapper writes the sentinel only at the very end.
+	// This rm runs synchronously in the same shell invocation as systemd-run, so
+	// it completes before Launch() returns; relying on the async wrapper's own
+	// `>` truncation would leave that race window open. The `is-active || rm`
+	// guard makes the removal apply ONLY when the unit is not currently running,
+	// so re-Launching a still-active unit (which systemd-run then rejects as
+	// "already exists") never unlinks that live job's in-flight log.
+	b.WriteString(fmt.Sprintf("systemctl --user is-active --quiet %s || rm -f %s %s; ",
+		shQuote(h.Unit), shQuote(h.SentinelPath), shQuote(h.LogPath)))
 	b.WriteString(fmt.Sprintf(
 		"systemd-run --user --unit=%s --collect bash %s",
 		shQuote(strings.TrimSuffix(h.Unit, ".service")),
@@ -242,13 +256,15 @@ func IsActive(ctx context.Context, r Runner, unit string) (bool, error) {
 	u := unitName(unit)
 	res, err := r.Run(ctx,
 		"export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user is-active "+shQuote(u))
-	if err != nil {
-		// `is-active` exits non-zero for inactive/failed units; pkg/remote's
-		// SSH executor surfaces that as an error. Distinguish a real transport
-		// failure (empty stdout) from a benign "inactive" verdict.
-		if strings.TrimSpace(res.Stdout) == "" {
-			return false, nil
-		}
+	if err != nil && strings.TrimSpace(res.Stdout) == "" {
+		// `is-active` exits non-zero for inactive/failed units; pkg/remote's SSH
+		// executor surfaces that non-zero exit as an error — but so does a real
+		// transport failure (host unreachable, could not exec). A non-empty
+		// stdout ("active"/"inactive"/"failed") is a genuine verdict from the
+		// remote systemctl and is NOT an error; an EMPTY stdout WITH an error
+		// means no verdict was ever produced, so surface it rather than report a
+		// false "not active" for a host we could not even reach.
+		return false, fmt.Errorf("remoteexec: is-active %s: %w", u, err)
 	}
 	return strings.TrimSpace(res.Stdout) == "active", nil
 }
@@ -342,8 +358,15 @@ func (l *LocalRunner) Run(ctx context.Context, command string) (Result, error) {
 	err := cmd.Run()
 	res := Result{Stdout: stdout.String(), Stderr: stderr.String()}
 	if ee, ok := err.(*exec.ExitError); ok {
+		// Runner contract (see the Runner interface doc): a non-zero exit is
+		// reported via Result.ExitCode and is NOT, by itself, a Go error —
+		// callers decide whether a non-zero exit is fatal. Only a genuine
+		// "could not execute at all" failure (the non-ExitError branch below)
+		// returns a non-nil error. This mirrors SSHRunner.Run so local and
+		// remote hosts behave identically, and keeps the "err && empty stdout"
+		// transport-failure guard in IsActive/MainPID/FetchLog meaningful.
 		res.ExitCode = ee.ExitCode()
-		return res, fmt.Errorf("local exec exited %d", res.ExitCode)
+		return res, nil
 	}
 	return res, err
 }
