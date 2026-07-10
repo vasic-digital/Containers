@@ -18,6 +18,7 @@ type ConnectionPool struct {
 	mu         sync.Mutex
 	opts       Options
 	active     map[string]*controlEntry
+	dialLocks  map[string]*sync.Mutex // per-host, serializes same-host dials
 	socketDir  string
 	cleanupCtx context.Context
 	cleanupFn  context.CancelFunc
@@ -59,14 +60,50 @@ func NewConnectionPool(opts Options) (*ConnectionPool, error) {
 func (p *ConnectionPool) Acquire(
 	ctx context.Context, host RemoteHost,
 ) (string, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	key := hostKey(host)
+
+	// Fast path under the pool lock: reuse a pooled master, but ONLY if
+	// its control socket still exists. A ControlMaster that died
+	// out-of-band (remote reboot, network partition outliving the SSH
+	// keepalive budget, master process killed) leaves a stale entry whose
+	// socket is gone; handing that dead path back would report a healthy
+	// pooled connection for one that cannot be used (Gotcha #1). Evict on
+	// a missing socket and fall through to a fresh dial.
+	p.mu.Lock()
 	if entry, ok := p.active[key]; ok {
-		entry.refs++
-		return entry.socketPath, nil
+		if _, statErr := os.Stat(entry.socketPath); statErr == nil {
+			entry.refs++
+			sp := entry.socketPath
+			p.mu.Unlock()
+			return sp, nil
+		}
+		delete(p.active, key)
 	}
+	dl := p.dialLockLocked(key)
+	p.mu.Unlock()
+
+	// Serialize dials for THIS host only (two goroutines must not race two
+	// ControlMasters onto the same deterministic socket path), while
+	// leaving the pool mutex free so dials for OTHER hosts — and
+	// Release/Close/CloseHost/ActiveCount — run concurrently. Holding the
+	// pool-wide mutex across the blocking ssh dial (up to ConnectTimeout)
+	// would serialize every pool operation behind one slow/hung host.
+	dl.Lock()
+	defer dl.Unlock()
+
+	// Re-check under the pool lock: a concurrent same-host Acquire may
+	// have finished dialing while we waited on the per-host dial lock.
+	p.mu.Lock()
+	if entry, ok := p.active[key]; ok {
+		if _, statErr := os.Stat(entry.socketPath); statErr == nil {
+			entry.refs++
+			sp := entry.socketPath
+			p.mu.Unlock()
+			return sp, nil
+		}
+		delete(p.active, key)
+	}
+	p.mu.Unlock()
 
 	socketPath := filepath.Join(
 		p.socketDir,
@@ -79,6 +116,7 @@ func (p *ConnectionPool) Acquire(
 	)
 	defer cancel()
 
+	// Blocking dial runs WITHOUT the pool mutex held.
 	_, stderr, err := iexec.Run(execCtx, "ssh", args...)
 	if err != nil {
 		return "", fmt.Errorf(
@@ -87,13 +125,29 @@ func (p *ConnectionPool) Acquire(
 		)
 	}
 
+	p.mu.Lock()
 	p.active[key] = &controlEntry{
 		host:       host,
 		socketPath: socketPath,
 		refs:       1,
 		createdAt:  time.Now(),
 	}
+	p.mu.Unlock()
 	return socketPath, nil
+}
+
+// dialLockLocked returns the per-host dial mutex, creating it on first
+// use. The caller MUST hold p.mu.
+func (p *ConnectionPool) dialLockLocked(key string) *sync.Mutex {
+	if p.dialLocks == nil {
+		p.dialLocks = make(map[string]*sync.Mutex)
+	}
+	dl, ok := p.dialLocks[key]
+	if !ok {
+		dl = &sync.Mutex{}
+		p.dialLocks[key] = dl
+	}
+	return dl
 }
 
 // Release decrements the reference count for a host's connection.

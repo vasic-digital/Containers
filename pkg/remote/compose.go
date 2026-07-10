@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"sync"
 
 	"digital.vasic.containers/pkg/compose"
 	"digital.vasic.containers/pkg/logging"
@@ -28,8 +27,6 @@ type RemoteComposeOrchestrator struct {
 	composeCmd *ComposeCommand
 	detector   *ComposeDetector
 	logger     logging.Logger
-	once       sync.Once
-	detectErr  error
 }
 
 // RemoteComposeOption configures the RemoteComposeOrchestrator.
@@ -94,21 +91,31 @@ func NewRemoteComposeOrchestrator(
 }
 
 // getComposeCommand returns the compose command to use, detecting if necessary.
+//
+// It does NOT freeze a low-confidence fallback guess. Detect() caches
+// genuine successes permanently but never caches a failure, so once the
+// host is healthy the real compose tool is picked up. Only when Detect()
+// fails do we use DetectWithFallback's host.Runtime guess — and only for
+// THIS call: a later call re-attempts detection. Previously a sync.Once
+// froze whatever the first call produced (a genuine tool OR, if the host
+// was transiently unready, an unvalidated guess) for the orchestrator's
+// entire lifetime, so a host that recovered kept being driven with the
+// wrong binary until a brand-new orchestrator was constructed.
 func (o *RemoteComposeOrchestrator) getComposeCommand(ctx context.Context) (*ComposeCommand, error) {
-	// If command was explicitly set, use it
+	// Explicit override via WithComposeCommand is permanent by design.
 	if o.composeCmd != nil {
 		return o.composeCmd, nil
 	}
 
-	// Detect once
-	o.once.Do(func() {
-		o.composeCmd = o.detector.DetectWithFallback(ctx, o.host)
-		if o.composeCmd == nil {
-			o.detectErr = fmt.Errorf("no compose command detected on host %s", o.host.Name)
-		}
-	})
+	if cmd, err := o.detector.Detect(ctx, o.host); err == nil {
+		return cmd, nil
+	}
 
-	return o.composeCmd, o.detectErr
+	o.logger.Warn(
+		"compose auto-detection failed on %s, using configured runtime %s (will re-attempt on next call)",
+		o.host.Name, o.host.Runtime,
+	)
+	return o.detector.DetectWithFallback(ctx, o.host), nil
 }
 
 // composeCmdString returns the compose command string for execution.
