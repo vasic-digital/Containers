@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"runtime/debug"
+	"sync"
 )
 
 // deliverableEvent pairs an event with the context active at the
@@ -16,11 +17,12 @@ type deliverableEvent struct {
 
 // subscription holds the state of a single event subscriber.
 type subscription struct {
-	id      SubscriptionID
-	filter  EventFilter
-	handler EventHandler
-	ch      chan deliverableEvent
-	done    chan struct{}
+	id        SubscriptionID
+	filter    EventFilter
+	handler   EventHandler
+	ch        chan deliverableEvent
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // newSubscriptionID creates a SubscriptionID from a uint64.
@@ -82,10 +84,25 @@ func (s *subscription) dispatch(de deliverableEvent) {
 	s.handler(de.ctx, de.event)
 }
 
-// stop closes the event channel and waits for the goroutine to
-// finish.
+// requestStop signals the delivery goroutine to terminate WITHOUT
+// waiting for it to finish. It is idempotent (a double request, or a
+// concurrent request from Close, closes s.ch exactly once) and is safe
+// to call from inside the subscription's own delivery goroutine — a
+// handler that unsubscribes itself. Because it does not join, it never
+// self-deadlocks the way stop() would when called from that goroutine.
+func (s *subscription) requestStop() {
+	s.closeOnce.Do(func() {
+		close(s.ch)
+	})
+}
+
+// stop signals the delivery goroutine to terminate and then waits for
+// it to finish. It MUST NOT be called from the subscription's own
+// delivery goroutine (that would join the goroutine on itself and
+// deadlock); use requestStop from a handler instead. stop is the
+// teardown path for Close, which runs outside any delivery goroutine.
 func (s *subscription) stop() {
-	close(s.ch)
+	s.requestStop()
 	<-s.done
 }
 

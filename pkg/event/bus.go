@@ -107,6 +107,19 @@ func (b *DefaultEventBus) Subscribe(
 
 // Unsubscribe removes a subscription and stops its delivery
 // goroutine.
+//
+// It signals the goroutine to stop via sub.requestStop() rather than
+// sub.stop(): a subscriber handler may unsubscribe its OWN subscription
+// (the one-shot / unsubscribe-on-condition pattern), in which case
+// Unsubscribe runs INSIDE that subscription's delivery goroutine. A
+// joining stop() (`<-s.done`) there would wait for run() to return while
+// run() is blocked in the very handler doing the unsubscribe — a self-
+// join deadlock that wedges the goroutine and never returns.
+// requestStop() only closes the channel (idempotently), which is enough
+// to terminate run(); the goroutine winds down on its own without a
+// join. The delete under b.mu.Lock() has already removed the sub from
+// the map (waiting out any in-flight Publish holding b.mu.RLock()), so
+// closing s.ch is strictly after any send that could have seen it.
 func (b *DefaultEventBus) Unsubscribe(id SubscriptionID) {
 	b.mu.Lock()
 	sub, ok := b.subs[id]
@@ -116,7 +129,7 @@ func (b *DefaultEventBus) Unsubscribe(id SubscriptionID) {
 	b.mu.Unlock()
 
 	if ok {
-		sub.stop()
+		sub.requestStop()
 	}
 }
 
