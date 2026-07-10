@@ -164,11 +164,27 @@ func buildRunnerScript(h Handle, script string) string {
 		"set -uo pipefail",
 		fmt.Sprintf("__log=%s", shQuote(h.LogPath)),
 		fmt.Sprintf("__sentinel=%s", shQuote(h.SentinelPath)),
+		// A run-once EXIT trap writes the sentinel with the real exit status on
+		// EVERY normal exit path — a fall-through, an early `exit` inside the
+		// group, a `set -u` unbound-variable abort, or a user `set -e` failure
+		// (the `{ }` is a group, NOT a subshell, so any of these exits THIS
+		// shell without reaching a post-group write). The prior code wrote the
+		// sentinel only AFTER the group, so those early-exit paths skipped it
+		// entirely and WaitForSentinel then hung to timeout on a job that had in
+		// fact finished — a §11.4.1 FAIL-bluff against this function's documented
+		// "ALWAYS writes the exit code" contract. __finish's `__rc=$?` is its
+		// first statement, so it records the terminating status on every path.
+		// Honest boundary (§11.4.6): a job killed by an EXTERNAL signal
+		// (SIGTERM/SIGINT) still writes the sentinel via the EXIT trap (never
+		// reported as hung) but records the last-completed-command status, not
+		// the 128+signo code — best-effort, as no caller consumes the recorded
+		// rc today; the four normal exit paths above are exact.
+		`__finish() { __rc=$?; printf '%s\n' "$__rc" > "$__sentinel"; }`,
+		"trap __finish EXIT",
 		"{",
 		script,
 		`} >"$__log" 2>&1`,
 		"__rc=$?",
-		`printf '%s\n' "$__rc" > "$__sentinel"`,
 		"exit $__rc",
 		"",
 	}, "\n")
@@ -291,11 +307,24 @@ func WaitForSentinel(ctx context.Context, r Runner, h Handle, poll, timeout time
 	}
 	deadline := time.Now().Add(timeout)
 	for {
-		res, _ := r.Run(ctx, fmt.Sprintf("cat %s 2>/dev/null", shQuote(h.SentinelPath)))
+		res, err := r.Run(ctx, fmt.Sprintf("cat %s 2>/dev/null", shQuote(h.SentinelPath)))
 		if s := strings.TrimSpace(res.Stdout); s != "" {
 			var rc int
 			_, _ = fmt.Sscanf(s, "%d", &rc)
 			return rc, nil
+		}
+		if err != nil {
+			// Per the Runner contract, err is non-nil ONLY when the command could
+			// not be executed at all (host unreachable / could-not-exec). A
+			// not-yet-present sentinel is a benign `cat` non-zero exit reported via
+			// ExitCode with a NIL error, which the empty-stdout path below already
+			// treats as "not done, keep polling". A transport failure (empty stdout
+			// WITH err) must NOT masquerade as "sentinel did not appear within
+			// timeout": surface it immediately, the same §11.4.144 availability-
+			// following honesty IsActive/MainPID/FetchLog enforce. The signature is
+			// unchanged, so callers already handling the error path get a truthful
+			// transport error instead of a misattributed timeout.
+			return -1, fmt.Errorf("remoteexec: wait sentinel %s: %w", h.SentinelPath, err)
 		}
 		if timeout > 0 && time.Now().After(deadline) {
 			return -1, fmt.Errorf("remoteexec: sentinel %s did not appear within %s", h.SentinelPath, timeout)

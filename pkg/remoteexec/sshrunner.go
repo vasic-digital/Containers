@@ -32,10 +32,19 @@ func (s *SSHRunner) Run(ctx context.Context, command string) (Result, error) {
 		return Result{}, err
 	}
 	res := Result{Stdout: cr.Stdout, Stderr: cr.Stderr, ExitCode: cr.ExitCode}
-	// pkg/remote returns a non-nil error for a non-zero remote exit. Callers
-	// of Runner treat exit codes via Result.ExitCode, so only surface the
-	// error when the command did not run (no exit code captured).
-	if err != nil && cr.ExitCode != 0 {
+	// pkg/remote returns a non-nil error both for a non-zero *remote command*
+	// exit AND for ssh's OWN transport failures. ssh propagates a remote
+	// command's status as its own exit code in [1,254], but reserves 255 for
+	// its own errors (connection refused / DNS / auth / host-key), and a
+	// ctx-timeout SIGKILL surfaces as a negative code. Callers of Runner read a
+	// genuine remote verdict from Result.ExitCode/Stdout, so only swallow the
+	// error for a [1,254] remote exit; SURFACE it for 255/negative — reporting
+	// an unreachable durable-job host as "finished" is the exact
+	// §11.4.108/§11.4.144 bluff the liveness accessors (IsActive/MainPID/
+	// FetchLog) exist to prevent. (255 is inherently ambiguous — ssh cannot
+	// distinguish a remote command's 255 from its own — so we treat it as
+	// transport-suspect; none of this package's commands exit 255.)
+	if err != nil && cr.ExitCode >= 1 && cr.ExitCode <= 254 {
 		return res, nil
 	}
 	return res, err
