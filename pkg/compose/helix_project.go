@@ -59,6 +59,13 @@ func NewHelixComposeProject(projectName string, services []HelixService) *HelixC
 
 // GetService returns a service by name.
 func (p *HelixComposeProject) GetService(name string) (*HelixService, error) {
+	if p == nil {
+		// A nil receiver (map-lookup miss, ignored-error return, uninitialized
+		// field — all legitimate Go zero values) returns the same "not found"
+		// error an empty project gives, rather than panicking
+		// (CT-HARDEN-COMPOSE-1).
+		return nil, fmt.Errorf("service %q not found", name)
+	}
 	for i := range p.Services {
 		if p.Services[i].Name == name {
 			return &p.Services[i], nil
@@ -69,6 +76,14 @@ func (p *HelixComposeProject) GetService(name string) (*HelixService, error) {
 
 // ServiceNames returns all service names.
 func (p *HelixComposeProject) ServiceNames() []string {
+	if p == nil {
+		// Return the SAME non-nil empty slice an initialized-but-empty
+		// project yields (make([]string, 0)), not a bare nil — so a nil
+		// receiver is truly indistinguishable from an empty project
+		// (reflect.DeepEqual / == nil / JSON null-vs-[] all agree), the
+		// contract CT-HARDEN-COMPOSE-1 guarantees.
+		return []string{}
+	}
 	names := make([]string, len(p.Services))
 	for i, s := range p.Services {
 		names[i] = s.Name
@@ -78,6 +93,9 @@ func (p *HelixComposeProject) ServiceNames() []string {
 
 // HasService checks if a service exists.
 func (p *HelixComposeProject) HasService(name string) bool {
+	if p == nil {
+		return false
+	}
 	for _, s := range p.Services {
 		if s.Name == name {
 			return true
