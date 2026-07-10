@@ -3,6 +3,8 @@ package event
 import (
 	"context"
 	"fmt"
+	"log"
+	"runtime/debug"
 )
 
 // deliverableEvent pairs an event with the context active at the
@@ -52,11 +54,32 @@ func (s *subscription) run(closeCh <-chan struct{}) {
 			if !ok {
 				return
 			}
-			s.handler(de.ctx, de.event)
+			s.dispatch(de)
 		case <-closeCh:
 			return
 		}
 	}
+}
+
+// dispatch invokes the subscriber's handler for a single delivery,
+// containing any panic so one misbehaving subscriber cannot crash the
+// process or kill this subscription's delivery goroutine. A recovered
+// panic is surfaced honestly (logged with the subscriber id, the event
+// that triggered it, the recovered value, and the stack) — never
+// silently swallowed — while sibling subscribers and subsequent
+// deliveries to this subscriber proceed unaffected.
+func (s *subscription) dispatch(de deliverableEvent) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf(
+				"event: subscriber %s panicked handling %q event "+
+					"from %q: %v\n%s",
+				s.id, de.event.Type, de.event.Source, r,
+				debug.Stack(),
+			)
+		}
+	}()
+	s.handler(de.ctx, de.event)
 }
 
 // stop closes the event channel and waits for the goroutine to
