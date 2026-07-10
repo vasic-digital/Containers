@@ -70,6 +70,36 @@ func (s *FilesystemStore) lockPath(sha string) string {
 	return filepath.Join(s.lockfilesDir(), prefix+".lock")
 }
 
+// Durability seams (§11.4.115 structural guard for Wave-20 CACHE-HARD C-1).
+// The fsync/rename operations that make a fetched blob durable are indirected
+// through package-level vars so the crash-durability guard can record their
+// invocation ORDER: syncFile (flush the temp's data pages) BEFORE renameFile
+// (atomically publish the blob at its final path) BEFORE syncDir (fsync the
+// containing directory so the rename itself survives a crash). Production
+// points them at the real syscalls; tests that override them MUST NOT use
+// t.Parallel() — the swap-and-restore pattern on a package-level var is not
+// concurrency-safe (same convention as pkg/vm's killByPortHook).
+var (
+	syncFile   = (*os.File).Sync
+	renameFile = os.Rename
+	syncDir    = fsyncDir
+)
+
+// fsyncDir opens dir and fsyncs it so a preceding os.Rename INTO that directory
+// becomes durable (the rename's directory-entry metadata is flushed to stable
+// storage). Returns the first error encountered.
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if serr := d.Sync(); serr != nil {
+		_ = d.Close()
+		return serr
+	}
+	return d.Close()
+}
+
 // normalizeSHA256 is the security boundary for the content-addressed blob
 // path. It lowercases the manifest SHA and requires exactly 64 hexadecimal
 // characters, returning the canonical lowercase form or an error.
@@ -201,9 +231,21 @@ func (s *FilesystemStore) fetchAndPlace(ctx context.Context, entry *ImageEntry, 
 	if err != nil {
 		return "", err
 	}
-	if err := os.Rename(tmpPath, final); err != nil {
+	if err := renameFile(tmpPath, final); err != nil {
 		_ = os.Remove(tmpPath)
 		return "", fmt.Errorf("atomic rename %s → %s: %w", tmpPath, final, err)
+	}
+	// Durability barrier: os.Rename atomically publishes the blob, but the
+	// rename itself is only durable once the CONTAINING directory's metadata
+	// is fsync'd. Without this, a crash after the rename returns but before
+	// the directory entry flushes can lose the publish on recovery (final
+	// missing, or a stale entry surviving). fsync the blobs dir so the atomic
+	// publish survives a power-loss. The blob at final is already SHA-verified
+	// (fetchToTemp verifies before returning tmpPath), so a dir-fsync failure
+	// surfaces as an error while the verified bytes remain safely in place for
+	// the next fast-path Get.
+	if err := syncDir(s.blobsDir()); err != nil {
+		return "", fmt.Errorf("fsync blobs dir: %w", err)
 	}
 	return final, nil
 }
@@ -238,12 +280,27 @@ func (s *FilesystemStore) fetchToTemp(ctx context.Context, entry *ImageEntry, sh
 	tmpPath := tmp.Name()
 	hasher := sha256.New()
 	written, err := io.Copy(io.MultiWriter(tmp, hasher), resp.Body)
-	if cerr := tmp.Close(); cerr != nil && err == nil {
-		err = cerr
-	}
 	if err != nil {
+		_ = tmp.Close()
 		_ = os.Remove(tmpPath)
 		return "", fmt.Errorf("write tempfile: %w", err)
+	}
+	// Durability barrier: flush the blob DATA to stable storage BEFORE the
+	// temp is eligible to be renamed into place. os.Rename gives ATOMICITY
+	// (no torn file ever visible at final) but NOT DURABILITY — on a crash
+	// after the rename's metadata is journaled but before the data pages
+	// flush, recovery can leave a present-but-zero/garbage blob at final,
+	// which Get's re-hash-free fast path would then serve forever as
+	// "verified". A failed Sync fails the fetch and removes the temp; it
+	// never publishes an unflushed blob.
+	if serr := syncFile(tmp); serr != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("fsync tempfile %q: %w", entry.ID, serr)
+	}
+	if cerr := tmp.Close(); cerr != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("close tempfile %q: %w", entry.ID, cerr)
 	}
 
 	gotSHA := hex.EncodeToString(hasher.Sum(nil))
@@ -277,13 +334,30 @@ func (s *FilesystemStore) Verify(ctx context.Context, m *Manifest, imageID strin
 	if err != nil {
 		return fmt.Errorf("verify %q: %w", entry.ID, err)
 	}
-	defer f.Close()
 	hasher := sha256.New()
-	if _, err := io.Copy(hasher, f); err != nil {
-		return fmt.Errorf("verify %q: %w", entry.ID, err)
+	_, copyErr := io.Copy(hasher, f)
+	// Close before any quarantine rename below so we never move a file we
+	// still hold open (defensive across platforms; harmless on Linux).
+	_ = f.Close()
+	if copyErr != nil {
+		return fmt.Errorf("verify %q: %w", entry.ID, copyErr)
 	}
 	got := hex.EncodeToString(hasher.Sum(nil))
 	if got != sha {
+		// SHA drift: the cached blob's bytes no longer hash to the declared
+		// SHA (on-disk corruption / bit-rot / partial write). Get's fast path
+		// never re-hashes a cached blob, so leaving the poisoned blob in place
+		// would serve it forever as "verified" (breaking the package's
+		// integrity property). Quarantine it aside to a .corrupt sidecar
+		// (matching pkg/serviceregistry's corrupt-file convention) so a
+		// subsequent Get misses the fast path and re-fetches a good copy,
+		// while the corrupt bytes are preserved for forensic recovery. If the
+		// move-aside fails, fall back to removing the blob so a re-fetch can
+		// still recover. The drift error is returned either way.
+		quarantine := path + ".corrupt"
+		if renameErr := os.Rename(path, quarantine); renameErr != nil {
+			_ = os.Remove(path)
+		}
 		return fmt.Errorf("verify %q: SHA256 drift (got %s, want %s)",
 			entry.ID, got, sha)
 	}
