@@ -8,11 +8,27 @@ type Options struct {
 	PortRangeStart int
 	// PortRangeEnd is the end of the local port range.
 	PortRangeEnd int
-	// AutoReconnect enables automatic tunnel reconnection.
+
+	// AutoReconnect, ReconnectInterval, and MaxReconnectAttempts are NOT YET
+	// IMPLEMENTED. They are config-only stubs — DefaultOptions() defaults
+	// AutoReconnect to true and the With* setters store all three, but NOTHING
+	// consumes them: the tunnel manager never re-establishes a dropped tunnel.
+	// A tunnel whose ssh process dies is reaped (removed, or retained as
+	// State=TunnelFailed on a forward-failure death) — it is never reconnected,
+	// and the State=TunnelReconnecting value is likewise never set. These fields
+	// are reserved as the seam for a future reconnection loop (a feature pending
+	// an operator decision); until it lands, setting AutoReconnect=true has no
+	// runtime effect. Callers MUST NOT rely on automatic reconnection. Mirrors
+	// the honest stub disclaimer on overlay.go's TunnelOverlay.
+
+	// AutoReconnect is reserved to enable automatic tunnel reconnection.
+	// NOT YET IMPLEMENTED — currently a no-op (see the note above).
 	AutoReconnect bool
-	// ReconnectInterval is the delay between reconnect attempts.
+	// ReconnectInterval is reserved as the delay between reconnect attempts.
+	// NOT YET IMPLEMENTED — currently unused (see the note above).
 	ReconnectInterval time.Duration
-	// MaxReconnectAttempts limits reconnect retries (0=unlimited).
+	// MaxReconnectAttempts is reserved to limit reconnect retries (0=unlimited).
+	// NOT YET IMPLEMENTED — currently unused (see the note above).
 	MaxReconnectAttempts int
 }
 
@@ -48,17 +64,22 @@ func WithPortRange(start, end int) Option {
 }
 
 // WithAutoReconnect enables or disables automatic reconnection.
+// NOT YET IMPLEMENTED — stores the flag but has no runtime effect; see the
+// Options.AutoReconnect field note.
 func WithAutoReconnect(enabled bool) Option {
 	return func(o *Options) { o.AutoReconnect = enabled }
 }
 
 // WithReconnectInterval sets the delay between reconnect
-// attempts.
+// attempts. NOT YET IMPLEMENTED — stores the value but has no runtime effect;
+// see the Options.ReconnectInterval field note.
 func WithReconnectInterval(d time.Duration) Option {
 	return func(o *Options) { o.ReconnectInterval = d }
 }
 
 // WithMaxReconnectAttempts sets the maximum reconnect retries.
+// NOT YET IMPLEMENTED — stores the value but has no runtime effect; see the
+// Options.MaxReconnectAttempts field note.
 func WithMaxReconnectAttempts(n int) Option {
 	return func(o *Options) { o.MaxReconnectAttempts = n }
 }

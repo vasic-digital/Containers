@@ -176,8 +176,12 @@ func (m *DefaultTunnelManager) CreateTunnel(
 	// autoAllocatedPort (>=0 only when we auto-allocated the port) is passed so
 	// the reaper releases ONLY a reservation this tunnel owns. An explicit port
 	// was never allocator-managed, so releasing it here could free a *different*
-	// live auto-tunnel that happens to hold that same integer.
-	go m.reapTunnel(spec.LocalPort, entry, autoAllocatedPort)
+	// live auto-tunnel that happens to hold that same integer. ctx is passed so
+	// the reaper can tell an intentional teardown (ctx cancelled →
+	// exec.CommandContext killed ssh — a normal close) from a tunnel that died on
+	// its own (a forward-failure death, which must be surfaced as
+	// State=TunnelFailed rather than silently deleted).
+	go m.reapTunnel(ctx, spec.LocalPort, entry, autoAllocatedPort)
 
 	m.logger.Info(
 		"tunnel created: %s %s:%s <-> local:%s via %s",
@@ -213,16 +217,35 @@ func (m *DefaultTunnelManager) CloseTunnel(
 	return nil
 }
 
-// reapTunnel blocks until the tunnel's ssh process exits, then removes the
-// tunnel from the active set and releases its local port. It is spawned once
-// per successfully-created tunnel. Teardown is guarded by pointer identity: if
-// CloseTunnel already removed this exact entry, or a later CreateTunnel replaced
-// this port with a different tunnel, reapTunnel touches nothing — releasing the
-// port here would free a port the replacement (or CloseTunnel) already owns.
+// reapTunnel blocks until the tunnel's ssh process exits, then reconciles the
+// active set. It is spawned once per successfully-created tunnel. Teardown is
+// guarded by pointer identity: if CloseTunnel already removed this exact entry,
+// or a later CreateTunnel replaced this port with a different tunnel, reapTunnel
+// touches nothing — acting here would free a port the replacement (or
+// CloseTunnel) already owns.
+//
+// Exit disposition, once this entry is still the current one:
+//
+//   - Dead-on-arrival / forward-failure death (the ssh process exited NON-ZERO
+//     on its own, ctx still live): ssh runs with ExitOnForwardFailure=yes, so it
+//     exits the instant a forward cannot be established (remote port already
+//     bound, auth / host-key failure). CreateTunnel already returned success with
+//     State=TunnelActive, so silently deleting the entry here would let the
+//     tunnel simply VANISH from ListTunnels with no error or signal — the
+//     "absence-of-error masks a dead tunnel" bluff. Instead mark it
+//     State=TunnelFailed and KEEP it queryable so a caller polling ListTunnels
+//     can detect the failure and CloseTunnel it (which releases the port). The
+//     auto-allocated port is deliberately NOT released here, preserving the
+//     invariant "an entry in m.tunnels ⟺ its auto port is still allocated".
+//
+//   - Clean exit (waitErr == nil) OR intentional teardown (ctx cancelled →
+//     exec.CommandContext killed ssh — a normal close, not a failure): remove the
+//     entry and release its auto-allocated port, exactly as before.
 func (m *DefaultTunnelManager) reapTunnel(
+	ctx context.Context,
 	localPort string, entry *tunnelEntry, autoAllocatedPort int,
 ) {
-	_ = entry.wait()
+	waitErr := entry.wait()
 
 	m.mu.Lock()
 	cur, ok := m.tunnels[localPort]
@@ -230,6 +253,21 @@ func (m *DefaultTunnelManager) reapTunnel(
 		m.mu.Unlock()
 		return
 	}
+
+	// A non-zero exit that is NOT an intentional ctx-driven teardown means the
+	// tunnel died on its own (forward failure). Retain it as TunnelFailed rather
+	// than silently deleting it.
+	if waitErr != nil && ctx.Err() == nil {
+		entry.info.State = TunnelFailed
+		m.mu.Unlock()
+		m.logger.Info(
+			"tunnel failed: local port %s (ssh process exited: %v) — "+
+				"retained as State=failed for caller inspection",
+			localPort, waitErr,
+		)
+		return
+	}
+
 	delete(m.tunnels, localPort)
 	m.mu.Unlock()
 
