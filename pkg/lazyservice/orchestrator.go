@@ -164,6 +164,23 @@ func (lo *LazyOrchestrator) RegisterService(svc *ServiceDefinition) error {
 
 // StartService starts a service and its dependencies on-demand.
 func (lo *LazyOrchestrator) StartService(ctx context.Context, name string) error {
+	// Track the services currently on the dependency-resolution path so a
+	// cyclic (A→B→A) or self-referential (A→A) Dependencies graph is detected
+	// and rejected instead of recursing forever. Fresh set per top-level call.
+	return lo.startServiceWithPath(ctx, name, make(map[string]bool))
+}
+
+// startServiceWithPath is the cycle-safe recursive core of StartService.
+// inProgress holds every service ancestor on the CURRENT resolution path
+// (added on entry, removed on return). Re-encountering a service already on
+// the path is a dependency cycle: it is surfaced as a descriptive error rather
+// than recursed into — which is what previously drove unbounded recursion →
+// goroutine stack overflow → whole-process crash (a Go stack overflow is a
+// fatal, non-recoverable runtime error). Because entries are removed on return,
+// a service legitimately reachable via two disjoint paths (a DAG diamond) is
+// still re-visited exactly as before — the LazyBooter once-guard keeps its
+// compose Up to a single invocation — so acyclic behaviour is unchanged.
+func (lo *LazyOrchestrator) startServiceWithPath(ctx context.Context, name string, inProgress map[string]bool) error {
 	lo.mu.RLock()
 	svc, exists := lo.services[name]
 	booter, hasBooter := lo.booters[name]
@@ -176,9 +193,18 @@ func (lo *LazyOrchestrator) StartService(ctx context.Context, name string) error
 		return fmt.Errorf("service %s has no booter", name)
 	}
 
+	// Cycle detection: this service is already being resolved higher up the
+	// current path, so its Dependencies form a cycle. Surface it (§11.4
+	// anti-bluff: a clear error, never a silent swallow) and unwind.
+	if inProgress[name] {
+		return fmt.Errorf("dependency cycle detected involving service %q", name)
+	}
+	inProgress[name] = true
+	defer delete(inProgress, name)
+
 	// Start dependencies first
 	for _, depName := range svc.Dependencies {
-		if err := lo.StartService(ctx, depName); err != nil {
+		if err := lo.startServiceWithPath(ctx, depName, inProgress); err != nil {
 			return fmt.Errorf("dependency %s failed: %w", depName, err)
 		}
 	}
@@ -188,7 +214,7 @@ func (lo *LazyOrchestrator) StartService(ctx context.Context, name string) error
 		// Try alternatives if available
 		for _, altName := range svc.AlternativeServices {
 			lo.logger.Warn("service %s failed, trying alternative: %s", name, altName)
-			if altErr := lo.StartService(ctx, altName); altErr == nil {
+			if altErr := lo.startServiceWithPath(ctx, altName, inProgress); altErr == nil {
 				return nil
 			}
 		}
