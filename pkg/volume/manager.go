@@ -71,6 +71,16 @@ func (m *DefaultVolumeManager) Mount(
 		return fmt.Errorf("mount name cannot be empty")
 	}
 
+	// Reserve the name atomically with the existence check. Previously the
+	// check and the map insert used two separate m.mu acquisitions with the
+	// blocking remote mount in between, so two concurrent Mount() calls for the
+	// same name both passed the (still-empty) check and both ran the real
+	// remote mount — the uniqueness invariant was silently unenforced under
+	// concurrency (a check-then-act TOCTOU, the lock dropped before the
+	// protected op completed). Inserting a MountPending placeholder under the
+	// SAME lock as the check rejects a concurrent same-name Mount before it can
+	// run any remote op.
+	info := &MountInfo{Mount: mount, State: MountPending}
 	m.mu.Lock()
 	if _, exists := m.mounts[mount.Name]; exists {
 		m.mu.Unlock()
@@ -78,15 +88,30 @@ func (m *DefaultVolumeManager) Mount(
 			"mount %q already exists", mount.Name,
 		)
 	}
+	m.mounts[mount.Name] = info
 	m.mu.Unlock()
+
+	// unreserve releases the reservation on a pre-mount early return, matching
+	// the prior "no entry left" behavior of the bad/absent-host and
+	// unsupported-type paths. It only deletes OUR reservation (cur == info) so
+	// it can never clobber an unrelated later entry under the same name.
+	unreserve := func() {
+		m.mu.Lock()
+		if cur, ok := m.mounts[mount.Name]; ok && cur == info {
+			delete(m.mounts, mount.Name)
+		}
+		m.mu.Unlock()
+	}
 
 	host, err := m.hostManager.GetHost(mount.HostName)
 	if err != nil {
+		unreserve()
 		return fmt.Errorf(
 			"get host %s: %w", mount.HostName, err,
 		)
 	}
 	if host == nil {
+		unreserve()
 		return fmt.Errorf(
 			"host %s not found", mount.HostName,
 		)
@@ -101,24 +126,25 @@ func (m *DefaultVolumeManager) Mount(
 	case MountRsync:
 		mountErr = m.rsync.Sync(ctx, *host, mount)
 	default:
+		unreserve()
 		return fmt.Errorf(
 			"unsupported mount type: %s", mount.Type,
 		)
 	}
 
-	info := &MountInfo{Mount: mount}
 	if mountErr != nil {
+		// Keep the reserved entry, flipped to MountFailed (unchanged existing
+		// semantics — TestDefaultVolumeManager_Mount_ExecutionError relies on
+		// the failed entry remaining queryable via Status).
+		m.mu.Lock()
 		info.State = MountFailed
 		info.Error = mountErr.Error()
-		m.mu.Lock()
-		m.mounts[mount.Name] = info
 		m.mu.Unlock()
 		return mountErr
 	}
 
-	info.State = MountMounted
 	m.mu.Lock()
-	m.mounts[mount.Name] = info
+	info.State = MountMounted
 	m.mu.Unlock()
 
 	m.logger.Info("mounted %s (%s) on %s: %s -> %s",

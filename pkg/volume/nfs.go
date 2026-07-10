@@ -50,14 +50,18 @@ func (m *NFSMounter) Mount(
 		)
 	}
 
-	// Mount NFS on remote host.
-	mountOpts := "nfs"
+	// Mount NFS on remote host. `ro` is a mount OPTION and must go under -o;
+	// welding it onto the -t filesystem type (`-t nfs,ro`) makes util-linux
+	// parse "nfs,ro" as a comma-separated type list and reject it with
+	// "unknown filesystem type 'ro'", silently breaking every read-only NFS
+	// mount. Read-write mounts (ReadOnly:false) emit a valid `mount -t nfs ...`.
+	mountFlags := "-t nfs"
 	if mount.ReadOnly {
-		mountOpts += ",ro"
+		mountFlags += " -o ro"
 	}
 	nfsCmd := fmt.Sprintf(
-		"mount -t %s %s:%s %s",
-		mountOpts,
+		"mount %s %s:%s %s",
+		mountFlags,
 		shellQuote(mount.LocalPath), shellQuote(mount.LocalPath),
 		shellQuote(mount.RemotePath),
 	)

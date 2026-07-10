@@ -53,7 +53,13 @@ func (r *RsyncSyncer) Sync(
 
 	// Build the rsync command to run locally.
 	// rsync pushes from local to remote via SSH.
-	flags := r.opts.RsyncFlags
+	// Copy into a fresh, per-call slice before appending. `flags :=
+	// r.opts.RsyncFlags` shares the option slice's backing array; appending
+	// into it (when RsyncFlags has spare capacity, cap > len) writes in place
+	// into backing[len], mutating memory shared across every concurrent Sync on
+	// this one RsyncSyncer — a data race under concurrent read-only Syncs (the
+	// -race detector flags the write here and the strings.Join read below).
+	flags := append([]string(nil), r.opts.RsyncFlags...)
 	if mount.ReadOnly {
 		// For read-only, we still sync but just flag it.
 		flags = append(flags, "--dry-run")

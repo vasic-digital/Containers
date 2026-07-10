@@ -27,6 +27,10 @@ const (
 	MountSyncing MountState = "syncing"
 	// MountFailed means the mount operation failed.
 	MountFailed MountState = "failed"
+	// MountPending means the name is reserved and the mount is in progress.
+	// It is inserted under the same lock as the existence check so a
+	// concurrent same-name Mount is rejected before running any remote op.
+	MountPending MountState = "pending"
 )
 
 // VolumeMount describes a volume to share between local and
