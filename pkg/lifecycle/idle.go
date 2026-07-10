@@ -15,6 +15,20 @@ type IdleShutdown struct {
 	stopped   bool
 	lastTouch time.Time
 	clk       clock
+	// busy, when non-nil and returning true, means the monitored resource
+	// is genuinely in use (e.g. an Acquire lease is held) and MUST NOT be
+	// idle-shut-down. fire() re-arms instead of firing onIdle while busy. A
+	// nil busy preserves the original behavior for callers that do not set
+	// it. Set once before Start() via setBusy (LIFE-(a) IDLE-vs-LEASE fix).
+	busy func() bool
+}
+
+// setBusy installs the in-use predicate consulted by fire(). It must be
+// called before Start() arms the timer (no concurrent fire is possible
+// yet), so it takes no lock. The predicate MUST be non-blocking (an atomic
+// load) because fire() calls it while holding is.mu.
+func (is *IdleShutdown) setBusy(f func() bool) {
+	is.busy = f
 }
 
 // NewIdleShutdown creates an IdleShutdown that fires onIdle after
@@ -107,6 +121,21 @@ func (is *IdleShutdown) fire() {
 		remaining := is.timeout - sinceLastTouch
 		if is.timer != nil {
 			is.timer.Reset(remaining)
+		}
+		is.mu.Unlock()
+		return
+	}
+
+	// Timeout elapsed, but if the resource is still in use (a lease is
+	// held) it is NOT genuinely idle — re-arm rather than reclaiming it out
+	// from under an active holder (LIFE-(a) IDLE-vs-LEASE fix). is.busy()
+	// must be a non-blocking check (an atomic load) so it is safe to call
+	// while holding is.mu; it never takes another lock, so no lock ordering
+	// is introduced.
+	if is.busy != nil && is.busy() {
+		is.lastTouch = is.clk.Now()
+		if is.timer != nil {
+			is.timer.Reset(is.timeout)
 		}
 		is.mu.Unlock()
 		return

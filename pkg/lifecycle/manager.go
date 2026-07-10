@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"digital.vasic.containers/pkg/compose"
@@ -47,6 +48,12 @@ type serviceEntry struct {
 	semaphore  *ConcurrencySemaphore
 	idleCtrl   *IdleShutdown
 	lazyBooter *LazyBooter
+	// activeLeases counts currently-held Acquire leases: incremented when a
+	// lease is granted, decremented exactly once per release (guaranteed by
+	// the sync.Once in the release closure). The idle-shutdown controller
+	// consults it via its busy predicate so a service is never reclaimed
+	// while a lease is still held (LIFE-(a) IDLE-vs-LEASE fix).
+	activeLeases atomic.Int32
 }
 
 // DefaultManager is the standard LifecycleManager implementation.
@@ -215,6 +222,10 @@ func (m *DefaultManager) Start(
 		)
 		entry.idleCtrl = idleCtrl
 		m.mu.Unlock()
+		// Do not fire idle shutdown while a lease is held (LIFE-(a)
+		// IDLE-vs-LEASE fix). The predicate is a lock-free atomic load, safe
+		// to call from fire() under is.mu. Set before Start() arms the timer.
+		idleCtrl.setBusy(func() bool { return entry.activeLeases.Load() > 0 })
 		idleCtrl.Start()
 	}
 
@@ -340,6 +351,12 @@ func (m *DefaultManager) Acquire(
 		}
 	}
 
+	// Mark the lease active before returning so idle-shutdown cannot reclaim
+	// the service while this lease is held (LIFE-(a) IDLE-vs-LEASE fix).
+	// Paired with the Add(-1) inside the release closure's sync.Once, so
+	// exactly one decrement happens per release.
+	entry.activeLeases.Add(1)
+
 	// Reset idle timer. entry.idleCtrl is written under m.mu by Start();
 	// read it under the same lock rather than unguarded, closing a data
 	// race with a concurrent Start() (constitution/Constitution.md
@@ -354,21 +371,26 @@ func (m *DefaultManager) Acquire(
 		idleCtrl.Touch()
 	}
 
-	released := false
+	// releaseOnce makes the returned ReleaseFunc idempotent AND
+	// concurrency-safe (LIFE-(b) RELEASED-RACE fix): the previous plain
+	// non-atomic `released bool` guard data-raced when the same ReleaseFunc
+	// was invoked concurrently, double-releasing the semaphore. sync.Once
+	// mirrors the tunnelEntry.waitOnce pattern in pkg/network/tunnel.go.
+	var releaseOnce sync.Once
 	return func() {
-		if released {
-			return
-		}
-		released = true
-		if entry.semaphore != nil {
-			entry.semaphore.Release()
-		}
-		m.mu.Lock()
-		relIdleCtrl := entry.idleCtrl
-		m.mu.Unlock()
-		if relIdleCtrl != nil {
-			relIdleCtrl.Touch()
-		}
+		releaseOnce.Do(func() {
+			if entry.semaphore != nil {
+				entry.semaphore.Release()
+			}
+			// Pair the Add(1) in Acquire — exactly one decrement per release.
+			entry.activeLeases.Add(-1)
+			m.mu.Lock()
+			relIdleCtrl := entry.idleCtrl
+			m.mu.Unlock()
+			if relIdleCtrl != nil {
+				relIdleCtrl.Touch()
+			}
+		})
 	}, nil
 }
 
