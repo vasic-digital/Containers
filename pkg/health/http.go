@@ -10,8 +10,13 @@ import (
 const defaultHTTPTimeout = 10 * time.Second
 
 // CheckHTTP performs a health check by issuing an HTTP GET request to
-// the target. The check passes when the response status code is less
-// than 500 (i.e., the server is not experiencing an internal error).
+// the target. The check passes only for a 2xx or 3xx response status
+// (200-399): a healthy endpoint answers its health path successfully or
+// redirects. A 4xx (e.g. 401/403/404/429 — auth failure, wrong path,
+// rate-limited) or 5xx (server error) is reported UNHEALTHY. A bare
+// "< 500" predicate would greenlight a 404 from a mis-pointed health
+// URL, masking a broken service (Wave-18 CT-HARDEN-60); the sibling
+// HelixServiceHealthChecker already uses 2xx-only for the same reason.
 func CheckHTTP(ctx context.Context, target HealthTarget) *HealthResult {
 	start := time.Now()
 	url := target.ResolvedAddress()
@@ -58,7 +63,9 @@ func CheckHTTP(ctx context.Context, target HealthTarget) *HealthResult {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	healthy := resp.StatusCode < http.StatusInternalServerError
+	// 2xx-3xx (200-399) is healthy; 4xx and 5xx are not (CT-HARDEN-60).
+	healthy := resp.StatusCode >= http.StatusOK &&
+		resp.StatusCode < http.StatusBadRequest
 
 	result := &HealthResult{
 		Target:    target.Name,
