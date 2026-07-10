@@ -65,6 +65,11 @@ func (c Cap) Validate() error {
 			"are preferred OOM-killer victims (negative would protect " +
 			"the container at the cost of the user manager)")
 	}
+	if c.OOMAdj > 1000 {
+		return fmt.Errorf("oom_score_adj %d exceeds the kernel-valid maximum "+
+			"of 1000 (a write >1000 to /proc/<pid>/oom_score_adj is rejected "+
+			"with EINVAL, so the cap could never be applied)", c.OOMAdj)
+	}
 	return nil
 }
 
@@ -224,10 +229,14 @@ func Default() Policy {
 // parseSize converts compose-style size strings ("128", "512k", "2g") into
 // raw bytes. Suffixes are case-insensitive: k/m/g/t for 1024-based units.
 func parseSize(s string) (uint64, error) {
+	s = strings.TrimSpace(strings.ToLower(s))
+	// Guard AFTER trimming: a whitespace-only input ("  ", "\t") passes an
+	// s == "" check made before the trim, then s[len(s)-1] indexes s[-1] and
+	// panics. Checking the trimmed value returns a clean "empty size" error
+	// instead of crashing (§11.4.1 — a panic is a FAIL-bluff, not an error).
 	if s == "" {
 		return 0, errors.New("empty size")
 	}
-	s = strings.TrimSpace(strings.ToLower(s))
 	mult := uint64(1)
 	switch s[len(s)-1] {
 	case 'k':
