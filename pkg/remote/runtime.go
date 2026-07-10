@@ -97,15 +97,28 @@ func (r *RemoteRuntime) Remove(
 	return err
 }
 
+// statusInspectFormat is the Go template passed to `<runtime> inspect
+// --format` by Status. The health field is GUARDED with
+// `{{if .State.Health}}...{{end}}`: a container created WITHOUT a
+// HEALTHCHECK (the common case) has a nil .State.Health pointer (docker
+// *types.Health / podman *define.HealthCheckResults). An unguarded
+// `{{.State.Health.Status}}` makes the runtime abort the ENTIRE inspect
+// with "nil pointer evaluating ...HealthCheckResults.Status" (exit 125),
+// so Status returns that error and reports nothing at all. The guard emits
+// an empty health field for a no-healthcheck container while still
+// reporting a real health status when a healthcheck IS defined. Every
+// field stays `|`-separated so parseRemoteStatus still sees 7 fields.
+const statusInspectFormat = "{{.Id}}|{{.Name}}|{{.State.Status}}|" +
+	"{{if .State.Health}}{{.State.Health.Status}}{{end}}|" +
+	"{{.State.StartedAt}}|{{.State.FinishedAt}}|{{.State.ExitCode}}"
+
 // Status returns the status of a container on the remote host.
 func (r *RemoteRuntime) Status(
 	ctx context.Context, id string,
 ) (*runtime.ContainerStatus, error) {
 	cmd := fmt.Sprintf(
-		"inspect --format '{{.Id}}|{{.Name}}|{{.State.Status}}|"+
-			"{{.State.Health.Status}}|{{.State.StartedAt}}|"+
-			"{{.State.FinishedAt}}|{{.State.ExitCode}}' %s",
-		shellEscape(id),
+		"inspect --format '%s' %s",
+		statusInspectFormat, shellEscape(id),
 	)
 	result, err := r.exec(ctx, cmd)
 	if err != nil {
