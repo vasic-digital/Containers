@@ -136,6 +136,23 @@ func WithLabels(labels map[string]string) ServiceOption {
 	}
 }
 
+// cloneLabels returns a deep copy of a service's Labels map so that a Service
+// value handed out by an accessor (Get/GetAll/List/Discover) does not alias the
+// registry's internal map. A bare struct copy (`copy := *svc`) duplicates only
+// the map header, leaving both structs pointing at the same backing map — a
+// caller mutating the returned Labels would corrupt stored state and could race
+// a concurrent accessor ranging the same map. Nil-safe: a nil input yields nil.
+func cloneLabels(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
 func (r *ServiceRegistry) Get(name string) (*Service, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -144,6 +161,7 @@ func (r *ServiceRegistry) Get(name string) (*Service, bool) {
 		return nil, false
 	}
 	copy := *svc
+	copy.Labels = cloneLabels(svc.Labels)
 	return &copy, true
 }
 
@@ -173,7 +191,9 @@ func (r *ServiceRegistry) GetAll() map[string]Service {
 	defer r.mu.RUnlock()
 	result := make(map[string]Service, len(r.services))
 	for name, svc := range r.services {
-		result[name] = *svc
+		s := *svc
+		s.Labels = cloneLabels(svc.Labels)
+		result[name] = s
 	}
 	return result
 }
@@ -183,7 +203,9 @@ func (r *ServiceRegistry) List() []Service {
 	defer r.mu.RUnlock()
 	result := make([]Service, 0, len(r.services))
 	for _, svc := range r.services {
-		result = append(result, *svc)
+		s := *svc
+		s.Labels = cloneLabels(svc.Labels)
+		result = append(result, s)
 	}
 	return result
 }
@@ -213,6 +235,7 @@ func (r *ServiceRegistry) Discover(ctx context.Context, name string, defaultPort
 	r.mu.RLock()
 	if svc, ok := r.services[name]; ok {
 		cp := *svc
+		cp.Labels = cloneLabels(svc.Labels)
 		r.mu.RUnlock()
 		return &cp, nil
 	}
