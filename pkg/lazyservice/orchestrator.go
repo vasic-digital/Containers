@@ -225,6 +225,21 @@ func (lo *LazyOrchestrator) StopService(ctx context.Context, name string) error 
 	}
 
 	lo.started[name] = false
+
+	// Reset the one-shot lazy booter so a subsequent StartService
+	// genuinely restarts the service. The lifecycle.LazyBooter created
+	// in RegisterService runs its startFn EXACTLY once; after a stop its
+	// cached first-run success would make EnsureStarted() short-circuit,
+	// turning the next StartService into a silent no-op that invokes no
+	// compose Up yet returns nil — a fabricated success for a service
+	// that is actually down (constitution/Constitution.md §11.4
+	// lifecycle-layer PASS-bluff). Recreating the booter here (under the
+	// same lo.mu hold as every other booter mutation) restores a clean
+	// not-started booter so the service can boot again on demand.
+	lo.booters[name] = lifecycle.NewLazyBooter(func() error {
+		return lo.startServiceInternal(svc)
+	})
+
 	lo.logger.Info("stopped service: %s", name)
 
 	return nil
