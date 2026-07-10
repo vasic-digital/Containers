@@ -227,7 +227,7 @@ func (r *AndroidMatrixRunner) runOne(
 		conditions := MergeNetworkConditions(profile, config.NetworkOverride)
 		if accessor, ok := r.emulator.(adbAccessor); ok {
 			executor, adbPath := accessor.executorAndAdb()
-			serial := fmt.Sprintf("emulator-%d", boot.ConsolePort)
+			serial := fmt.Sprintf("emulator-%d", boot.ADBPort)
 			if applyErr := applyNetworkConditions(ctx, executor, adbPath, serial, conditions); applyErr != nil {
 				fmt.Fprintf(os.Stderr,
 					"[matrix] warning: applyNetworkConditions failed for %s (profile=%q): %v\n",
@@ -277,7 +277,7 @@ func (r *AndroidMatrixRunner) runOne(
 	if !test.Passed && config.CaptureScreenshotOnFailure {
 		if accessor, ok := r.emulator.(adbAccessor); ok {
 			executor, adbPath := accessor.executorAndAdb()
-			serial := fmt.Sprintf("emulator-%d", boot.ConsolePort)
+			serial := fmt.Sprintf("emulator-%d", boot.ADBPort)
 			screenshotPath := filepath.Join(config.EvidenceDir, avd.Name, "screenshot-on-failure.png")
 			if scErr := CaptureScreenshot(ctx, executor, adbPath, serial, screenshotPath); scErr == nil {
 				// Stored relative to EvidenceDir so a packaged

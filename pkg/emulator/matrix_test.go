@@ -1003,7 +1003,7 @@ func TestRunOne_ScreenshotOnFailure(t *testing.T) {
 	pngBytes := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
 	exec := &fakeExecutor{
 		scripts: map[string]fakeScript{
-			"/sdk/platform-tools/adb -s localhost:5554 exec-out screencap -p": {Out: pngBytes},
+			"/sdk/platform-tools/adb -s localhost:5555 exec-out screencap -p": {Out: pngBytes},
 		},
 	}
 	stub := &adbStubEmulator{
@@ -1104,7 +1104,7 @@ func TestRunOne_NoScreenshotOnSuccess(t *testing.T) {
 func TestRunOne_NoScreenshotWhenFlagFalse(t *testing.T) {
 	exec := &fakeExecutor{
 		scripts: map[string]fakeScript{
-			"/sdk/platform-tools/adb -s localhost:5554 exec-out screencap -p": {
+			"/sdk/platform-tools/adb -s localhost:5555 exec-out screencap -p": {
 				Out: []byte("png-bytes"),
 			},
 		},
@@ -1139,7 +1139,7 @@ func TestRunOne_AttestationCarriesNetworkProfileAndScreenshotPath(t *testing.T) 
 	pngBytes := []byte{0x89, 'P', 'N', 'G'}
 	exec := &fakeExecutor{
 		scripts: map[string]fakeScript{
-			"/sdk/platform-tools/adb -s localhost:5554 exec-out screencap -p": {Out: pngBytes},
+			"/sdk/platform-tools/adb -s localhost:5555 exec-out screencap -p": {Out: pngBytes},
 		},
 	}
 	stub := &adbStubEmulator{
