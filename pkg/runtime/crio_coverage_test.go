@@ -416,7 +416,7 @@ func TestParseCrioVersion_InvalidJSON(t *testing.T) {
 }
 
 func TestParseCrioPods_InvalidJSON(t *testing.T) {
-	_, err := parseCrioPods([]byte("not-json"))
+	_, err := parseCrioPods([]byte("not-json"), ListFilter{})
 	assert.Error(t, err)
 }
 

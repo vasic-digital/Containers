@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"sync"
 )
 
 // RuntimeFactory creates container runtimes. This allows dependency injection
@@ -12,14 +13,27 @@ type RuntimeFactory func() []ContainerRuntime
 // RuntimePriority defines the order of runtime detection.
 // Podman is preferred over Docker for its rootless capabilities.
 // Containerd/nerdctl is preferred for Kubernetes-native environments.
-var RuntimePriority = []string{
-	"podman",
-	"docker",
-	"nerdctl",
-	"cri-o",
-	"lxd",
-	"kubernetes",
-}
+//
+// Access it through GetRuntimePriority / SetRuntimePriority, which serialise
+// reads and writes under priorityMu. AutoDetect consults the current value, so
+// SetRuntimePriority genuinely reorders subsequent AutoDetect calls.
+var (
+	priorityMu      sync.RWMutex
+	RuntimePriority = []string{
+		"podman",
+		"docker",
+		"nerdctl",
+		"cri-o",
+		"lxd",
+		"kubernetes",
+	}
+)
+
+// detectFactory produces the runtime set the public detection path
+// (AutoDetect / AutoDetectWithPriority) considers. It defaults to
+// defaultRuntimeFactory; tests swap it to inject fakes so the priority-honouring
+// path is unit-testable without a real container runtime on the host.
+var detectFactory RuntimeFactory = defaultRuntimeFactory
 
 // defaultRuntimeFactory creates the standard set of container runtimes
 // in priority order: Podman → Docker → nerdctl → CRI-O → LXD → Kubernetes
@@ -64,17 +78,20 @@ func detectAllWith(
 	return available
 }
 
-// AutoDetect tries runtimes in priority order:
-// Podman → Docker → nerdctl → CRI-O → LXD → Kubernetes
-// Returns the first available container runtime.
+// AutoDetect tries runtimes in the current RuntimePriority order (default:
+// Podman → Docker → nerdctl → CRI-O → LXD → Kubernetes) and returns the first
+// available container runtime. It honours SetRuntimePriority — previously it
+// ignored RuntimePriority and always used the hardcoded factory order, so
+// SetRuntimePriority had no effect on AutoDetect despite documenting that it
+// would.
 func AutoDetect(ctx context.Context) (ContainerRuntime, error) {
-	return autoDetectWith(ctx, defaultRuntimeFactory())
+	return AutoDetectWithPriority(ctx, GetRuntimePriority())
 }
 
 // AutoDetectWithPriority tries runtimes in the specified priority order.
 // If a runtime is not in the priority list, it's tried last.
 func AutoDetectWithPriority(ctx context.Context, priority []string) (ContainerRuntime, error) {
-	runtimes := defaultRuntimeFactory()
+	runtimes := detectFactory()
 
 	// Reorder runtimes based on priority
 	ordered := make([]ContainerRuntime, 0, len(runtimes))
@@ -133,13 +150,17 @@ func DetectByPriority(ctx context.Context, priority []string) []ContainerRuntime
 	return ordered
 }
 
-// GetRuntimePriority returns the default runtime priority list.
+// GetRuntimePriority returns a copy of the current runtime priority list.
 func GetRuntimePriority() []string {
+	priorityMu.RLock()
+	defer priorityMu.RUnlock()
 	return append([]string{}, RuntimePriority...)
 }
 
 // SetRuntimePriority sets a custom runtime priority order.
 // This affects all subsequent AutoDetect calls.
 func SetRuntimePriority(priority []string) {
+	priorityMu.Lock()
+	defer priorityMu.Unlock()
 	RuntimePriority = append([]string{}, priority...)
 }

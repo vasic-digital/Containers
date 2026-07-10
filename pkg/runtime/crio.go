@@ -161,7 +161,7 @@ func (c *CRIORuntime) List(ctx context.Context, filter ListFilter) ([]ContainerI
 	if err != nil {
 		return nil, fmt.Errorf("crictl pods: %w", err)
 	}
-	return parseCrioPods(out)
+	return parseCrioPods(out, filter)
 }
 
 type crioPod struct {
@@ -172,22 +172,70 @@ type crioPod struct {
 	CreatedAt int64             `json:"createdAt"`
 }
 
-func parseCrioPods(data []byte) ([]ContainerInfo, error) {
+// parseCrioPods converts crictl pod JSON into ContainerInfo, applying the
+// caller's ListFilter. Previously it ignored filter.Names / filter.Labels /
+// filter.Status entirely and returned EVERY pod, so a caller asking for one
+// service by name got the whole cluster's pods back — the sibling LXD/Docker
+// runtimes honour these filters. Name matching is substring (like parseLXDList)
+// and label matching requires every filter label to be present with an equal
+// value.
+func parseCrioPods(data []byte, filter ListFilter) ([]ContainerInfo, error) {
 	var pods []crioPod
 	if err := json.Unmarshal(data, &pods); err != nil {
 		return nil, fmt.Errorf("parsing crictl pods output: %w", err)
 	}
 
-	result := make([]ContainerInfo, len(pods))
-	for i, pod := range pods {
-		result[i] = ContainerInfo{
+	var result []ContainerInfo
+	for _, pod := range pods {
+		state := mapCrioState(pod.State)
+
+		if len(filter.Status) > 0 {
+			matched := false
+			for _, s := range filter.Status {
+				if s == state {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+
+		if len(filter.Names) > 0 {
+			matched := false
+			for _, name := range filter.Names {
+				if strings.Contains(pod.Name, name) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+
+		if len(filter.Labels) > 0 {
+			matched := true
+			for k, v := range filter.Labels {
+				if pod.Labels[k] != v {
+					matched = false
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+
+		result = append(result, ContainerInfo{
 			ID:      pod.ID,
 			Name:    pod.Name,
-			State:   mapCrioState(pod.State),
+			State:   state,
 			Status:  pod.State,
 			Labels:  pod.Labels,
 			Created: time.Unix(0, pod.CreatedAt),
-		}
+		})
 	}
 	return result, nil
 }
