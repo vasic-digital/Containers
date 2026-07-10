@@ -25,9 +25,12 @@ func scheduleResourceAware(
 
 	var candidates []hostScore
 
-	// Score local host if snapshot exists.
-	if snap, ok := snapshots[localName]; ok {
-
+	// Score local host if a snapshot exists AND it satisfies the required
+	// labels. The local host carries no labels, so a request that requires
+	// any label must NOT land on it — the remote-host loop below already
+	// gates on labelsMatch, and skipping the same gate here let a labelled
+	// request (e.g. gpu=true) be placed on an unlabelled local host.
+	if snap, ok := snapshots[localName]; ok && labelsMatch(nil, req.Labels) {
 		if scorer.CanFit(snap, req) {
 			score := scorer.Score(snap, req)
 
@@ -35,8 +38,6 @@ func scheduleResourceAware(
 				name:  localName,
 				score: score,
 			})
-		} else {
-
 		}
 	}
 
@@ -102,16 +103,22 @@ func scheduleResourceAware(
 	}
 }
 
-// roundRobinCounter is a package-level counter for round-robin.
-var roundRobinCounter atomic.Uint64
-
-// scheduleRoundRobin distributes containers evenly across hosts.
+// scheduleRoundRobin distributes containers evenly across hosts. The
+// round-robin counter is per-scheduler (passed in), not a package global —
+// two independent schedulers must not share one rotation, which would
+// desynchronise each one's fair distribution.
 func scheduleRoundRobin(
 	hosts []remote.RemoteHost,
 	req ContainerRequirements,
 	localName string,
+	counter *atomic.Uint64,
 ) PlacementDecision {
-	allNames := []string{localName}
+	var allNames []string
+	// The local host carries no labels; include it only for label-free
+	// requests (labelsMatch(nil, req.Labels) is true iff req.Labels is empty).
+	if labelsMatch(nil, req.Labels) {
+		allNames = append(allNames, localName)
+	}
 	for _, h := range hosts {
 		if labelsMatch(h.Labels, req.Labels) {
 			allNames = append(allNames, h.Name)
@@ -126,7 +133,7 @@ func scheduleRoundRobin(
 		}
 	}
 
-	idx := roundRobinCounter.Add(1) - 1
+	idx := counter.Add(1) - 1
 	selected := allNames[idx%uint64(len(allNames))]
 
 	return PlacementDecision{
@@ -186,7 +193,11 @@ func scheduleSpread(
 	localName string,
 	existing map[string]int,
 ) PlacementDecision {
-	allNames := []string{localName}
+	var allNames []string
+	// Local host carries no labels: include only for label-free requests.
+	if labelsMatch(nil, req.Labels) {
+		allNames = append(allNames, localName)
+	}
 	for _, h := range hosts {
 		if labelsMatch(h.Labels, req.Labels) {
 			allNames = append(allNames, h.Name)
@@ -233,7 +244,8 @@ func scheduleBinPack(
 
 	var candidates []candidate
 
-	if snap, ok := snapshots[localName]; ok {
+	// Local host carries no labels: include only for label-free requests.
+	if snap, ok := snapshots[localName]; ok && labelsMatch(nil, req.Labels) {
 		if scorer.CanFit(snap, req) {
 			candidates = append(candidates, candidate{
 				name: localName,

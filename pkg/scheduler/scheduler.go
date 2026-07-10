@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"digital.vasic.containers/pkg/logging"
 	"digital.vasic.containers/pkg/remote"
@@ -44,7 +45,18 @@ type DefaultScheduler struct {
 	// read and map write" — not just a benign data race.
 	mu         sync.Mutex
 	placements map[string]int // host -> container count
+	// rrCounter is this scheduler's own round-robin rotation. It is
+	// per-instance (not a package global) so two independent schedulers do
+	// not share one counter and desynchronise each other's fair rotation.
+	rrCounter atomic.Uint64
 }
+
+// minSelectedScore is the floor applied to a selected placement's score.
+// The distribution layer (pkg/distribution) treats Score==0 as the "no host
+// found" sentinel and drops the container as failed, so a genuinely selected
+// but resource-saturated host — whose score can clamp to exactly 0 — must
+// report a tiny positive score instead, keeping Score==0 unambiguous.
+const minSelectedScore = 1e-4
 
 // NewScheduler creates a DefaultScheduler.
 func NewScheduler(
@@ -146,42 +158,68 @@ func (s *DefaultScheduler) Rebalance(
 	return plan, nil
 }
 
+// Release decrements the placement counter for a host, reflecting a container
+// that has been removed / undistributed. StrategySpread places each new
+// container on the least-loaded host by reading s.placements; without a
+// decrement the counter only ever grows, so spread keeps steering away from a
+// host that has long since been drained. Release is a method on the concrete
+// *DefaultScheduler rather than part of the Scheduler interface — adding a
+// method to the interface would break external implementers; lifecycle-aware
+// callers hold the concrete type.
+func (s *DefaultScheduler) Release(hostName string) {
+	if hostName == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.placements[hostName] > 0 {
+		s.placements[hostName]--
+	}
+}
+
 func (s *DefaultScheduler) scheduleOne(
 	snapshots map[string]*remote.HostResources,
 	hosts []remote.RemoteHost,
 	req ContainerRequirements,
 ) PlacementDecision {
+	var decision PlacementDecision
 	switch s.opts.Strategy {
 	case StrategyRoundRobin:
-		return scheduleRoundRobin(
-			hosts, req, s.opts.LocalHostName,
+		decision = scheduleRoundRobin(
+			hosts, req, s.opts.LocalHostName, &s.rrCounter,
 		)
 	case StrategyAffinity:
-		return scheduleAffinity(
+		decision = scheduleAffinity(
 			s.scorer, snapshots, hosts, req,
 		)
 	case StrategySpread:
-		return scheduleSpread(
+		decision = scheduleSpread(
 			snapshots, hosts, req,
 			s.opts.LocalHostName, s.placements,
 		)
 	case StrategyBinPack:
-		return scheduleBinPack(
+		decision = scheduleBinPack(
 			s.scorer, snapshots, hosts, req,
 			s.opts.LocalHostName,
 		)
 	case StrategyGPUAffinity:
 		host, reason := pickGPUAffinity(snapshots, req, s.scorer)
-		return PlacementDecision{
+		decision = PlacementDecision{
 			Requirement: req,
 			HostName:    host,
 			Score:       s.scorer.Score(snapshots[host], req),
 			Reason:      reason,
 		}
 	default:
-		return scheduleResourceAware(
+		decision = scheduleResourceAware(
 			s.scorer, snapshots, hosts, req,
 			s.opts.LocalHostName,
 		)
 	}
+
+	// A selected host must never report Score==0 (see minSelectedScore).
+	if decision.HostName != "" && decision.Score == 0 {
+		decision.Score = minSelectedScore
+	}
+	return decision
 }
