@@ -140,18 +140,40 @@ func (m *DefaultVolumeManager) Unmount(
 	}
 	m.mu.Unlock()
 
-	host, _ := m.hostManager.GetHost(info.Mount.HostName)
-	if host != nil {
-		switch info.Mount.Type {
-		case MountSSHFS:
-			_ = m.sshfs.Unmount(ctx, *host, info.Mount)
-		case MountNFS:
-			_ = m.nfs.Unmount(ctx, *host, info.Mount)
-		}
+	host, err := m.hostManager.GetHost(info.Mount.HostName)
+	if err != nil {
+		return fmt.Errorf("get host %s: %w", info.Mount.HostName, err)
+	}
+	if host == nil {
+		// The host is gone, so the remote unmount cannot run. Report this
+		// honestly rather than marking the volume unmounted (it may still be
+		// mounted on a host we lost track of) — a false "unmounted" success is
+		// a §11.4 bluff, and UnmountAll must be able to surface it.
+		return fmt.Errorf("host %s not found", info.Mount.HostName)
 	}
 
+	var unmountErr error
+	switch info.Mount.Type {
+	case MountSSHFS:
+		unmountErr = m.sshfs.Unmount(ctx, *host, info.Mount)
+	case MountNFS:
+		unmountErr = m.nfs.Unmount(ctx, *host, info.Mount)
+	}
+	if unmountErr != nil {
+		// The remote unmount failed (busy, unreachable). Do NOT drop the entry
+		// or claim success — record the failure and propagate so UnmountAll and
+		// the caller see it.
+		m.mu.Lock()
+		info.State = MountFailed
+		info.Error = unmountErr.Error()
+		m.mu.Unlock()
+		return fmt.Errorf("unmount %q: %w", name, unmountErr)
+	}
+
+	// Success: remove the entry so the name is reusable and the map does not
+	// grow unbounded across mount/unmount churn.
 	m.mu.Lock()
-	info.State = MountUnmounted
+	delete(m.mounts, name)
 	m.mu.Unlock()
 
 	m.logger.Info("unmounted %s", name)

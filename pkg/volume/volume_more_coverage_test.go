@@ -157,9 +157,11 @@ func TestSync_RsyncError(t *testing.T) {
 
 // --- Unmount branch coverage ---
 
-// TestUnmount_NilHost exercises the branch where Unmount finds the mount
-// but the host manager returns nil — the unmount proceeds without calling
-// the underlying sshfs/nfs unmount.
+// TestUnmount_NilHost exercises the branch where Unmount finds the mount but
+// the host manager returns nil (the host vanished). DEFECT-2: this is an
+// honest failure — the remote unmount cannot run, so Unmount MUST return an
+// error and MUST NOT drop the entry or falsely mark it unmounted (it may still
+// be mounted on a host we lost track of). Previously it silently succeeded.
 func TestUnmount_NilHost(t *testing.T) {
 	hm := &moreVolHostMgr{hosts: map[string]remote.RemoteHost{
 		"host-1": {Name: "host-1", Address: "10.0.0.1", User: "u", Port: 22},
@@ -177,10 +179,13 @@ func TestUnmount_NilHost(t *testing.T) {
 	hm.nilHost = true
 
 	err := mgr.Unmount(context.Background(), "sshfs-nil-host")
-	assert.NoError(t, err)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not found")
 
-	info, _ := mgr.Status("sshfs-nil-host")
-	assert.Equal(t, MountUnmounted, info.State)
+	// The entry is preserved (not silently dropped, not falsely unmounted).
+	info, e := mgr.Status("sshfs-nil-host")
+	require.NoError(t, e)
+	assert.Equal(t, MountMounted, info.State)
 }
 
 // TestUnmount_NFS_WithHost exercises the NFS unmount branch in Unmount when
@@ -199,10 +204,12 @@ func TestUnmount_NFS_WithHost(t *testing.T) {
 	require.NoError(t, mgr.Mount(context.Background(), mount))
 
 	err := mgr.Unmount(context.Background(), "nfs-unmount-test")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
-	info, _ := mgr.Status("nfs-unmount-test")
-	assert.Equal(t, MountUnmounted, info.State)
+	// DEFECT-1: a successful unmount removes the entry so the name is reusable
+	// and the map does not grow unbounded — Status now reports it as gone.
+	_, e := mgr.Status("nfs-unmount-test")
+	assert.Error(t, e)
 }
 
 // --- UnmountAll error branch ---

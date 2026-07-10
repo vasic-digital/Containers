@@ -36,7 +36,7 @@ func (m *NFSMounter) Mount(
 	mount VolumeMount,
 ) error {
 	// Create the remote mount point.
-	mkdirCmd := fmt.Sprintf("mkdir -p %s", mount.RemotePath)
+	mkdirCmd := fmt.Sprintf("mkdir -p %s", shellQuote(mount.RemotePath))
 	result, err := m.executor.Execute(ctx, host, mkdirCmd)
 	if err != nil {
 		return fmt.Errorf(
@@ -57,8 +57,9 @@ func (m *NFSMounter) Mount(
 	}
 	nfsCmd := fmt.Sprintf(
 		"mount -t %s %s:%s %s",
-		mountOpts, mount.LocalPath, mount.LocalPath,
-		mount.RemotePath,
+		mountOpts,
+		shellQuote(mount.LocalPath), shellQuote(mount.LocalPath),
+		shellQuote(mount.RemotePath),
 	)
 
 	m.logger.Info("nfs mount on %s: %s",
@@ -87,7 +88,7 @@ func (m *NFSMounter) Unmount(
 	host remote.RemoteHost,
 	mount VolumeMount,
 ) error {
-	cmd := fmt.Sprintf("umount %s", mount.RemotePath)
+	cmd := fmt.Sprintf("umount %s", shellQuote(mount.RemotePath))
 	result, err := m.executor.Execute(ctx, host, cmd)
 	if err != nil {
 		return fmt.Errorf(

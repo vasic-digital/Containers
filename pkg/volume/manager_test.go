@@ -244,8 +244,11 @@ func TestDefaultVolumeManager_Unmount(t *testing.T) {
 	err := mgr.Unmount(context.Background(), "data")
 	require.NoError(t, err)
 
-	info, _ := mgr.Status("data")
-	assert.Equal(t, MountUnmounted, info.State)
+	// After a successful unmount the entry is removed so the name is reusable
+	// and the mounts map does not grow unbounded (DEFECT-1: it previously
+	// lingered as MountUnmounted, blocking any re-mount of the same name).
+	_, statErr := mgr.Status("data")
+	assert.Error(t, statErr)
 }
 
 func TestDefaultVolumeManager_Unmount_NotFound(t *testing.T) {

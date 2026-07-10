@@ -37,7 +37,7 @@ func (m *SSHFSMounter) Mount(
 	mount VolumeMount,
 ) error {
 	// Create the remote mount point.
-	mkdirCmd := fmt.Sprintf("mkdir -p %s", mount.RemotePath)
+	mkdirCmd := fmt.Sprintf("mkdir -p %s", shellQuote(mount.RemotePath))
 	result, err := m.executor.Execute(ctx, host, mkdirCmd)
 	if err != nil {
 		return fmt.Errorf(
@@ -63,8 +63,8 @@ func (m *SSHFSMounter) Mount(
 	// the remote host, or use a reverse tunnel.
 	sshfsCmd := fmt.Sprintf("%s %s %s",
 		strings.Join(sshfsArgs, " "),
-		mount.LocalPath,
-		mount.RemotePath,
+		shellQuote(mount.LocalPath),
+		shellQuote(mount.RemotePath),
 	)
 
 	m.logger.Info("sshfs mount on %s: %s",
@@ -93,7 +93,7 @@ func (m *SSHFSMounter) Unmount(
 	host remote.RemoteHost,
 	mount VolumeMount,
 ) error {
-	cmd := fmt.Sprintf("fusermount -u %s", mount.RemotePath)
+	cmd := fmt.Sprintf("fusermount -u %s", shellQuote(mount.RemotePath))
 	result, err := m.executor.Execute(ctx, host, cmd)
 	if err != nil {
 		return fmt.Errorf(

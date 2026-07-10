@@ -37,7 +37,7 @@ func (r *RsyncSyncer) Sync(
 	mount VolumeMount,
 ) error {
 	// Ensure remote directory exists.
-	mkdirCmd := fmt.Sprintf("mkdir -p %s", mount.RemotePath)
+	mkdirCmd := fmt.Sprintf("mkdir -p %s", shellQuote(mount.RemotePath))
 	result, err := r.executor.Execute(ctx, host, mkdirCmd)
 	if err != nil {
 		return fmt.Errorf(
@@ -65,12 +65,17 @@ func (r *RsyncSyncer) Sync(
 
 	// Run rsync via the remote executor. The remote host pulls
 	// from the local host using rsync over SSH.
+	// NOTE: the source host is host.Address (the remote host itself), so this
+	// rsyncs the remote's own LocalPath rather than pushing the local
+	// orchestrator's files — a separate tracked defect (needs a local-host
+	// identity threaded through config). The path quoting here closes the
+	// shell-injection / word-splitting vector regardless of that.
 	pullCmd := fmt.Sprintf(
 		"rsync %s %s@%s:%s/ %s/",
 		strings.Join(flags, " "),
 		host.User, host.Address,
-		mount.LocalPath,
-		mount.RemotePath,
+		shellQuote(mount.LocalPath),
+		shellQuote(mount.RemotePath),
 	)
 
 	result, err = r.executor.Execute(ctx, host, pullCmd)
