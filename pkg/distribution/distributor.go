@@ -122,7 +122,13 @@ func (d *DefaultDistributor) Distribute(
 	}
 
 	summary.Duration = time.Since(start)
-	summary.Containers = containers
+	// Hand the caller an INDEPENDENT copy: d.containers keeps the original
+	// backing array (which Undistribute() mutates under d.mu), so a caller
+	// iterating the returned summary never aliases d.containers — no
+	// cross-goroutine read/write race on an escaped summary, and
+	// Undistribute() can never retroactively flip a previously-returned
+	// summary's State (CT-HARDEN-DIST-2, escaped-alias half).
+	summary.Containers = append([]DistributedContainer(nil), containers...)
 
 	d.mu.Lock()
 	d.containers = containers
@@ -142,14 +148,20 @@ func (d *DefaultDistributor) Distribute(
 func (d *DefaultDistributor) Undistribute(
 	ctx context.Context,
 ) error {
+	// Mark the detached containers Stopped while STILL holding the lock:
+	// mutating them after Unlock raced with any in-package reader (e.g.
+	// HealthCheckAll) that had captured the same live backing array via
+	// d.containers (CT-HARDEN-DIST-2). The escaped-summary alias is handled
+	// separately by the copy-on-publish in Distribute(), so a returned
+	// summary never shares this backing array. Same intent, in-package race
+	// closed.
 	d.mu.Lock()
 	containers := d.containers
-	d.containers = nil
-	d.mu.Unlock()
-
 	for i := range containers {
 		containers[i].State = StateStopped
 	}
+	d.containers = nil
+	d.mu.Unlock()
 
 	// Close tunnels.
 	if d.opts.TunnelManager != nil {
@@ -185,8 +197,12 @@ func (d *DefaultDistributor) Status(
 func (d *DefaultDistributor) HealthCheckAll(
 	ctx context.Context,
 ) map[string]error {
+	// Copy under the read-lock (mirrors Status()) so the loop reads an
+	// independent backing array, never the live d.containers that
+	// Undistribute() mutates — no cross-method data race (CT-HARDEN-DIST-2).
 	d.mu.RLock()
-	containers := d.containers
+	containers := make([]DistributedContainer, len(d.containers))
+	copy(containers, d.containers)
 	d.mu.RUnlock()
 
 	errors := make(map[string]error)
@@ -197,6 +213,17 @@ func (d *DefaultDistributor) HealthCheckAll(
 		// Basic check: verify host is reachable.
 		if d.opts.Executor != nil && dc.HostName != "" &&
 			dc.HostName != "local" {
+			// HostManager may be nil even when Executor is configured (they are
+			// independently settable). Surface an honest error rather than
+			// panicking on GetHost() (CT-HARDEN-DIST-1) — silently skipping the
+			// check would be a §11.4.69 sink-side bluff (a running-but-
+			// unverifiable container reported healthy).
+			if d.opts.HostManager == nil {
+				errors[dc.Requirement.Name] = fmt.Errorf(
+					"host manager not configured",
+				)
+				continue
+			}
 			host, err := d.opts.HostManager.GetHost(dc.HostName)
 			if err != nil || host == nil {
 				errors[dc.Requirement.Name] = fmt.Errorf(
@@ -373,6 +400,13 @@ func (d *DefaultDistributor) deployRemote(
 ) error {
 	if d.opts.Executor == nil {
 		return fmt.Errorf("no remote executor configured")
+	}
+	// HostManager is an independently-settable Option (options.go); a caller
+	// can configure Executor without HostManager. Guard exactly like
+	// HostStatus() does — GetHost() on a nil interface panics
+	// (CT-HARDEN-DIST-1).
+	if d.opts.HostManager == nil {
+		return fmt.Errorf("no host manager configured")
 	}
 
 	host, err := d.opts.HostManager.GetHost(dc.HostName)
