@@ -111,10 +111,20 @@ func (p *ConnectionPool) Acquire(
 	)
 
 	args := p.masterArgs(host, socketPath)
-	execCtx, cancel := context.WithTimeout(
-		ctx, p.opts.ConnectTimeout,
-	)
-	defer cancel()
+	// Only impose a deadline when ConnectTimeout is positive. A zero
+	// ConnectTimeout means "no artificial deadline" (matching the
+	// KeepAlive/CommandTimeout 0=disable convention and ssh's own
+	// `-o ConnectTimeout=0` = no-limit); passing 0 to context.WithTimeout
+	// would produce an ALREADY-EXPIRED context that cancels every dial
+	// immediately, making the pool permanently unusable when a caller
+	// explicitly requests ConnectTimeout=0. Mirrors the CommandTimeout
+	// guard in SSHExecutor.Execute.
+	execCtx := ctx
+	if p.opts.ConnectTimeout > 0 {
+		var cancel context.CancelFunc
+		execCtx, cancel = context.WithTimeout(ctx, p.opts.ConnectTimeout)
+		defer cancel()
+	}
 
 	// Blocking dial runs WITHOUT the pool mutex held.
 	_, stderr, err := iexec.Run(execCtx, "ssh", args...)

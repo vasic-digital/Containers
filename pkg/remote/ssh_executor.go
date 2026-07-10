@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"digital.vasic.containers/pkg/logging"
@@ -448,6 +449,15 @@ type streamReader struct {
 	reader io.ReadCloser
 	pool   *ConnectionPool
 	host   RemoteHost
+
+	// closeOnce makes Close idempotent: the pooled ControlMaster ref must be
+	// Released EXACTLY once per stream and cmd.Wait() called at most once, even
+	// when an io.Closer consumer calls Close() more than once (belt-and-
+	// suspenders `defer rc.Close()` + an explicit Close). A second unguarded
+	// Close would double-decrement the pool ref-count (underflow below 0,
+	// corrupting the leak-detection oracle) and hit "Wait was already called".
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (r *streamReader) Read(p []byte) (int, error) {
@@ -455,10 +465,12 @@ func (r *streamReader) Read(p []byte) (int, error) {
 }
 
 func (r *streamReader) Close() error {
-	_ = r.reader.Close()
-	err := r.cmd.Wait()
-	if r.pool != nil {
-		r.pool.Release(r.host)
-	}
-	return err
+	r.closeOnce.Do(func() {
+		_ = r.reader.Close()
+		r.closeErr = r.cmd.Wait()
+		if r.pool != nil {
+			r.pool.Release(r.host)
+		}
+	})
+	return r.closeErr
 }
