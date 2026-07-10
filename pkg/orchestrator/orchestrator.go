@@ -168,6 +168,84 @@ type startedService struct {
 	composeAbs string
 }
 
+// computeStartLevels orders services into dependency waves: level 0 holds the
+// services with no dependency, level N holds services all of whose declared
+// dependencies live in earlier levels. Services within a level are independent
+// and boot concurrently. It fails fast — BEFORE any service is started — on an
+// unknown dependency name or a dependency cycle (a self-dependency is a
+// one-node cycle), so a cycle can never reach the goroutine boot, where a
+// dependent waiting on its prerequisite would deadlock instead of erroring.
+// A name may map to several services; a dependency on that name must precede
+// ALL of them. With no dependencies declared, every service lands in level 0 —
+// identical to an unordered concurrent boot.
+func computeStartLevels(services []Service) ([][]Service, error) {
+	n := len(services)
+	byName := make(map[string][]int, n)
+	for i, s := range services {
+		byName[s.Name] = append(byName[s.Name], i)
+	}
+
+	indeg := make([]int, n)
+	dependents := make([][]int, n) // prerequisite index -> services depending on it
+	for i, s := range services {
+		for _, dep := range s.Dependencies {
+			prereqs, ok := byName[dep]
+			if !ok {
+				return nil, fmt.Errorf("service %q depends on unknown service %q", s.Name, dep)
+			}
+			for _, p := range prereqs {
+				dependents[p] = append(dependents[p], i)
+				indeg[i]++
+			}
+		}
+	}
+
+	placed := make([]bool, n)
+	var levels [][]Service
+	remaining := n
+	for remaining > 0 {
+		var level []Service
+		var levelIdx []int
+		for i := 0; i < n; i++ {
+			if !placed[i] && indeg[i] == 0 {
+				level = append(level, services[i])
+				levelIdx = append(levelIdx, i)
+			}
+		}
+		if len(level) == 0 {
+			var unresolved []string
+			for i := 0; i < n; i++ {
+				if !placed[i] {
+					unresolved = append(unresolved, services[i].Name)
+				}
+			}
+			return nil, fmt.Errorf("dependency cycle among services: %v", unresolved)
+		}
+		for _, i := range levelIdx {
+			placed[i] = true
+			remaining--
+		}
+		for _, i := range levelIdx {
+			for _, d := range dependents[i] {
+				indeg[d]--
+			}
+		}
+		levels = append(levels, level)
+	}
+	return levels, nil
+}
+
+// dependencyFailed reports whether any of svc's declared dependencies already
+// failed to start (or was itself skipped for a failed dependency).
+func dependencyFailed(svc Service, failed map[string]bool) bool {
+	for _, dep := range svc.Dependencies {
+		if failed[dep] {
+			return true
+		}
+	}
+	return false
+}
+
 func (o *DefaultOrchestrator) StartAll(ctx context.Context) error {
 	// Snapshot the service list + config under the lock, then release it BEFORE
 	// the blocking boot. Holding o.mu across container/SSH/compose operations
@@ -183,63 +261,94 @@ func (o *DefaultOrchestrator) StartAll(ctx context.Context) error {
 
 	o.logger.Info("orchestrator: starting %d services (remote=%v)", len(services), remoteEnabled)
 
+	// Order into dependency waves and fail fast on an unknown dependency or a
+	// cycle before starting anything (a cycle must never reach the goroutine
+	// boot, where it would deadlock rather than error).
+	levels, err := computeStartLevels(services)
+	if err != nil {
+		return fmt.Errorf("orchestrator: %w", err)
+	}
+
 	type startOutcome struct {
 		svc        Service
 		composeAbs string
 		err        error
 	}
 
-	var wg sync.WaitGroup
-	resultChan := make(chan startOutcome, len(services))
-
-	for _, svc := range services {
-		composePath := svc.ComposeFile
-		if !filepath.IsAbs(composePath) {
-			composePath = filepath.Join(projectDir, composePath)
-		}
-
-		if _, err := os.Stat(composePath); os.IsNotExist(err) {
-			o.logger.Debug("orchestrator: skipping %s (file not found)", svc.Name)
-			continue
-		}
-
-		wg.Add(1)
-		go func(s Service, composeAbs string) {
-			defer wg.Done()
-
-			o.logger.Info("orchestrator: starting %s", s.Name)
-
-			var err error
-			if remoteEnabled {
-				err = o.startRemote(ctx, s, composeAbs)
-				if err != nil {
-					o.logger.Warn("orchestrator: remote start failed for %s: %v", s.Name, err)
-					err = o.startLocal(ctx, s, composeAbs)
-				}
-			} else {
-				err = o.startLocal(ctx, s, composeAbs)
-			}
-
-			resultChan <- startOutcome{svc: s, composeAbs: composeAbs, err: err}
-		}(svc, composePath)
-	}
-
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
+	failedNames := make(map[string]bool)
 	var failures []error
 	var started []startedService
-	for r := range resultChan {
-		if r.err != nil {
-			o.logger.Warn("orchestrator: failed to start %s: %v", r.svc.Name, r.err)
-			if r.svc.Required {
-				failures = append(failures, fmt.Errorf("required service %s failed: %w", r.svc.Name, r.err))
+
+	for _, level := range levels {
+		var wg sync.WaitGroup
+		resultChan := make(chan startOutcome, len(level))
+
+		for _, svc := range level {
+			// A service whose dependency already failed/was skipped cannot come
+			// up correctly: skip its start, and treat the skip as this service's
+			// own failure both for the Required gate and for ITS dependents.
+			if dependencyFailed(svc, failedNames) {
+				o.logger.Warn("orchestrator: skipping %s (dependency failed)", svc.Name)
+				failedNames[svc.Name] = true
+				if svc.Required {
+					failures = append(failures, fmt.Errorf("required service %s skipped: dependency failed", svc.Name))
+				}
+				continue
 			}
-		} else {
-			o.logger.Info("orchestrator: started %s", r.svc.Name)
-			started = append(started, startedService{svc: r.svc, composeAbs: r.composeAbs})
+
+			composePath := svc.ComposeFile
+			if !filepath.IsAbs(composePath) {
+				composePath = filepath.Join(projectDir, composePath)
+			}
+
+			if _, statErr := os.Stat(composePath); os.IsNotExist(statErr) {
+				// A missing compose file is a benign "not configured here" skip
+				// (unchanged from the pre-dependency boot): it is intentionally
+				// NOT recorded in failedNames, so a service depending on a
+				// missing-file service still starts — a missing file means "this
+				// service isn't part of this deployment", not "its dependency
+				// failed". A dependency whose Up genuinely FAILS does cascade.
+				o.logger.Debug("orchestrator: skipping %s (file not found)", svc.Name)
+				continue
+			}
+
+			wg.Add(1)
+			go func(s Service, composeAbs string) {
+				defer wg.Done()
+
+				o.logger.Info("orchestrator: starting %s", s.Name)
+
+				var startErr error
+				if remoteEnabled {
+					startErr = o.startRemote(ctx, s, composeAbs)
+					if startErr != nil {
+						o.logger.Warn("orchestrator: remote start failed for %s: %v", s.Name, startErr)
+						startErr = o.startLocal(ctx, s, composeAbs)
+					}
+				} else {
+					startErr = o.startLocal(ctx, s, composeAbs)
+				}
+
+				resultChan <- startOutcome{svc: s, composeAbs: composeAbs, err: startErr}
+			}(svc, composePath)
+		}
+
+		go func() {
+			wg.Wait()
+			close(resultChan)
+		}()
+
+		for r := range resultChan {
+			if r.err != nil {
+				o.logger.Warn("orchestrator: failed to start %s: %v", r.svc.Name, r.err)
+				failedNames[r.svc.Name] = true
+				if r.svc.Required {
+					failures = append(failures, fmt.Errorf("required service %s failed: %w", r.svc.Name, r.err))
+				}
+			} else {
+				o.logger.Info("orchestrator: started %s", r.svc.Name)
+				started = append(started, startedService{svc: r.svc, composeAbs: r.composeAbs})
+			}
 		}
 	}
 
