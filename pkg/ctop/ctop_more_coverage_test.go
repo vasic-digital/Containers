@@ -145,8 +145,8 @@ func TestCompactDisplay_Stop(t *testing.T) {
 // TestCompactDisplay_RenderSnapshot verifies the compact display
 // delegates RenderSnapshot to the inner Display correctly.
 func TestCompactDisplay_RenderSnapshot(t *testing.T) {
-	psOutput := `[{"Id":"compact1","Names":["/compact-test"],"Image":"nginx:latest","Created":"2024-01-01T00:00:00Z","State":{"Status":"running","StartedAt":"2024-01-01T00:00:00Z"}}]`
-	statsOutput := `{"CPUPerc":"5.0%","MemUsage":"50MiB / 1GiB","MemPerc":"5.0%","NetIO":"1MiB / 1MiB","BlockIO":"10MiB / 10MiB","PIDs":"1"}`
+	psOutput := `[{"Id":"compact1","Names":["/compact-test"],"Image":"nginx:latest","Created":1704067200,"State":"running","Status":"Up","StartedAt":1704067200}]`
+	statsOutput := `[{"cpu_percent":"5.0%","mem_usage":"50MB / 1GB","mem_percent":"5.0%","net_io":"1MB / 1MB","block_io":"10MB / 10MB","pids":"1"}]`
 
 	exec := &mockExecutor{
 		responses: map[string][]byte{

@@ -10,8 +10,8 @@ import (
 
 // TestDisplay_Render_NoColor exercises the render path with NoColor=true.
 func TestDisplay_Render_NoColor(t *testing.T) {
-	psOutput := `[{"Id":"render1","Names":["/render-test"],"Image":"nginx:latest","Created":"2024-01-01T00:00:00Z","State":{"Status":"running","StartedAt":"2024-01-01T00:00:00Z"}}]`
-	statsOutput := `{"CPUPerc":"10.0%","MemUsage":"100MiB / 1GiB","MemPerc":"10.0%","NetIO":"1MiB / 1MiB","BlockIO":"10MiB / 10MiB","PIDs":"2"}`
+	psOutput := `[{"Id":"render1","Names":["/render-test"],"Image":"nginx:latest","Created":1704067200,"State":"running","Status":"Up","StartedAt":1704067200}]`
+	statsOutput := `[{"cpu_percent":"10.0%","mem_usage":"100MB / 1GB","mem_percent":"10.0%","net_io":"1MB / 1MB","block_io":"10MB / 10MB","pids":"2"}]`
 
 	exec := &mockExecutor{
 		responses: map[string][]byte{
@@ -54,8 +54,8 @@ func TestDisplay_Render_NoContainers(t *testing.T) {
 
 // TestDisplay_Render_WithFilter exercises filter during render.
 func TestDisplay_Render_WithFilter(t *testing.T) {
-	psOutput := `[{"Id":"flt1","Names":["/web-server"],"Image":"nginx:latest","Created":"2024-01-01T00:00:00Z","State":{"Status":"running","StartedAt":"2024-01-01T00:00:00Z"}},{"Id":"flt2","Names":["/db-server"],"Image":"postgres","Created":"2024-01-01T00:00:00Z","State":{"Status":"running","StartedAt":"2024-01-01T00:00:00Z"}}]`
-	statsOutput := `{"CPUPerc":"5.0%","MemUsage":"50MiB / 1GiB","MemPerc":"5.0%","NetIO":"0B / 0B","BlockIO":"0B / 0B","PIDs":"1"}`
+	psOutput := `[{"Id":"flt1","Names":["/web-server"],"Image":"nginx:latest","Created":1704067200,"State":"running","Status":"Up","StartedAt":1704067200},{"Id":"flt2","Names":["/db-server"],"Image":"postgres","Created":1704067200,"State":"running","Status":"Up","StartedAt":1704067200}]`
+	statsOutput := `[{"cpu_percent":"5.0%","mem_usage":"50MB / 1GB","mem_percent":"5.0%","net_io":"0B / 0B","block_io":"0B / 0B","pids":"1"}]`
 
 	exec := &mockExecutor{
 		responses: map[string][]byte{

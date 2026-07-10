@@ -3,7 +3,6 @@ package ctop
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os/exec"
 	"sort"
@@ -253,96 +252,6 @@ func (c *Collector) getContainerStats(ctx context.Context, rt, id string) (*Cont
 	return parseContainerStats(out), nil
 }
 
-func parseContainerList(data []byte, rt, location string) ([]ContainerProcess, error) {
-	var containers []dockerContainerJSON
-
-	if err := json.Unmarshal(data, &containers); err != nil {
-		var single dockerContainerJSON
-		if err := json.Unmarshal(data, &single); err != nil {
-			return nil, fmt.Errorf("parsing container list: %w", err)
-		}
-		containers = []dockerContainerJSON{single}
-	}
-
-	result := make([]ContainerProcess, len(containers))
-	for i, c := range containers {
-		uptime := ""
-		if !c.State.StartedAt.IsZero() {
-			uptime = formatUptime(time.Since(c.State.StartedAt))
-		}
-
-		host := "local"
-		if strings.HasPrefix(location, "remote:") {
-			host = strings.TrimPrefix(location, "remote:")
-		}
-
-		result[i] = ContainerProcess{
-			ID:        shortenID(c.ID),
-			Name:      extractName(c.Names),
-			Image:     c.Image,
-			Runtime:   rt,
-			Host:      host,
-			Location:  location,
-			State:     c.State.Status,
-			Status:    c.State.String,
-			Created:   c.Created,
-			StartedAt: c.State.StartedAt,
-			Uptime:    uptime,
-			Labels:    c.Labels,
-			Ports:     extractPorts(c.Ports),
-		}
-	}
-
-	return result, nil
-}
-
-func parseContainerStats(data []byte) *ContainerProcess {
-	var stats dockerStatsJSON
-	if err := json.Unmarshal(data, &stats); err != nil {
-		return nil
-	}
-
-	return &ContainerProcess{
-		CPUPercent:    parsePercent(stats.CPUPerc),
-		MemoryUsage:   parseMemoryBytes(stats.MemUsage),
-		MemoryLimit:   parseMemoryLimit(stats.MemUsage),
-		MemoryPercent: parsePercent(stats.MemPerc),
-		NetworkRx:     parseNetIO(stats.NetIO, true),
-		NetworkTx:     parseNetIO(stats.NetIO, false),
-		BlockRead:     parseBlockIO(stats.BlockIO, true),
-		BlockWrite:    parseBlockIO(stats.BlockIO, false),
-		PIDs:          parsePIDs(stats.PIDs),
-	}
-}
-
-type dockerContainerJSON struct {
-	ID      string    `json:"Id"`
-	Names   []string  `json:"Names"`
-	Image   string    `json:"Image"`
-	Created time.Time `json:"Created"`
-	State   struct {
-		Status    string    `json:"Status"`
-		String    string    `json:"String"`
-		StartedAt time.Time `json:"StartedAt"`
-	} `json:"State"`
-	Labels map[string]string `json:"Labels"`
-	Ports  []struct {
-		IP          string `json:"IP"`
-		PrivatePort int    `json:"PrivatePort"`
-		PublicPort  int    `json:"PublicPort"`
-		Type        string `json:"Type"`
-	} `json:"Ports"`
-}
-
-type dockerStatsJSON struct {
-	CPUPerc  string `json:"CPUPerc"`
-	MemUsage string `json:"MemUsage"`
-	MemPerc  string `json:"MemPerc"`
-	NetIO    string `json:"NetIO"`
-	BlockIO  string `json:"BlockIO"`
-	PIDs     string `json:"PIDs"`
-}
-
 func shortenID(id string) string {
 	if len(id) > 12 {
 		return id[:12]
@@ -357,21 +266,6 @@ func extractName(names []string) string {
 	name := names[0]
 	name = strings.TrimPrefix(name, "/")
 	return name
-}
-
-func extractPorts(ports []struct {
-	IP          string `json:"IP"`
-	PrivatePort int    `json:"PrivatePort"`
-	PublicPort  int    `json:"PublicPort"`
-	Type        string `json:"Type"`
-}) []string {
-	var result []string
-	for _, p := range ports {
-		if p.PublicPort > 0 {
-			result = append(result, fmt.Sprintf("%d/%s", p.PublicPort, p.Type))
-		}
-	}
-	return result
 }
 
 func parsePercent(s string) float64 {
