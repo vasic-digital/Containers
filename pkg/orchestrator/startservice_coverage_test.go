@@ -93,9 +93,14 @@ func TestDefaultOrchestrator_StartService_RemoteEnabled(t *testing.T) {
 	})
 
 	err := o.StartService(context.Background(), "remote-svc")
-	// May fail because we can't copy dirs in unit tests, but the code path is covered
-	_ = err
-	assert.True(t, executeCalled || err != nil) // Either ran or got an expected error
+	// The stub Execute + CopyDir both succeed, so the remote start path must
+	// complete without error AND must actually have invoked the remote
+	// executor. The previous `executeCalled || err != nil` assertion was a
+	// tautology (the remote path always calls Execute first, so executeCalled
+	// is always true) — it passed whether or not the remote start worked,
+	// §11.4 test-layer anti-bluff.
+	require.NoError(t, err)
+	assert.True(t, executeCalled, "the remote start path must invoke the remote executor")
 }
 
 // startTestComposeOrch is a minimal ComposeOrchestrator mock.

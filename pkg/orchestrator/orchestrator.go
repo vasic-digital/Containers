@@ -161,19 +161,41 @@ func (o *DefaultOrchestrator) AddService(svc Service) {
 	o.services = append(o.services, svc)
 }
 
-func (o *DefaultOrchestrator) StartAll(ctx context.Context) error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
+// startedService records a service StartAll successfully started, so it can be
+// rolled back (compose-down) if a required service later fails mid-boot.
+type startedService struct {
+	svc        Service
+	composeAbs string
+}
 
-	o.logger.Info("orchestrator: starting %d services (remote=%v)", len(o.services), o.remoteEnabled)
+func (o *DefaultOrchestrator) StartAll(ctx context.Context) error {
+	// Snapshot the service list + config under the lock, then release it BEFORE
+	// the blocking boot. Holding o.mu across container/SSH/compose operations
+	// violated MANDATORY PRINCIPLE #2 (no blocking work inside a shared lock):
+	// the whole multi-service boot stalled every other o.mu user — AddService,
+	// ListServices, ServiceCount, StartService, StopAll — until it completed.
+	o.mu.Lock()
+	services := make([]Service, len(o.services))
+	copy(services, o.services)
+	remoteEnabled := o.remoteEnabled
+	projectDir := o.projectDir
+	o.mu.Unlock()
+
+	o.logger.Info("orchestrator: starting %d services (remote=%v)", len(services), remoteEnabled)
+
+	type startOutcome struct {
+		svc        Service
+		composeAbs string
+		err        error
+	}
 
 	var wg sync.WaitGroup
-	errChan := make(chan error, len(o.services))
+	resultChan := make(chan startOutcome, len(services))
 
-	for _, svc := range o.services {
+	for _, svc := range services {
 		composePath := svc.ComposeFile
 		if !filepath.IsAbs(composePath) {
-			composePath = filepath.Join(o.projectDir, composePath)
+			composePath = filepath.Join(projectDir, composePath)
 		}
 
 		if _, err := os.Stat(composePath); os.IsNotExist(err) {
@@ -188,7 +210,7 @@ func (o *DefaultOrchestrator) StartAll(ctx context.Context) error {
 			o.logger.Info("orchestrator: starting %s", s.Name)
 
 			var err error
-			if o.remoteEnabled {
+			if remoteEnabled {
 				err = o.startRemote(ctx, s, composeAbs)
 				if err != nil {
 					o.logger.Warn("orchestrator: remote start failed for %s: %v", s.Name, err)
@@ -198,31 +220,62 @@ func (o *DefaultOrchestrator) StartAll(ctx context.Context) error {
 				err = o.startLocal(ctx, s, composeAbs)
 			}
 
-			if err != nil {
-				o.logger.Warn("orchestrator: failed to start %s: %v", s.Name, err)
-				if s.Required {
-					errChan <- fmt.Errorf("required service %s failed: %w", s.Name, err)
-				}
-			} else {
-				o.logger.Info("orchestrator: started %s", s.Name)
-			}
+			resultChan <- startOutcome{svc: s, composeAbs: composeAbs, err: err}
 		}(svc, composePath)
 	}
 
 	go func() {
 		wg.Wait()
-		close(errChan)
+		close(resultChan)
 	}()
 
-	var errors []error
-	for err := range errChan {
-		errors = append(errors, err)
+	var failures []error
+	var started []startedService
+	for r := range resultChan {
+		if r.err != nil {
+			o.logger.Warn("orchestrator: failed to start %s: %v", r.svc.Name, r.err)
+			if r.svc.Required {
+				failures = append(failures, fmt.Errorf("required service %s failed: %w", r.svc.Name, r.err))
+			}
+		} else {
+			o.logger.Info("orchestrator: started %s", r.svc.Name)
+			started = append(started, startedService{svc: r.svc, composeAbs: r.composeAbs})
+		}
 	}
 
-	if len(errors) > 0 {
-		return fmt.Errorf("orchestrator: %d service(s) failed", len(errors))
+	if len(failures) > 0 {
+		// A required service failed: roll back the services that DID start so a
+		// partial boot does not leave orphaned services running.
+		o.rollback(ctx, started)
+		return fmt.Errorf("orchestrator: %d service(s) failed", len(failures))
 	}
 	return nil
+}
+
+// rollback tears down services that StartAll had already started, used when a
+// required service failed mid-boot. Best-effort local compose-down, matching
+// StopAll's teardown semantics (a Down failure is logged, not surfaced — the
+// StartAll error already reports the boot failure). Services started on remote
+// hosts share StopAll's pre-existing local-only teardown limitation; that gap
+// is tracked separately and is not regressed here.
+func (o *DefaultOrchestrator) rollback(ctx context.Context, started []startedService) {
+	if o.localOrch == nil {
+		return
+	}
+	// Tear down on a context detached from the parent's cancellation: when the
+	// boot failed BECAUSE ctx was canceled/timed out, reusing ctx would make
+	// every rollback Down no-op on an already-dead context, defeating the
+	// rollback exactly when it is most needed. WithoutCancel keeps ctx values
+	// but drops its cancellation.
+	downCtx := context.WithoutCancel(ctx)
+	for _, s := range started {
+		if err := o.localOrch.Down(downCtx, compose.ComposeProject{
+			File:    s.composeAbs,
+			Profile: s.svc.Profile,
+		}); err != nil {
+			o.logger.Warn("orchestrator: rollback down failed for %s: %v", s.svc.Name, err)
+		}
+	}
 }
 
 func (o *DefaultOrchestrator) startLocal(ctx context.Context, svc Service, composePath string) error {
@@ -279,38 +332,60 @@ func (o *DefaultOrchestrator) startRemote(ctx context.Context, svc Service, comp
 }
 
 func (o *DefaultOrchestrator) StartService(ctx context.Context, name string) error {
+	// Resolve the service + config under the lock, then release it BEFORE the
+	// blocking start (MANDATORY PRINCIPLE #2 — no blocking work under o.mu).
 	o.mu.Lock()
-	defer o.mu.Unlock()
-
+	var (
+		target Service
+		found  bool
+	)
 	for _, svc := range o.services {
 		if svc.Name == name {
-			composePath := svc.ComposeFile
-			if !filepath.IsAbs(composePath) {
-				composePath = filepath.Join(o.projectDir, composePath)
-			}
-			if o.remoteEnabled {
-				return o.startRemote(ctx, svc, composePath)
-			}
-			return o.startLocal(ctx, svc, composePath)
+			target = svc
+			found = true
+			break
 		}
 	}
-	return fmt.Errorf("service not found: %s", name)
+	remoteEnabled := o.remoteEnabled
+	projectDir := o.projectDir
+	o.mu.Unlock()
+
+	if !found {
+		return fmt.Errorf("service not found: %s", name)
+	}
+
+	composePath := target.ComposeFile
+	if !filepath.IsAbs(composePath) {
+		composePath = filepath.Join(projectDir, composePath)
+	}
+	if remoteEnabled {
+		return o.startRemote(ctx, target, composePath)
+	}
+	return o.startLocal(ctx, target, composePath)
 }
 
 func (o *DefaultOrchestrator) StopAll(ctx context.Context) error {
+	// Snapshot the service list + config under the lock, then release it BEFORE
+	// the blocking teardown (MANDATORY PRINCIPLE #2 — no blocking work under
+	// o.mu; the Down loop must not stall concurrent o.mu users).
 	o.mu.Lock()
-	defer o.mu.Unlock()
+	services := make([]Service, len(o.services))
+	copy(services, o.services)
+	localOrch := o.localOrch
+	projectDir := o.projectDir
+	o.mu.Unlock()
+
+	if localOrch == nil {
+		return nil
+	}
 
 	var firstErr error
-	for _, svc := range o.services {
-		if o.localOrch == nil {
-			continue
-		}
+	for _, svc := range services {
 		composePath := svc.ComposeFile
 		if !filepath.IsAbs(composePath) {
-			composePath = filepath.Join(o.projectDir, composePath)
+			composePath = filepath.Join(projectDir, composePath)
 		}
-		if err := o.localOrch.Down(ctx, compose.ComposeProject{
+		if err := localOrch.Down(ctx, compose.ComposeProject{
 			File:    composePath,
 			Profile: svc.Profile,
 		}); err != nil && firstErr == nil {
