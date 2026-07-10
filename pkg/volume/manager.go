@@ -229,7 +229,12 @@ func (m *DefaultVolumeManager) Status(
 	if !ok {
 		return nil, fmt.Errorf("mount %q not found", name)
 	}
-	return info, nil
+	// Return a value copy (never the live internal pointer) so a caller
+	// polling Status cannot torn-read State/Error while Sync/Unmount mutate
+	// the same struct under the write lock, and cannot mutate manager state
+	// through the returned pointer. Mirrors ListMounts, which already copies.
+	infoCopy := *info
+	return &infoCopy, nil
 }
 
 // ListMounts returns all mounts.
