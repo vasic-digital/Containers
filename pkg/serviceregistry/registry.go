@@ -25,14 +25,39 @@ type Service struct {
 }
 
 type ServiceRegistry struct {
-	mu           sync.RWMutex
-	persistMu    sync.Mutex
-	services     map[string]*Service
-	serviceFiles map[string]string
-	registryDir  string
-	defaultHost  string
-	logger       Logger
+	mu               sync.RWMutex
+	persistMu        sync.Mutex
+	services         map[string]*Service
+	serviceFiles     map[string]string
+	registryDir      string
+	defaultHost      string
+	logger           Logger
+	warnEmptyDirOnce sync.Once // SR-HARD-3: warn exactly once when persist() is a no-op because registryDir is empty
 }
+
+// persistBeforeLockHook is a package-level test seam (nil in production, so the
+// only production cost is a single nil check). It is invoked inside persist() at
+// the point IMMEDIATELY BEFORE persistMu is acquired. Because the SR-HARD-1 fix
+// marshals the snapshot AFTER acquiring persistMu, a test can pause a persist
+// here — before it captures anything — mutate the registry, run a second persist
+// to completion, then release, and deterministically observe that the released
+// persist captures the FRESH state (freshest-wins) rather than a stale snapshot
+// captured before the mutation. Same idiomatic seam pattern as pkg/vm's
+// killByPortHook. Tests overriding it MUST NOT use t.Parallel() (the
+// swap-and-restore of a package-level var is not concurrency-safe).
+var persistBeforeLockHook func()
+
+// persistBeforeRenameHook is a second package-level test seam (nil in
+// production). It is invoked inside persist() IMMEDIATELY BEFORE the atomic
+// os.Rename — the point at which the snapshot is already marshaled to a temp
+// file and persistMu is held, but the write has not yet been committed. The
+// SR-HARD-2 guard pauses a persist here (a non-empty snapshot captured, about to
+// land) to prove Clear() cannot remove the file and then have the paused persist
+// resurrect it: with the fix Clear blocks on persistMu until the rename commits
+// and only then removes the file; reverting the fix lets Clear remove the file
+// first, so the paused persist's rename resurrects the cleared service. Tests
+// overriding it MUST NOT use t.Parallel().
+var persistBeforeRenameHook func()
 
 type Logger interface {
 	Info(msg string, args ...any)
@@ -103,7 +128,14 @@ func (r *ServiceRegistry) Register(name string, port int, opts ...ServiceOption)
 	r.mu.Unlock()
 
 	r.logger.Info("Registered service %s at %s:%d", name, host, port)
-	r.persist()
+	// SR-HARD-3: persist() now returns its failure. Register's signature already
+	// returns error, so propagate it — a service the caller believes is durably
+	// registered but never reached disk (MkdirAll/Write/Rename failed) is a
+	// silent-persistence-failure defect. The in-memory registration stands; the
+	// error tells the caller the on-disk snapshot did not update.
+	if err := r.persist(); err != nil {
+		return fmt.Errorf("register %s: persist failed: %w", name, err)
+	}
 	return nil
 }
 
@@ -319,58 +351,94 @@ func (r *ServiceRegistry) isPortAvailable(port int) bool {
 	return true
 }
 
-// persist writes a snapshot of the registry to disk. The snapshot is marshaled
-// under the read lock (an in-memory, non-blocking step), but the blocking disk
-// I/O runs OUTSIDE r.mu — MANDATORY DEVELOPMENT PRINCIPLE #2: no blocking
-// operation may run inside a synchronized region, so a slow fsync never stalls
-// every reader/writer waiting on r.mu. persistMu serializes concurrent writers
-// (they no longer hold r.mu, so two could otherwise race on the file). The
-// write is atomic: a temp file in the same directory is renamed over the
-// target, so a crash mid-write leaves the previous registry intact rather than
-// a truncated file (§9 data-safety).
-func (r *ServiceRegistry) persist() {
+// persist writes a snapshot of the registry to disk under persistMu. persistMu
+// is acquired FIRST, then the snapshot is marshaled under r.mu.RLock (an
+// in-memory, non-blocking step), then the blocking disk I/O runs — all while
+// holding persistMu but with r.mu already released.
+//
+// SR-HARD-1: capturing the snapshot INSIDE persistMu makes snapshot-capture and
+// the atomic rename one indivisible unit with respect to every other persist()
+// call. If the marshal ran OUTSIDE persistMu (as it once did), a goroutine that
+// captured an OLDER snapshot could block on the contended persistMu while a
+// goroutine holding a NEWER snapshot wrote first, then rename its stale bytes
+// LAST — resurrecting an Unregister'd service (or dropping a just-Register'd
+// one) on the next restart. Acquiring persistMu first guarantees write order
+// equals capture order, so the last writer always holds the freshest state.
+//
+// MANDATORY DEVELOPMENT PRINCIPLE #2 is preserved: only the marshal runs under
+// r.mu.RLock; the blocking os.MkdirAll/CreateTemp/Write/Rename run with r.mu
+// released, so a slow fsync never stalls readers/writers waiting on r.mu.
+// persistMu (a separate mutex) intentionally serializes the writers. The write
+// is atomic: a temp file in the same directory is renamed over the target, so a
+// crash mid-write leaves the previous registry intact rather than a truncated
+// file (§9 data-safety).
+//
+// SR-HARD-3: persist returns its failure instead of only logging it, so callers
+// whose signature carries an error (Register) can surface a silent-persistence
+// failure rather than reporting durable success on a snapshot that never landed.
+func (r *ServiceRegistry) persist() error {
 	if r.registryDir == "" {
-		return
+		// SR-HARD-3: an empty registryDir (e.g. os.Getwd() failed in New) makes
+		// persist a silent in-memory-only no-op. Surface it once at Warn so the
+		// operator knows persistence is disabled instead of assuming it works.
+		r.warnEmptyDirOnce.Do(func() {
+			r.logger.Warn("service registry directory is empty; persistence disabled (in-memory only)")
+		})
+		return nil
 	}
+
+	// SR-HARD-1 test seam: nil in production. Fires BEFORE persistMu is acquired
+	// (and therefore before the snapshot is marshaled), the controllable point a
+	// deterministic guard uses to force the stale-write interleaving.
+	if persistBeforeLockHook != nil {
+		persistBeforeLockHook()
+	}
+
+	r.persistMu.Lock()
+	defer r.persistMu.Unlock()
 
 	r.mu.RLock()
 	data, err := json.MarshalIndent(r.services, "", "  ")
 	r.mu.RUnlock()
 	if err != nil {
 		r.logger.Warn("Failed to marshal services: %v", err)
-		return
+		return fmt.Errorf("marshal services: %w", err)
 	}
-
-	r.persistMu.Lock()
-	defer r.persistMu.Unlock()
 
 	if err := os.MkdirAll(r.registryDir, 0755); err != nil {
 		r.logger.Warn("Failed to create registry dir: %v", err)
-		return
+		return fmt.Errorf("create registry dir: %w", err)
 	}
 
 	file := filepath.Join(r.registryDir, "services.json")
 	tmp, err := os.CreateTemp(r.registryDir, "services-*.json.tmp")
 	if err != nil {
 		r.logger.Warn("Failed to create temp registry file: %v", err)
-		return
+		return fmt.Errorf("create temp registry file: %w", err)
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
 		r.logger.Warn("Failed to write temp registry: %v", err)
-		return
+		return fmt.Errorf("write temp registry: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpName)
 		r.logger.Warn("Failed to close temp registry: %v", err)
-		return
+		return fmt.Errorf("close temp registry: %w", err)
+	}
+	// SR-HARD-2 test seam: nil in production. Fires with persistMu held and the
+	// temp file written, immediately before the atomic rename commits the write.
+	if persistBeforeRenameHook != nil {
+		persistBeforeRenameHook()
 	}
 	if err := os.Rename(tmpName, file); err != nil {
 		os.Remove(tmpName)
 		r.logger.Warn("Failed to rename registry into place: %v", err)
+		return fmt.Errorf("rename registry into place: %w", err)
 	}
+	return nil
 }
 
 func (r *ServiceRegistry) loadFromDisk() {
@@ -414,11 +482,23 @@ func (r *ServiceRegistry) loadFromDisk() {
 
 func (r *ServiceRegistry) Clear() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.services = make(map[string]*Service)
-	if r.registryDir != "" {
-		file := filepath.Join(r.registryDir, "services.json")
-		os.Remove(file)
+	r.mu.Unlock()
+
+	if r.registryDir == "" {
+		return
+	}
+	// SR-HARD-2: the file removal is coordinated with persist() through persistMu
+	// so an in-flight persist() (which holds persistMu across its snapshot capture
+	// AND its atomic rename) can never rename a stale, non-empty snapshot back
+	// over the file after Clear removed it — which would resurrect the cleared
+	// services on the next restart. The blocking os.Remove runs OUTSIDE r.mu
+	// (MANDATORY DEVELOPMENT PRINCIPLE #2), matching persist()'s discipline.
+	r.persistMu.Lock()
+	defer r.persistMu.Unlock()
+	file := filepath.Join(r.registryDir, "services.json")
+	if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
+		r.logger.Warn("Failed to remove registry file on Clear: %v", err)
 	}
 }
 

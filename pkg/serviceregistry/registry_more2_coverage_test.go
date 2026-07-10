@@ -62,22 +62,34 @@ func TestLoadFromDisk_ValidFile(t *testing.T) {
 	assert.Equal(t, 8080, svc.Port)
 }
 
-// TestSaveToDisk_WriteFileError covers the os.WriteFile error branch in
-// saveToDisk. We achieve this by creating a directory at the path where
-// services.json would be written, which causes WriteFile to fail.
+// TestSaveToDisk_WriteFileError covers persist()'s write-failure branch: a
+// directory planted at the services.json path makes the atomic rename fail.
+//
+// SR-HARD-3 reconciliation (§11.4.120 fix-breaks-its-own-gate): this test used
+// to assert "Register should succeed even if saveToDisk WriteFile fails" — i.e.
+// it encoded the exact silent-persistence-failure defect SR-HARD-3 removes.
+// persist() now RETURNS its failure and Register PROPAGATES it, so the assertion
+// is rewritten to the NEW contract (Register surfaces the error). This is a
+// reconciliation, not a fake-pass and not a revert: reverting the SR-HARD-3 fix
+// (Register returning nil again) makes this test FAIL, so it remains a genuine
+// guard rather than a tautology.
 func TestSaveToDisk_WriteFileError(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "registry-writefile-fail-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
 	// Create a directory at the location where services.json would be
-	// written; this causes os.WriteFile to fail with "is a directory".
+	// written; this causes the atomic rename in persist() to fail.
 	blockerPath := tmpDir + "/services.json"
 	require.NoError(t, os.MkdirAll(blockerPath, 0755))
 
 	r := New(WithRegistryDir(tmpDir))
-	// Trigger saveToDisk; the write should fail silently via the logger.
+	// Trigger persist(); the write failure MUST be surfaced, not swallowed.
 	err = r.Register("write-fail-svc", 7654)
-	assert.NoError(t, err,
-		"Register should succeed even if saveToDisk WriteFile fails")
+	require.Error(t, err,
+		"SR-HARD-3: Register must propagate persist() failure, not silently return nil")
+
+	// The in-memory registration still stands — only the on-disk write failed.
+	_, ok := r.Get("write-fail-svc")
+	assert.True(t, ok, "in-memory registration should stand even when persistence fails")
 }
