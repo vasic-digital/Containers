@@ -206,17 +206,21 @@ func (p *PodmanRuntime) Stats(
 	return parsePodmanStats(out)
 }
 
-// podmanStatsJSON models podman stats --format json output.
+// podmanStatsJSON models the REAL `podman stats --no-stream --format json`
+// output: a JSON array of objects whose every field is a STRING, with combined
+// `net_io`/`block_io` "rx / tx" mappings and a combined `mem_usage` "used /
+// limit". This is what real podman emits; the earlier numeric-field struct
+// (separate net_input/net_output, uint64 mem, float cpu) matched NOTHING
+// podman produces, so every real container's stats unmarshal failed and fell
+// through to parseDockerStats — which then failed on the leading `[`, leaving
+// PodmanRuntime.Stats returning an error for every real container.
 type podmanStatsJSON struct {
-	CPUPercent float64 `json:"cpu_percent"`
-	MemPerc    float64 `json:"mem_percent"`
-	MemUsage   uint64  `json:"mem_usage"`
-	MemLimit   uint64  `json:"mem_limit"`
-	NetInput   uint64  `json:"net_input"`
-	NetOutput  uint64  `json:"net_output"`
-	BlockIn    uint64  `json:"block_input"`
-	BlockOut   uint64  `json:"block_output"`
-	PIDs       int     `json:"pids"`
+	CPUPercent string `json:"cpu_percent"`
+	MemPercent string `json:"mem_percent"`
+	MemUsage   string `json:"mem_usage"`
+	NetIO      string `json:"net_io"`
+	BlockIO    string `json:"block_io"`
+	PIDs       string `json:"pids"`
 }
 
 func parsePodmanStats(data []byte) (*ContainerStats, error) {
@@ -225,28 +229,41 @@ func parsePodmanStats(data []byte) (*ContainerStats, error) {
 		return nil, fmt.Errorf("empty stats output")
 	}
 
-	var items []podmanStatsJSON
-	if err := json.Unmarshal([]byte(trimmed), &items); err != nil {
-		// Fall back to docker-style string parsing.
-		return parseDockerStats(data)
+	// Real podman emits a JSON array of string-valued objects. Decode it and
+	// string-parse each field with the same helpers docker.go uses.
+	if trimmed[0] == '[' {
+		var items []podmanStatsJSON
+		if err := json.Unmarshal([]byte(trimmed), &items); err != nil {
+			return nil, fmt.Errorf("parsing podman stats: %w", err)
+		}
+		if len(items) == 0 {
+			return nil, fmt.Errorf("no stats data returned")
+		}
+		return podmanStatsToContainerStats(items[0]), nil
 	}
 
-	if len(items) == 0 {
-		return nil, fmt.Errorf("no stats data returned")
-	}
+	// Not an array → a docker-shim single object / first-line docker shape.
+	return parseDockerStats(data)
+}
 
-	s := items[0]
+// podmanStatsToContainerStats string-parses one real podman stats record,
+// reusing docker.go's percentage / mem / IO-pair string helpers.
+func podmanStatsToContainerStats(s podmanStatsJSON) *ContainerStats {
+	memUsage, memLimit := parseMemUsage(s.MemUsage)
+	netRx, netTx := parseIOPair(s.NetIO)
+	blockR, blockW := parseIOPair(s.BlockIO)
+	pids, _ := strconv.Atoi(strings.TrimSpace(s.PIDs))
 	return &ContainerStats{
-		CPUPercent:    s.CPUPercent,
-		MemoryPercent: s.MemPerc,
-		MemoryUsage:   s.MemUsage,
-		MemoryLimit:   s.MemLimit,
-		NetworkRx:     s.NetInput,
-		NetworkTx:     s.NetOutput,
-		BlockRead:     s.BlockIn,
-		BlockWrite:    s.BlockOut,
-		PIDs:          s.PIDs,
-	}, nil
+		CPUPercent:    parsePercentage(s.CPUPercent),
+		MemoryPercent: parsePercentage(s.MemPercent),
+		MemoryUsage:   memUsage,
+		MemoryLimit:   memLimit,
+		NetworkRx:     netRx,
+		NetworkTx:     netTx,
+		BlockRead:     blockR,
+		BlockWrite:    blockW,
+		PIDs:          pids,
+	}
 }
 
 func (p *PodmanRuntime) Exec(
