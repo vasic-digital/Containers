@@ -36,17 +36,17 @@ type stubVM struct {
 	qmp *fakeQMPClient
 }
 
-func (s *stubVM) sshClientForNetwork() sshClient {
+func (s *stubVM) ApplyNetworkConditions(ctx context.Context, _ int, conditions NetworkConditions) error {
 	if s.ssh == nil {
 		return nil
 	}
-	return s.ssh
+	return applyNetworkConditionsVM(ctx, s.ssh, conditions)
 }
-func (s *stubVM) qmpClientForScreenshot() qmpClient {
+func (s *stubVM) CaptureScreenshot(ctx context.Context, monitorPort int, dstPath string) error {
 	if s.qmp == nil {
 		return nil
 	}
-	return s.qmp
+	return CaptureScreenshotVM(ctx, s.qmp, monitorPort, dstPath)
 }
 
 func (s *stubVM) Boot(_ context.Context, cfg VMConfig) (BootResult, error) {

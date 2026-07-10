@@ -24,34 +24,29 @@ type QEMUMatrixRunner struct {
 }
 
 // vmNetworkAccessor is the seam runOne uses to apply network shaping
-// in-guest. Production: QEMUVM exposes it via its sshClient. Tests
-// substitute a fake recorder.
+// in-guest. Production: *QEMUVM.ApplyNetworkConditions, which is self-
+// authenticating and self-locking under guestMu (see CT-HARDEN-VM-1 +
+// CT-HARDEN-VM-2 — the prior raw-sshClient exposer let the tc-qdisc
+// command run on an UNAUTHENTICATED session). Tests substitute a fake
+// recorder.
 //
 // The seam exists for the same reason pkg/emulator's adbAccessor exists:
 // it lets the matrix-integration tests assert on observable side-effects
 // without running a real QEMU + Linux kernel (which would not be
 // hermetic on CI).
 type vmNetworkAccessor interface {
-	sshClientForNetwork() sshClient
+	ApplyNetworkConditions(ctx context.Context, sshPort int, conditions NetworkConditions) error
 }
 
 // vmScreenshotAccessor is the analogous seam for QMP-driven forensic
-// screenshot capture. The screenshot path goes to a host file directly
-// (QMP runs in qemu-system on the host), so the test fake records the
-// (monitorPort, dstPath) pair without spawning real QEMU.
+// screenshot capture. Production: *QEMUVM.CaptureScreenshot, self-locking
+// under guestMu so a concurrent target cannot corrupt the shared qmp
+// connection mid-capture. The screenshot path goes to a host file
+// directly (QMP runs in qemu-system on the host), so the test fake
+// records the (monitorPort, dstPath) pair without spawning real QEMU.
 type vmScreenshotAccessor interface {
-	qmpClientForScreenshot() qmpClient
+	CaptureScreenshot(ctx context.Context, monitorPort int, dstPath string) error
 }
-
-// sshClientForNetwork is the production QEMUVM's exposure of its ssh
-// client for the matrix runner's in-guest tc-shaping path.
-func (v *QEMUVM) sshClientForNetwork() sshClient { return v.ssh }
-
-// qmpClientForScreenshot is the production QEMUVM's exposure of its
-// qmp client. NOTE — the matrix runner Dials a fresh QMP connection
-// for screenshot capture (the Teardown-time qmp gets closed after
-// powerdown), so this returns the same client the runner re-Dials.
-func (v *QEMUVM) qmpClientForScreenshot() qmpClient { return v.qmp }
 
 // NewQEMUMatrixRunner constructs a runner. Pass cache.Store for image
 // resolution; pass nil to skip image resolution (tests).
@@ -245,16 +240,16 @@ func (r *QEMUMatrixRunner) runOne(ctx context.Context, target VMTarget, qcowPath
 		}
 		conditions := MergeNetworkConditions(profile, config.NetworkOverride)
 		if accessor, ok := r.vm.(vmNetworkAccessor); ok {
-			ssh := accessor.sshClientForNetwork()
-			if ssh != nil {
-				if applyErr := applyNetworkConditionsVM(ctx, ssh, conditions); applyErr != nil {
-					// Best-effort enrichment; log as a non-fatal failure
-					// summary, do NOT flip Passed.
-					row.FailureSummaries = append(row.FailureSummaries, FailureSummary{
-						Type:    "network-shaping-warning",
-						Message: applyErr.Error(),
-					})
-				}
+			// ApplyNetworkConditions authenticates boot.SSHPort before the
+			// tc-qdisc command (CT-HARDEN-VM-2) and holds guestMu across
+			// the whole sequence (CT-HARDEN-VM-1).
+			if applyErr := accessor.ApplyNetworkConditions(ctx, boot.SSHPort, conditions); applyErr != nil {
+				// Best-effort enrichment; log as a non-fatal failure
+				// summary, do NOT flip Passed.
+				row.FailureSummaries = append(row.FailureSummaries, FailureSummary{
+					Type:    "network-shaping-warning",
+					Message: applyErr.Error(),
+				})
 			}
 		}
 		row.NetworkProfile = config.NetworkProfile
@@ -303,17 +298,15 @@ func (r *QEMUMatrixRunner) runOne(ctx context.Context, target VMTarget, qcowPath
 	// directly — qemu-system runs on the host, so no SCP step.
 	if !row.Passed && config.CaptureScreenshotOnFailure {
 		if accessor, ok := r.vm.(vmScreenshotAccessor); ok {
-			qmp := accessor.qmpClientForScreenshot()
-			if qmp != nil {
-				screenshotPath := filepath.Join(config.EvidenceDir, target.ID, "screenshot-on-failure.ppm")
-				if scErr := CaptureScreenshotVM(ctx, qmp, boot.MonitorPort, screenshotPath); scErr == nil {
-					row.ScreenshotPath = filepath.Join(target.ID, "screenshot-on-failure.ppm")
-				} else {
-					row.FailureSummaries = append(row.FailureSummaries, FailureSummary{
-						Type:    "screenshot-capture-warning",
-						Message: scErr.Error(),
-					})
-				}
+			screenshotPath := filepath.Join(config.EvidenceDir, target.ID, "screenshot-on-failure.ppm")
+			// CaptureScreenshot self-locks under guestMu (CT-HARDEN-VM-1).
+			if scErr := accessor.CaptureScreenshot(ctx, boot.MonitorPort, screenshotPath); scErr == nil {
+				row.ScreenshotPath = filepath.Join(target.ID, "screenshot-on-failure.ppm")
+			} else {
+				row.FailureSummaries = append(row.FailureSummaries, FailureSummary{
+					Type:    "screenshot-capture-warning",
+					Message: scErr.Error(),
+				})
 			}
 		}
 	}

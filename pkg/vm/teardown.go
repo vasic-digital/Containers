@@ -50,21 +50,41 @@ func (v *QEMUVM) Teardown(ctx context.Context, monitorPort, sshPort int) error {
 	// targets). Resetting authedPort forces a fresh Authenticate on the
 	// next boot's port.
 	defer func() {
-		if v.ssh != nil {
-			_ = v.ssh.Close()
-		}
+		// Close the shared SSH client ONLY if this Teardown still owns
+		// the authenticated session (authedPort == this target's sshPort)
+		// or nobody owns it (authedPort == 0). Under --concurrent>1 a
+		// different, still-in-flight target may have re-authenticated the
+		// shared connection to ITS own port since this target ran; closing
+		// it here would kill a live connection that target is using. The
+		// `mine` check prevents that cross-target close. Guarded by
+		// guestMu (lock ordering guestMu → authMu, never reversed) so it
+		// cannot interleave with a concurrent guest op. See CT-HARDEN-VM-1.
+		v.guestMu.Lock()
 		v.authMu.Lock()
-		v.authedPort = 0
+		mine := v.authedPort == sshPort || v.authedPort == 0
 		v.authMu.Unlock()
+		if mine {
+			if v.ssh != nil {
+				_ = v.ssh.Close()
+			}
+			v.authMu.Lock()
+			v.authedPort = 0
+			v.authMu.Unlock()
+		}
+		v.guestMu.Unlock()
 	}()
 
-	// Stage 1: QMP powerdown — best-effort.
+	// Stage 1: QMP powerdown — best-effort. Guarded by guestMu (bounded
+	// ~5s Dial timeout, NOT the 30s grace sleep below) so a concurrent
+	// target's screenshot capture can't race the shared qmp connection.
+	v.guestMu.Lock()
 	if v.qmp != nil {
 		if err := v.qmp.Dial(ctx, monitorPort, 5*time.Second); err == nil {
 			_ = v.qmp.SystemPowerdown(ctx)
 			_ = v.qmp.Close()
 		}
 	}
+	v.guestMu.Unlock()
 
 	// Stage 2: wait for graceful exit. We can't directly observe the
 	// QEMU process from here without a process handle; we sleep.

@@ -72,6 +72,20 @@ type QEMUVM struct {
 
 	authMu     sync.Mutex
 	authedPort int // sshPort already authenticated; 0 = not authenticated
+
+	// guestMu serializes every guest-facing operation (Upload / Run /
+	// Download / Teardown's QMP+SSH-close stage / ApplyNetworkConditions
+	// / CaptureScreenshot) across the FULL authenticate-then-execute
+	// sequence of a single call. v.ssh and v.qmp are ONE shared
+	// connection per *QEMUVM, but cmd/vm-matrix/main.go wires exactly one
+	// *QEMUVM into NewQEMUMatrixRunner and --concurrent>1 dispatches N
+	// worker goroutines against it concurrently. Without this lock,
+	// ensureAuthenticated releases authMu before the caller's guest op
+	// executes, so target A's op can silently run against a session a
+	// concurrent target B just re-authenticated (cross-target session
+	// contamination) — see CT-HARDEN-VM-1. Lock ordering is always
+	// guestMu → authMu (never the reverse).
+	guestMu sync.Mutex
 }
 
 // NewQEMUVM constructs a production QEMUVM.
@@ -203,6 +217,8 @@ func (v *QEMUVM) ensureAuthenticated(ctx context.Context, sshPort int) error {
 }
 
 func (v *QEMUVM) Upload(ctx context.Context, sshPort int, hostPath, vmPath string) error {
+	v.guestMu.Lock()
+	defer v.guestMu.Unlock()
 	if err := v.ensureAuthenticated(ctx, sshPort); err != nil {
 		return fmt.Errorf("qemu upload: authenticate ssh port %d: %w", sshPort, err)
 	}
@@ -210,6 +226,8 @@ func (v *QEMUVM) Upload(ctx context.Context, sshPort int, hostPath, vmPath strin
 }
 
 func (v *QEMUVM) Run(ctx context.Context, sshPort int, script string, env map[string]string, timeout time.Duration) (string, string, int, error) {
+	v.guestMu.Lock()
+	defer v.guestMu.Unlock()
 	if err := v.ensureAuthenticated(ctx, sshPort); err != nil {
 		return "", "", -1, fmt.Errorf("qemu run: authenticate ssh port %d: %w", sshPort, err)
 	}
@@ -217,8 +235,41 @@ func (v *QEMUVM) Run(ctx context.Context, sshPort int, script string, env map[st
 }
 
 func (v *QEMUVM) Download(ctx context.Context, sshPort int, vmPath, hostPath string) error {
+	v.guestMu.Lock()
+	defer v.guestMu.Unlock()
 	if err := v.ensureAuthenticated(ctx, sshPort); err != nil {
 		return fmt.Errorf("qemu download: authenticate ssh port %d: %w", sshPort, err)
 	}
 	return v.ssh.Download(ctx, vmPath, hostPath)
+}
+
+// ApplyNetworkConditions authenticates sshPort (if it is not already the
+// currently-authenticated session) and then applies the in-guest tc-qdisc
+// network shaping, all under guestMu. This replaces the raw-client
+// exposer (sshClientForNetwork) the matrix runner previously used: that
+// path called applyNetworkConditionsVM directly on an UNAUTHENTICATED
+// v.ssh (nothing had authenticated for this VM's port yet at network-
+// shaping time), so against the real client the tc command always failed
+// with "not authenticated" (CT-HARDEN-VM-2). Folding ensureAuthenticated
+// in — and holding guestMu across it — closes both the ordering bug and
+// the CT-HARDEN-VM-1 race where a concurrent target's Authenticate could
+// land between this authentication and the tc-qdisc execution.
+func (v *QEMUVM) ApplyNetworkConditions(ctx context.Context, sshPort int, conditions NetworkConditions) error {
+	v.guestMu.Lock()
+	defer v.guestMu.Unlock()
+	if err := v.ensureAuthenticated(ctx, sshPort); err != nil {
+		return fmt.Errorf("apply network conditions: authenticate ssh port %d: %w", sshPort, err)
+	}
+	return applyNetworkConditionsVM(ctx, v.ssh, conditions)
+}
+
+// CaptureScreenshot serializes forensic QMP screendump capture under
+// guestMu so a concurrent target cannot Dial/read the shared qmp
+// connection against another target's monitor socket mid-capture
+// (corrupting a forensic evidence artifact). This replaces the raw-qmp
+// exposer (qmpClientForScreenshot). See CT-HARDEN-VM-1.
+func (v *QEMUVM) CaptureScreenshot(ctx context.Context, monitorPort int, dstPath string) error {
+	v.guestMu.Lock()
+	defer v.guestMu.Unlock()
+	return CaptureScreenshotVM(ctx, v.qmp, monitorPort, dstPath)
 }
