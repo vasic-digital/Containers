@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"time"
 )
@@ -110,6 +109,13 @@ func (w *WineContainerBackend) Build(ctx context.Context, req BuildRequest) Buil
 		}
 	}
 
+	// Artifact lives on the bind-mounted source dir; rsync-equivalent to
+	// the host output. Snapshot BEFORE the container runs so a leftover
+	// artifact from a prior invocation can be told apart from one this
+	// invocation genuinely produced (see verifyFreshArtifact).
+	produced := filepath.Join(req.SourceDir, req.OutputSubpath)
+	preExisting := statIfExists(produced)
+
 	var stdout, stderr bytes.Buffer
 	exitCode, err := w.runner.Run(ctx, containerRunSpec{
 		Image:       w.imageRef,
@@ -138,20 +144,9 @@ func (w *WineContainerBackend) Build(ctx context.Context, req BuildRequest) Buil
 		return result
 	}
 
-	// Artifact lives on the bind-mounted source dir; rsync-equivalent
-	// to the host output.
-	produced := filepath.Join(req.SourceDir, req.OutputSubpath)
-	stat, err := os.Stat(produced)
+	stat, err := verifyFreshArtifact(produced, preExisting)
 	if err != nil {
-		result.Error = fmt.Errorf(
-			"container build succeeded but artifact missing at %s: %w "+
-				"(anti-bluff: 'BUILD SUCCESSFUL' without real artifact == bluff)",
-			produced, err)
-		return result
-	}
-	if stat.Size() == 0 {
-		result.Error = fmt.Errorf(
-			"container build produced zero-byte artifact at %s (bluff)", produced)
+		result.Error = err
 		return result
 	}
 

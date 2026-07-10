@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"runtime"
 	"time"
@@ -118,6 +117,12 @@ func (l *LinuxContainerBackend) Build(ctx context.Context, req BuildRequest) Bui
 		}
 	}
 
+	// Snapshot the declared output path BEFORE the container runs so a
+	// leftover artifact from a prior invocation can be told apart from
+	// one this invocation genuinely produced (see verifyFreshArtifact).
+	produced := filepath.Join(req.SourceDir, req.OutputSubpath)
+	preExisting := statIfExists(produced)
+
 	var stdout, stderr bytes.Buffer
 	exitCode, err := l.runner.Run(ctx, containerRunSpec{
 		Image:       l.imageRef,
@@ -146,18 +151,9 @@ func (l *LinuxContainerBackend) Build(ctx context.Context, req BuildRequest) Bui
 		return result
 	}
 
-	produced := filepath.Join(req.SourceDir, req.OutputSubpath)
-	stat, err := os.Stat(produced)
+	stat, err := verifyFreshArtifact(produced, preExisting)
 	if err != nil {
-		result.Error = fmt.Errorf(
-			"container build succeeded but artifact missing at %s: %w "+
-				"(anti-bluff: 'BUILD SUCCESSFUL' without real artifact == bluff)",
-			produced, err)
-		return result
-	}
-	if stat.Size() == 0 {
-		result.Error = fmt.Errorf(
-			"container build produced zero-byte artifact at %s (bluff)", produced)
+		result.Error = err
 		return result
 	}
 
