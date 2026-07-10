@@ -24,9 +24,14 @@ type OverlayNetwork interface {
 	List(ctx context.Context) ([]string, error)
 }
 
-// TunnelOverlay implements OverlayNetwork using SSH tunnels as
-// the transport layer. This provides cross-host networking without
-// requiring Docker Swarm or other cluster managers.
+// TunnelOverlay implements OverlayNetwork. NOTE: it currently maintains only
+// an in-memory registry of network -> container-ID membership; it does NOT
+// yet perform any host-side networking (no Docker/bridge network is created,
+// no SSH transport is wired). The injected tunnelManager/hostManager/executor
+// are the seam for a real cross-host implementation, which is a tracked gap —
+// until then a nil return from these methods means "recorded in memory", NOT
+// "cross-host connectivity established". Callers MUST NOT treat success here
+// as proof that containers on different hosts can actually reach each other.
 type TunnelOverlay struct {
 	tunnelManager TunnelManager
 	hostManager   remote.HostManager
@@ -65,8 +70,9 @@ func NewTunnelOverlay(
 	}
 }
 
-// Create creates a named overlay network. For tunnel-based overlay,
-// this creates a Docker bridge network on each host.
+// Create records a named overlay network in the in-memory registry. NOTE: it
+// does NOT (yet) create any host-side Docker/bridge network or SSH transport;
+// the real cross-host wiring is a tracked gap (see the TunnelOverlay type doc).
 func (o *TunnelOverlay) Create(
 	ctx context.Context, name string,
 ) error {

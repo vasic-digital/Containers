@@ -86,6 +86,7 @@ func (m *DefaultTunnelManager) CreateTunnel(
 	}
 
 	// Auto-allocate local port if not specified.
+	autoAllocatedPort := -1
 	if spec.LocalPort == "" {
 		port, err := m.allocator.Allocate(spec.Description)
 		if err != nil {
@@ -94,12 +95,20 @@ func (m *DefaultTunnelManager) CreateTunnel(
 			)
 		}
 		spec.LocalPort = strconv.Itoa(port)
+		autoAllocatedPort = port
 	}
 
 	args := m.tunnelArgs(*host, spec)
 	cmd := exec.CommandContext(ctx, "ssh", args...)
 
 	if err := cmd.Start(); err != nil {
+		// The SSH process never launched, so no tunnelEntry is stored and
+		// CloseTunnel will never run to release the port. Release the port we
+		// auto-allocated above, otherwise every failed launch permanently
+		// leaks one port from the range until the allocator is exhausted.
+		if autoAllocatedPort >= 0 {
+			m.allocator.Release(autoAllocatedPort)
+		}
 		return nil, fmt.Errorf(
 			"start tunnel to %s: %w", hostName, err,
 		)
