@@ -206,8 +206,9 @@ func (r *ServiceRegistry) UpdateHealth(name string, healthy bool) {
 func (r *ServiceRegistry) Discover(ctx context.Context, name string, defaultPort int, portRange ...int) (*Service, error) {
 	r.mu.RLock()
 	if svc, ok := r.services[name]; ok {
+		cp := *svc
 		r.mu.RUnlock()
-		return svc, nil
+		return &cp, nil
 	}
 	r.mu.RUnlock()
 
