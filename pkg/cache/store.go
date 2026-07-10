@@ -19,7 +19,9 @@ import (
 // Get returns the local path of the image's bytes. On cache miss, the
 // image is fetched from the manifest's URL, SHA-256 verified, then
 // written atomically. Verify recomputes the SHA and compares against
-// the manifest. Refresh removes the cached blob and fetches it again.
+// the manifest. Refresh forces a fresh fetch and atomically replaces the
+// cached blob — it never removes the existing blob until a verified
+// replacement is ready, so a failed re-fetch leaves the cache untouched.
 type Store interface {
 	Get(ctx context.Context, m *Manifest, imageID string) (path string, err error)
 	Verify(ctx context.Context, m *Manifest, imageID string) error
@@ -142,7 +144,33 @@ func (s *FilesystemStore) Get(ctx context.Context, m *Manifest, imageID string) 
 		return final, nil
 	}
 
-	// Cross-process serialization via flock.
+	return s.fetchAndPlace(ctx, entry, sha, final, true)
+}
+
+// fetchAndPlace performs the cross-process-locked fetch → verify → atomic
+// place sequence shared by Get (fetch-if-missing) and Refresh (forced
+// re-fetch). The caller MUST already hold s.keymu for the relevant
+// imageID before calling this.
+//
+// It fetches entry.URL into a brand-new temp file and verifies the
+// SHA-256 (and declared size) BEFORE final is ever touched — see
+// fetchToTemp. The only write to final is the terminal os.Rename, which
+// atomically replaces whatever is currently there (if anything) in a
+// single filesystem operation. This is what makes Refresh safe to call
+// against an imageID that already has a valid cached blob: a failed or
+// corrupted re-fetch never destroys the existing good blob, because
+// nothing at final is ever removed or truncated until the replacement
+// has already been fetched and verified.
+//
+// dedupeIfPresent, when true (the Get path), re-checks final for
+// existence immediately after the flock is acquired and returns it
+// without fetching if present — this collapses a redundant fetch when a
+// DIFFERENT imageID resolving to the SAME SHA (or a different process)
+// populated the blob while the caller was blocked on the flock. Refresh
+// passes false: its entire purpose is to force a fresh fetch even though
+// final already exists, so it must not short-circuit on the very file it
+// is being asked to replace.
+func (s *FilesystemStore) fetchAndPlace(ctx context.Context, entry *ImageEntry, sha, final string, dedupeIfPresent bool) (string, error) {
 	if err := os.MkdirAll(s.blobsDir(), 0o755); err != nil {
 		return "", fmt.Errorf("mkdir blobs: %w", err)
 	}
@@ -160,13 +188,36 @@ func (s *FilesystemStore) Get(ctx context.Context, m *Manifest, imageID string) 
 	}
 	defer func() { _ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) }()
 
-	// Re-check fast path AFTER acquiring flock — another process may
-	// have populated it while we waited.
-	if _, err := os.Stat(final); err == nil {
-		return final, nil
+	// Re-check fast path AFTER acquiring flock — another process (or,
+	// in-process, a different imageID sharing this same SHA and thus a
+	// different keymu) may have populated it while we waited.
+	if dedupeIfPresent {
+		if _, err := os.Stat(final); err == nil {
+			return final, nil
+		}
 	}
 
-	// Fetch.
+	tmpPath, err := s.fetchToTemp(ctx, entry, sha)
+	if err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmpPath, final); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("atomic rename %s → %s: %w", tmpPath, final, err)
+	}
+	return final, nil
+}
+
+// fetchToTemp downloads entry.URL into a brand-new temp file under
+// blobsDir and verifies its SHA-256 (and declared size, if non-zero)
+// against sha BEFORE returning. On ANY failure — request construction,
+// network error, non-200, write error, SHA mismatch, size mismatch — the
+// temp file is removed and an error is returned. fetchToTemp never
+// touches (removes, truncates, or overwrites) any existing blob at the
+// eventual final path: the caller only learns the returned tmpPath once
+// its content is already known-good, so a rejected/failed fetch leaves
+// whatever was previously cached completely untouched.
+func (s *FilesystemStore) fetchToTemp(ctx context.Context, entry *ImageEntry, sha string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, entry.URL, nil)
 	if err != nil {
 		return "", fmt.Errorf("new request: %w", err)
@@ -198,9 +249,6 @@ func (s *FilesystemStore) Get(ctx context.Context, m *Manifest, imageID string) 
 	gotSHA := hex.EncodeToString(hasher.Sum(nil))
 	if gotSHA != sha {
 		_ = os.Remove(tmpPath)
-		// Also remove the final-path blob if a partial one ever appeared
-		// at it (defensive — shouldn't normally exist).
-		_ = os.Remove(final)
 		return "", fmt.Errorf("image %q: SHA256 mismatch (got %s, want %s)",
 			entry.ID, gotSHA, sha)
 	}
@@ -209,12 +257,7 @@ func (s *FilesystemStore) Get(ctx context.Context, m *Manifest, imageID string) 
 		return "", fmt.Errorf("image %q: size mismatch (got %d, want %d)",
 			entry.ID, written, entry.Size)
 	}
-
-	if err := os.Rename(tmpPath, final); err != nil {
-		_ = os.Remove(tmpPath)
-		return "", fmt.Errorf("atomic rename %s → %s: %w", tmpPath, final, err)
-	}
-	return final, nil
+	return tmpPath, nil
 }
 
 // Verify recomputes the SHA-256 of the cached blob and compares to the
@@ -247,8 +290,22 @@ func (s *FilesystemStore) Verify(ctx context.Context, m *Manifest, imageID strin
 	return nil
 }
 
-// Refresh removes the cached blob and fetches it again. Used by tooling
-// when the operator deliberately bumps a manifest entry's SHA.
+// Refresh forces a fresh fetch of the image and atomically replaces the
+// cached blob. Used by tooling when the operator deliberately bumps a
+// manifest entry's SHA, or wants to force a re-fetch of the same content
+// (e.g. suspected local corruption) — Refresh's contract does not require
+// entry.SHA256 to differ from whatever is currently cached.
+//
+// Refresh NEVER removes the existing blob before the replacement has been
+// fetched AND verified: it shares fetchAndPlace/fetchToTemp with Get, so a
+// failed or corrupted re-fetch (network error, non-200, SHA/size
+// mismatch, context cancellation) returns an error while leaving whatever
+// was previously cached at the blob path completely untouched.
+//
+// Locking mirrors Get: the same per-imageID in-process mutex, and the
+// same per-SHA flock (acquired inside fetchAndPlace), so a Refresh call
+// serializes correctly against concurrent Get calls for the same imageID
+// instead of racing an unlocked delete against an in-flight fetch.
 func (s *FilesystemStore) Refresh(ctx context.Context, m *Manifest, imageID string) error {
 	entry, err := m.FindByID(imageID)
 	if err != nil {
@@ -258,7 +315,14 @@ func (s *FilesystemStore) Refresh(ctx context.Context, m *Manifest, imageID stri
 	if err != nil {
 		return fmt.Errorf("refresh %q: %w", entry.ID, err)
 	}
-	_ = os.Remove(s.blobPath(sha))
-	_, err = s.Get(ctx, m, imageID)
-	return err
+	final := s.blobPath(sha)
+
+	mu := s.keymu(imageID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	if _, err := s.fetchAndPlace(ctx, entry, sha, final, false); err != nil {
+		return fmt.Errorf("refresh %q: %w", entry.ID, err)
+	}
+	return nil
 }
