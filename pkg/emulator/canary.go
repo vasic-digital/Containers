@@ -158,7 +158,7 @@ func RunCanary(ctx context.Context, cfg CanaryConfig) (CanaryResult, error) {
 
 	// Pre-boot cleanup: clear any zombie qemu-system-* processes so
 	// they don't hold ADB ports our new emulator wants.
-	_, _ = Cleanup(ctx)
+	_, _ = Cleanup(ctx, cfg.AVD.Name)
 
 	// Clear any stale AVD lock file before booting. The lock lives at
 	// $HOME/.android/avd/<name>.avd/<name>.lock on most hosts. If an

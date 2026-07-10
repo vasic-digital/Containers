@@ -169,11 +169,14 @@ func (c *Cuttlefish) WaitForReady(ctx context.Context, timeout time.Duration) (t
 }
 
 // Stop tears the instance down: it runs `stop_cvd` inside the container for
-// a graceful Cuttlefish shutdown, force-removes the container, then reaps
-// any orphan crosvm/run_cvd processes. A best-effort `stop_cvd` failure
-// does NOT abort the force-remove — the container MUST be cleaned up
-// regardless (§11.4.14 leave-the-target-quiescent). The first hard error
-// (container removal) is returned; reaping always runs.
+// a graceful Cuttlefish shutdown, then force-removes the container (`rm -f`),
+// which is the AUTHORITATIVE teardown — it tears down the container's PID
+// namespace and kills every cvd process inside. A best-effort `stop_cvd`
+// failure does NOT abort the force-remove — the container MUST be cleaned up
+// regardless (§11.4.14 leave-the-target-quiescent). Per §11.4.174 Stop does
+// NOT perform a host-wide cvd reap (no host-side ownership token exists); the
+// container removal is the only signal that reaches cvd processes. The hard
+// error (container removal) is returned.
 func (c *Cuttlefish) Stop(ctx context.Context) error {
 	if c.containerName == "" {
 		// Launch was never called on this instance — defensive no-op
@@ -186,20 +189,29 @@ func (c *Cuttlefish) Stop(ctx context.Context) error {
 	_, _ = c.executor.Execute(ctx, c.cfg.RuntimeBinary,
 		buildContainerExecArgs(c.containerName, buildStopCvdArgs())...)
 
-	// Force-remove the container — the authoritative teardown.
+	// Force-remove the container — the AUTHORITATIVE teardown. `rm -f` force-
+	// stops + removes the container, tearing down its OWN PID namespace (the
+	// container is launched WITHOUT `--pid host`, see buildContainerRunArgs),
+	// which kills every cvd process inside it (crosvm / run_cvd /
+	// cvd_internal_start).
 	out, rmErr := c.executor.Execute(ctx, c.cfg.RuntimeBinary, "rm", "-f", c.containerName)
 
-	// Reap orphan crosvm/run_cvd processes regardless of rm outcome.
-	graceCtx := ctx
-	_, reapErr := Cleanup(graceCtx)
+	// §11.4.174: do NOT reap cvd processes host-wide. The cvd processes run in
+	// the container's PID namespace and carry NO host-visible ownership token
+	// (the instance number is not plumbed from the host — buildLaunchCvdArgs is
+	// unused in production and CF_BASE_INSTANCE is never set here — and their
+	// argv references no container-name token). After `rm -f` above OUR cvd are
+	// already dead with the container's PID namespace, so a host-wide
+	// crosvm/run_cvd comm reap could ONLY hit a DIFFERENT (foreign / concurrent)
+	// instance's cvd — the exact §11.4.174 violation. We therefore hand the
+	// reaper an EMPTY ownership token, which makes it REFUSE (safe no-op); `rm
+	// -f` above is the sole teardown.
+	_, _ = Cleanup(ctx, "")
 
 	c.containerName = ""
 
 	if rmErr != nil {
 		return fmt.Errorf("%s rm: %w (output: %s)", c.cfg.RuntimeBinary, rmErr, string(out))
-	}
-	if reapErr != nil {
-		return fmt.Errorf("cuttlefish: orphan reaping after stop: %w", reapErr)
 	}
 	return nil
 }

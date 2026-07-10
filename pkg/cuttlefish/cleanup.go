@@ -40,6 +40,7 @@ var cuttlefishProcNames = map[string]struct{}{
 // newOSProcWalker (Linux: /proc; macOS/other: `ps -A`).
 type procWalker interface {
 	PidComms() (map[int]string, error)
+	PidCmdlines() (map[int][]string, error)
 }
 
 // killer abstracts signalling for testability.
@@ -74,15 +75,33 @@ func (osKiller) Exists(pid int) bool {
 //	          process is NOT collected; the loosened matcher would include
 //	          it, failing the test.
 //	Reverted: yes.
-func Cleanup(ctx context.Context) (CleanupReport, error) {
-	return cleanupWithDeps(ctx, newOSProcWalker(runtime.GOOS), osKiller{})
+func Cleanup(ctx context.Context, ownerToken string) (CleanupReport, error) {
+	return cleanupWithDeps(ctx, ownerToken, newOSProcWalker(runtime.GOOS), osKiller{})
 }
 
 // cleanupWithDeps is the testable core. Production uses Cleanup; tests
 // inject a synthetic procWalker + killer.
-func cleanupWithDeps(ctx context.Context, w procWalker, k killer) (CleanupReport, error) {
+//
+// §11.4.174 ownership scoping: the exact comm allowlist (crosvm / run_cvd /
+// cvd_internal_start) is ONLY a process-CLASS pre-filter; the LOAD-BEARING
+// ownership proof is the caller-supplied ownerToken appearing as an argv token
+// of the process (an instance selector such as "--base_instance_num=N"). A cvd
+// process belonging to a DIFFERENT instance is NEVER signalled. An empty
+// ownerToken is REFUSED (safe no-op) — we never fall back to a bare host-wide
+// comm match. Cuttlefish's production Stop supplies an EMPTY token (no host-
+// side ownership token exists for its container-namespaced cvd), so this
+// refuse-guard guarantees Stop performs NO host-wide reap; `rm -f <container>`
+// is the authoritative teardown.
+func cleanupWithDeps(ctx context.Context, ownerToken string, w procWalker, k killer) (CleanupReport, error) {
 	var report CleanupReport
+	if ownerToken == "" {
+		return report, nil
+	}
 	pidComms, err := w.PidComms()
+	if err != nil {
+		return report, err
+	}
+	cmdlines, err := w.PidCmdlines()
 	if err != nil {
 		return report, err
 	}
@@ -91,9 +110,11 @@ func cleanupWithDeps(ctx context.Context, w procWalker, k killer) (CleanupReport
 			report.SkippedReadErr = append(report.SkippedReadErr, pid)
 			continue
 		}
-		// EXACT comm match against the Cuttlefish allowlist — the
-		// falsifiability mutation target (see TestCleanup_ExactNameMatch).
-		if _, ok := cuttlefishProcNames[comm]; ok {
+		// EXACT comm allowlist pre-filter AND the argv ownership token, proving
+		// this cvd process is OURS. Falsifiability targets:
+		// TestCleanup_ExactNameMatch (allowlist) +
+		// TestCleanup_OwnershipScopedToOurInstance (argv token).
+		if _, ok := cuttlefishProcNames[comm]; ok && argvContains(cmdlines[pid], ownerToken) {
 			report.Found = append(report.Found, pid)
 		}
 	}
@@ -147,6 +168,19 @@ func cleanupWithDeps(ctx context.Context, w procWalker, k killer) (CleanupReport
 	return report, nil
 }
 
+// argvContains reports whether any argv token equals tok. (An instance
+// selector such as "--base_instance_num=1" is emitted by cvd as a single argv
+// token; substring matches are intentionally NOT honoured — that is the
+// §11.4.174 name-match bluff vector this gate exists to prevent.)
+func argvContains(argv []string, tok string) bool {
+	for _, a := range argv {
+		if a == tok {
+			return true
+		}
+	}
+	return false
+}
+
 // procFSWalker is the Linux /proc-based walker.
 type procFSWalker struct{}
 
@@ -167,6 +201,32 @@ func (procFSWalker) PidComms() (map[int]string, error) {
 			continue
 		}
 		out[pid] = strings.TrimSpace(string(b))
+	}
+	return out, nil
+}
+
+func (procFSWalker) PidCmdlines() (map[int][]string, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[int][]string)
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		b, err := os.ReadFile("/proc/" + e.Name() + "/cmdline")
+		if err != nil {
+			out[pid] = nil
+			continue
+		}
+		raw := strings.TrimRight(string(b), "\x00")
+		if raw == "" {
+			out[pid] = nil
+			continue
+		}
+		out[pid] = strings.Split(raw, "\x00")
 	}
 	return out, nil
 }
@@ -204,6 +264,37 @@ func (w psWalker) PidComms() (map[int]string, error) {
 			comm = comm[idx+1:]
 		}
 		result[pid] = comm
+	}
+	return result, nil
+}
+
+// PidCmdlines returns pid -> argv via `ps -Aww -o pid,args` (space-delimited,
+// which the argv-token ownership matcher treats identically to the NUL-split
+// /proc/pid/cmdline tokens on Linux).
+func (w psWalker) PidCmdlines() (map[int][]string, error) {
+	out, err := w.exec.Execute(context.Background(), "ps", "-Aww", "-o", "pid,args")
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[int][]string)
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 1 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid <= 0 {
+			continue
+		}
+		if len(fields) < 2 {
+			result[pid] = nil
+			continue
+		}
+		result[pid] = fields[1:]
 	}
 	return result, nil
 }

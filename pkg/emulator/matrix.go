@@ -110,7 +110,7 @@ func (r *AndroidMatrixRunner) runOne(
 	// the matrix row — the subsequent Boot will discover the new
 	// emulator's serial via dynamic discovery regardless of stale
 	// processes.
-	if _, cleanupErr := Cleanup(ctx); cleanupErr != nil {
+	if _, cleanupErr := Cleanup(ctx, avd.Name); cleanupErr != nil {
 		fmt.Fprintf(os.Stderr,
 			"[matrix] pre-boot cleanup warning for %s: %v\n",
 			avd.Name, cleanupErr,

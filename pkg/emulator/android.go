@@ -801,9 +801,10 @@ func (a *AndroidEmulator) Boot(
 		//
 		// We use Cleanup() here (not KillByPort) because we don't know the
 		// port — the discovery timeout means we never learned which port the
-		// emulator bound to. Cleanup() uses the strict "qemu-system-" comm
-		// prefix so only Android emulator processes are targeted.
-		cleanupReport, cleanupErr := Cleanup(ctx)
+		// emulator bound to. Cleanup(avd.Name) is ownership-scoped: it reaps
+		// ONLY the qemu-system-* carrying `-avd <avd.Name>` in its argv
+		// (§11.4.174), never every host qemu-system-*.
+		cleanupReport, cleanupErr := Cleanup(ctx, avd.Name)
 		if cleanupErr != nil {
 			fmt.Fprintf(os.Stderr,
 				"[boot] cleanup after port-discovery timeout: %v\n",
@@ -925,24 +926,20 @@ func (a *AndroidEmulator) WaitForBoot(
 			killReport.Surviving,
 		)
 	} else {
-		// Matched=0 means KillByPort found no process with "-port <consolePort>".
-		// This is possible if the emulator used a different port or if the
-		// process already exited on its own. Fall back to Cleanup() which uses
-		// the broader "qemu-system-" comm prefix.
-		cleanupReport, cleanupErr := Cleanup(ctx)
-		if cleanupErr != nil {
-			fmt.Fprintf(os.Stderr,
-				"[wait-for-boot] Cleanup() fallback after KillByPort matched=0: %v\n",
-				cleanupErr,
-			)
-		} else if len(cleanupReport.Found) > 0 {
-			fmt.Fprintf(os.Stderr,
-				"[wait-for-boot] Cleanup() fallback: found=%v terminated=%v killed=%v\n",
-				cleanupReport.Found,
-				cleanupReport.TerminatedTERM,
-				cleanupReport.KilledKILL,
-			)
-		}
+		// Matched=0 means KillByPort found no process with "-port <consolePort>":
+		// either our emulator on this port already exited (nothing OURS to reap)
+		// or its qemu child does not carry "-port <consolePort>" adjacently. Per
+		// §11.4.174 we do NOT fall back to a host-wide "qemu-system-" comm reap
+		// here — that would SIGKILL foreign / concurrent emulators (and, in
+		// concurrent-matrix mode, sibling emulators mid-test) that merely share
+		// the process name. avd is not in this method's scope, so there is no
+		// ownership token to scope a reap by; a genuinely-stuck OUR emulator that
+		// KillByPort could not match is a KillByPort port-signature gap to fix at
+		// its source, never a host-wide name-kill.
+		fmt.Fprintf(os.Stderr,
+			"[wait-for-boot] KillByPort(%d) matched 0; not falling back to host-wide reap (§11.4.174 ownership scoping)\n",
+			consolePort,
+		)
 	}
 
 	return time.Since(startedAt),

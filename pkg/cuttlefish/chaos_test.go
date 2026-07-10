@@ -93,17 +93,23 @@ func TestChaos_WaitForReadyContextCancelled(t *testing.T) {
 // honestly in report.Surviving and still kills the ones it can, so the
 // caller has an accurate picture (§11.4.6 — no silent success).
 func TestChaos_KillerFailsOnSomePIDs(t *testing.T) {
-	wk := fakeWalker{comms: map[int]string{
-		701: "crosvm",  // immortal + SIGKILL fails → Surviving
-		702: "run_cvd", // immortal + SIGKILL succeeds → KilledKILL
-	}}
+	wk := fakeWalker{
+		comms: map[int]string{
+			701: "crosvm",  // immortal + SIGKILL fails → Surviving
+			702: "run_cvd", // immortal + SIGKILL succeeds → KilledKILL
+		},
+		cmdlines: map[int][]string{
+			701: {"crosvm", "--base_instance_num=1"},
+			702: {"run_cvd", "--base_instance_num=1"},
+		},
+	}
 	k := newFakeKiller()
 	k.immortal[701] = true
 	k.immortal[702] = true
 	k.killProof[701] = false // SIGKILL on 701 fails
 	k.killProof[702] = true
 
-	report, err := cleanupWithDeps(context.Background(), wk, k)
+	report, err := cleanupWithDeps(context.Background(), "--base_instance_num=1", wk, k)
 	require.NoError(t, err, "a kill failure is reported in the struct, not as an error")
 	assert.ElementsMatch(t, []int{701, 702}, report.Found)
 	assert.Contains(t, report.Surviving, 701, "the un-killable pid MUST be surfaced as Surviving")
@@ -117,7 +123,7 @@ func TestChaos_KillerFailsOnSomePIDs(t *testing.T) {
 func TestChaos_WalkerError(t *testing.T) {
 	wk := fakeWalker{err: errors.New("ps: operation not permitted")}
 	k := newFakeKiller()
-	report, err := cleanupWithDeps(context.Background(), wk, k)
+	report, err := cleanupWithDeps(context.Background(), "--base_instance_num=1", wk, k)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "operation not permitted")
 	assert.Empty(t, report.Found)
@@ -130,13 +136,16 @@ func TestChaos_WalkerError(t *testing.T) {
 // context error promptly, no panic, no goroutine leak.
 func TestChaos_CleanupContextCancelledMidWait(t *testing.T) {
 	base := runtime.NumGoroutine()
-	wk := fakeWalker{comms: map[int]string{801: "crosvm"}}
+	wk := fakeWalker{
+		comms:    map[int]string{801: "crosvm"},
+		cmdlines: map[int][]string{801: {"crosvm", "--base_instance_num=1"}},
+	}
 	k := newFakeKiller()
 	k.immortal[801] = true // never dies on SIGTERM → forces the wait loop
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already cancelled
-	_, err := cleanupWithDeps(ctx, wk, k)
+	_, err := cleanupWithDeps(ctx, "--base_instance_num=1", wk, k)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, context.Canceled)
 	assertNoGoroutineLeak(t, base)
@@ -205,10 +214,11 @@ func TestChaos_MalformedADBDevicesOutput(t *testing.T) {
 
 // TestChaos_StopCleanupRunsDespiteRmFailure — state-corruption injection at
 // teardown: the authoritative `rm -f` fails (container stuck). RECOVERY
-// contract: Stop returns the wrapped rm error BUT (a) orphan reaping still
-// ran and (b) containerName is cleared so the instance is not wedged
-// half-torn-down — teardown is best-effort-complete, never aborted midway
-// (§11.4.14 leave-the-target-quiescent).
+// contract: Stop returns the wrapped rm error BUT containerName is cleared so
+// the instance is not wedged half-torn-down — teardown is best-effort-complete,
+// never aborted midway (§11.4.14 leave-the-target-quiescent). Per §11.4.174 Stop
+// performs NO host-wide cvd reap (it hands the reaper an empty ownership token,
+// which refuses); `rm -f` is the sole teardown signal.
 func TestChaos_StopCleanupRunsDespiteRmFailure(t *testing.T) {
 	withStatDevice(t, DefaultDevices()...)
 	exec := &safeExecutor{fn: func(name string, args []string) ([]byte, error) {
