@@ -70,7 +70,7 @@ func (r *RemoteRuntime) Start(
 	id string,
 	opts ...runtime.StartOption,
 ) error {
-	cmd := fmt.Sprintf("start %s", id)
+	cmd := fmt.Sprintf("start %s", shellEscape(id))
 	_, err := r.exec(ctx, cmd)
 	return err
 }
@@ -81,7 +81,7 @@ func (r *RemoteRuntime) Stop(
 	id string,
 	opts ...runtime.StopOption,
 ) error {
-	cmd := fmt.Sprintf("stop %s", id)
+	cmd := fmt.Sprintf("stop %s", shellEscape(id))
 	_, err := r.exec(ctx, cmd)
 	return err
 }
@@ -92,7 +92,7 @@ func (r *RemoteRuntime) Remove(
 	id string,
 	opts ...runtime.RemoveOption,
 ) error {
-	cmd := fmt.Sprintf("rm -f %s", id)
+	cmd := fmt.Sprintf("rm -f %s", shellEscape(id))
 	_, err := r.exec(ctx, cmd)
 	return err
 }
@@ -105,7 +105,7 @@ func (r *RemoteRuntime) Status(
 		"inspect --format '{{.Id}}|{{.Name}}|{{.State.Status}}|"+
 			"{{.State.Health.Status}}|{{.State.StartedAt}}|"+
 			"{{.State.FinishedAt}}|{{.State.ExitCode}}' %s",
-		id,
+		shellEscape(id),
 	)
 	result, err := r.exec(ctx, cmd)
 	if err != nil {
@@ -124,14 +124,15 @@ func (r *RemoteRuntime) List(
 		args += " -a"
 	}
 	for k, v := range filter.Labels {
-		args += fmt.Sprintf(" --filter label=%s=%s", k, v)
+		args += fmt.Sprintf(" --filter label=%s=%s",
+			shellEscape(k), shellEscape(v))
 	}
 	for _, name := range filter.Names {
-		args += fmt.Sprintf(" --filter name=%s", name)
+		args += fmt.Sprintf(" --filter name=%s", shellEscape(name))
 	}
 	for _, status := range filter.Status {
 		args += fmt.Sprintf(
-			" --filter status=%s", string(status),
+			" --filter status=%s", shellEscape(string(status)),
 		)
 	}
 
@@ -151,7 +152,7 @@ func (r *RemoteRuntime) Stats(
 		"stats --no-stream --format "+
 			"'{{.CPUPerc}}|{{.MemPerc}}|{{.MemUsage}}|"+
 			"{{.NetIO}}|{{.BlockIO}}|{{.PIDs}}' %s",
-		id,
+		shellEscape(id),
 	)
 	result, err := r.exec(ctx, cmd)
 	if err != nil {
@@ -172,7 +173,7 @@ func (r *RemoteRuntime) Exec(
 		)
 	}
 	command := fmt.Sprintf(
-		"exec %s %s", id, strings.Join(escapedCmd, " "),
+		"exec %s %s", shellEscape(id), strings.Join(escapedCmd, " "),
 	)
 
 	result, err := r.exec(ctx, command)
@@ -193,7 +194,7 @@ func (r *RemoteRuntime) Logs(
 	id string,
 	opts ...runtime.LogOption,
 ) (io.ReadCloser, error) {
-	cmd := fmt.Sprintf("logs %s", id)
+	cmd := fmt.Sprintf("logs %s", shellEscape(id))
 	return r.executor.ExecuteStream(
 		ctx, r.host, r.runtimeCmd(cmd),
 	)
