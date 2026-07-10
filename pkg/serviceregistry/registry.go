@@ -26,6 +26,7 @@ type Service struct {
 
 type ServiceRegistry struct {
 	mu           sync.RWMutex
+	persistMu    sync.Mutex
 	services     map[string]*Service
 	serviceFiles map[string]string
 	registryDir  string
@@ -82,7 +83,6 @@ func New(opts ...Option) *ServiceRegistry {
 
 func (r *ServiceRegistry) Register(name string, port int, opts ...ServiceOption) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	svc := &Service{
 		Name:     name,
@@ -99,8 +99,11 @@ func (r *ServiceRegistry) Register(name string, port int, opts ...ServiceOption)
 	svc.LastChecked = time.Now()
 
 	r.services[name] = svc
-	r.logger.Info("Registered service %s at %s:%d", name, svc.Host, svc.Port)
-	r.saveToDisk()
+	host, port := svc.Host, svc.Port
+	r.mu.Unlock()
+
+	r.logger.Info("Registered service %s at %s:%d", name, host, port)
+	r.persist()
 	return nil
 }
 
@@ -187,19 +190,22 @@ func (r *ServiceRegistry) List() []Service {
 
 func (r *ServiceRegistry) Unregister(name string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	delete(r.services, name)
+	r.mu.Unlock()
 	r.logger.Info("Unregistered service %s", name)
-	r.saveToDisk()
+	r.persist()
 }
 
 func (r *ServiceRegistry) UpdateHealth(name string, healthy bool) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if svc, ok := r.services[name]; ok {
+	svc, ok := r.services[name]
+	if ok {
 		svc.Healthy = healthy
 		svc.LastChecked = time.Now()
-		r.saveToDisk()
+	}
+	r.mu.Unlock()
+	if ok {
+		r.persist()
 	}
 }
 
@@ -257,6 +263,12 @@ func (r *ServiceRegistry) checkPort(host string, port int) bool {
 	return true
 }
 
+// FindAvailablePort returns the first port at or above startPort that is free
+// to bind. NOTE (inherent TOCTOU): the port is confirmed free by binding and
+// immediately closing a listener, so between this call and the caller actually
+// binding the port another process can claim it. Callers that need a race-free
+// port MUST bind with port 0 (let the OS assign) and keep the returned
+// listener, rather than relying on this check-then-use helper.
 func (r *ServiceRegistry) FindAvailablePort(startPort int) int {
 	for port := startPort; port < startPort+10000; port++ {
 		if r.isPortAvailable(port) {
@@ -275,24 +287,57 @@ func (r *ServiceRegistry) isPortAvailable(port int) bool {
 	return true
 }
 
-func (r *ServiceRegistry) saveToDisk() {
+// persist writes a snapshot of the registry to disk. The snapshot is marshaled
+// under the read lock (an in-memory, non-blocking step), but the blocking disk
+// I/O runs OUTSIDE r.mu — MANDATORY DEVELOPMENT PRINCIPLE #2: no blocking
+// operation may run inside a synchronized region, so a slow fsync never stalls
+// every reader/writer waiting on r.mu. persistMu serializes concurrent writers
+// (they no longer hold r.mu, so two could otherwise race on the file). The
+// write is atomic: a temp file in the same directory is renamed over the
+// target, so a crash mid-write leaves the previous registry intact rather than
+// a truncated file (§9 data-safety).
+func (r *ServiceRegistry) persist() {
 	if r.registryDir == "" {
 		return
 	}
-	if err := os.MkdirAll(r.registryDir, 0755); err != nil {
-		r.logger.Warn("Failed to create registry dir: %v", err)
-		return
-	}
 
+	r.mu.RLock()
 	data, err := json.MarshalIndent(r.services, "", "  ")
+	r.mu.RUnlock()
 	if err != nil {
 		r.logger.Warn("Failed to marshal services: %v", err)
 		return
 	}
 
+	r.persistMu.Lock()
+	defer r.persistMu.Unlock()
+
+	if err := os.MkdirAll(r.registryDir, 0755); err != nil {
+		r.logger.Warn("Failed to create registry dir: %v", err)
+		return
+	}
+
 	file := filepath.Join(r.registryDir, "services.json")
-	if err := os.WriteFile(file, data, 0644); err != nil {
-		r.logger.Warn("Failed to write registry: %v", err)
+	tmp, err := os.CreateTemp(r.registryDir, "services-*.json.tmp")
+	if err != nil {
+		r.logger.Warn("Failed to create temp registry file: %v", err)
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		r.logger.Warn("Failed to write temp registry: %v", err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		r.logger.Warn("Failed to close temp registry: %v", err)
+		return
+	}
+	if err := os.Rename(tmpName, file); err != nil {
+		os.Remove(tmpName)
+		r.logger.Warn("Failed to rename registry into place: %v", err)
 	}
 }
 
@@ -308,7 +353,22 @@ func (r *ServiceRegistry) loadFromDisk() {
 
 	var loaded map[string]*Service
 	if err := json.Unmarshal(data, &loaded); err != nil {
-		r.logger.Warn("Failed to unmarshal registry: %v", err)
+		// A corrupt registry file must NOT silently yield an empty registry —
+		// that looks identical to "no services were ever registered" and masks
+		// real data loss. Preserve the corrupt bytes aside for recovery and
+		// surface the failure loudly instead of swallowing it.
+		corrupt := file + ".corrupt"
+		if renameErr := os.Rename(file, corrupt); renameErr != nil {
+			r.logger.Error(
+				"Registry file %s is corrupt (%v) and could not be preserved: %v",
+				file, err, renameErr,
+			)
+		} else {
+			r.logger.Error(
+				"Registry file %s is corrupt (%v); moved aside to %s",
+				file, err, corrupt,
+			)
+		}
 		return
 	}
 
