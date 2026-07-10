@@ -275,6 +275,14 @@ func (m *DefaultManager) Stop(
 	entry.state = "stopped"
 	entry.healthy = false
 	entry.lastStop = time.Now()
+	// Reset the one-shot LazyBooter so a lazy service that was idle-stopped (or
+	// stopped manually) is REVIVED on the next Acquire. Without this, the already-
+	// fired sync.Once inside the LazyBooter returns its cached nil forever, so
+	// Start is never re-invoked and Acquire hands back a live-looking lease on a
+	// dead container (§11.4.108). A concurrent lazy Acquire copies its LazyBooter
+	// pointer under m.mu before calling EnsureStarted, so nil-ing it here only
+	// affects the NEXT Acquire.
+	entry.lazyBooter = nil
 	m.mu.Unlock()
 
 	return nil
