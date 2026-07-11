@@ -2,8 +2,36 @@ package health
 
 import (
 	"context"
+	"math"
 	"time"
 )
+
+// maxRetryDelay caps the computed exponential-backoff delay (Wave-20 HE-5).
+// Without a ceiling, a large Delay/BackoffFactor/MaxRetries combination can
+// overflow the float64->time.Duration conversion; on amd64 this has been
+// empirically confirmed to yield math.MinInt64 (a large NEGATIVE duration)
+// via the CVTTSD2SI "integer indefinite" result, and time.After(negative)
+// fires immediately — turning the intended backoff into a busy-loop.
+const maxRetryDelay = 10 * time.Minute
+
+// nextRetryDelay computes the next backoff delay for CheckWithRetry,
+// clamped to maxRetryDelay whenever the raw product is non-finite or
+// negative (the overflow signature above — delay and backoffFactor are
+// both non-negative here, so a negative product can only be an overflow
+// artifact, never a legitimate result) or simply larger than the ceiling.
+func nextRetryDelay(delay time.Duration, backoffFactor float64) time.Duration {
+	if backoffFactor <= 0 {
+		return delay
+	}
+	next := float64(delay) * backoffFactor
+	if math.IsNaN(next) || math.IsInf(next, 0) || next < 0 {
+		return maxRetryDelay
+	}
+	if next > float64(maxRetryDelay) {
+		return maxRetryDelay
+	}
+	return time.Duration(next)
+}
 
 // RetryPolicy configures how many times and how long to wait between
 // successive health check attempts.
@@ -65,11 +93,7 @@ func CheckWithRetry(
 			case <-time.After(delay):
 			}
 
-			if policy.BackoffFactor > 0 {
-				delay = time.Duration(
-					float64(delay) * policy.BackoffFactor,
-				)
-			}
+			delay = nextRetryDelay(delay, policy.BackoffFactor)
 		}
 	}
 

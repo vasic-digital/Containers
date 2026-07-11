@@ -3,8 +3,12 @@ package health
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -49,10 +53,47 @@ func NewHelixServiceHealthChecker(serviceName string) *HelixServiceHealthChecker
 		"jaeger":           {ServiceName: "jaeger", CheckType: "http", Host: "localhost", Port: 16686, Path: "/", Timeout: 5 * time.Second, Retries: 5},
 		"vault":            {ServiceName: "vault", CheckType: "http", Host: "localhost", Port: 8200, Path: "/v1/sys/health", Timeout: 5 * time.Second, Retries: 5},
 	}
-	if c, ok := configs[serviceName]; ok {
-		return c
+	c, ok := configs[serviceName]
+	if !ok {
+		return nil
 	}
-	return nil
+	applyHelixServiceEnvOverrides(c)
+	return c
+}
+
+// helixHealthEnvPrefix namespaces the per-service Host/Port/Path override
+// environment variables (Wave-20 HE-4, §6.R). No connection literal is
+// hardcoded here; the map above supplies documented FALLBACK DEFAULTS so
+// existing callers keep compiling and behaving identically when the
+// corresponding env var is unset — the override only takes effect when an
+// operator/deployment explicitly sets it.
+const helixHealthEnvPrefix = "HELIX_HEALTH_"
+
+// helixServiceEnvKey builds the env-var name for a given service + field
+// suffix, e.g. service "postgres-primary" + suffix "HOST" ->
+// "HELIX_HEALTH_POSTGRES_PRIMARY_HOST".
+func helixServiceEnvKey(serviceName, suffix string) string {
+	key := strings.ToUpper(strings.ReplaceAll(serviceName, "-", "_"))
+	return helixHealthEnvPrefix + key + "_" + suffix
+}
+
+// applyHelixServiceEnvOverrides overlays Host/Port/Path with values from
+// the service's namespaced env vars, when set and valid. The struct's
+// literal defaults (from the configs map) are left untouched — and thus
+// still in full effect — whenever the corresponding env var is absent,
+// empty, or (for Port) not a valid positive integer.
+func applyHelixServiceEnvOverrides(c *HelixServiceHealthChecker) {
+	if v := os.Getenv(helixServiceEnvKey(c.ServiceName, "HOST")); v != "" {
+		c.Host = v
+	}
+	if v := os.Getenv(helixServiceEnvKey(c.ServiceName, "PORT")); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 {
+			c.Port = p
+		}
+	}
+	if v := os.Getenv(helixServiceEnvKey(c.ServiceName, "PATH")); v != "" {
+		c.Path = v
+	}
 }
 
 // Check performs the health check.
@@ -107,7 +148,13 @@ func (h *HelixServiceHealthChecker) checkOnce(ctx context.Context) (HealthStatus
 
 	switch h.CheckType {
 	case "tcp":
-		conn, err := net.DialTimeout("tcp", addr, h.Timeout)
+		// Use a Dialer bound to ctx (not net.DialTimeout, which takes no
+		// context and cannot observe cancellation) so the ctx above
+		// (already timeout-bounded, and cancellable by the caller) can
+		// abort the dial promptly instead of always blocking for the
+		// full h.Timeout (Wave-20 HE-1).
+		dialer := &net.Dialer{Timeout: h.Timeout}
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			return HealthStatus{Healthy: false, Message: err.Error()}, err
 		}
@@ -120,12 +167,27 @@ func (h *HelixServiceHealthChecker) checkOnce(ctx context.Context) (HealthStatus
 		if err != nil {
 			return HealthStatus{Healthy: false, Message: err.Error()}, err
 		}
-		client := &http.Client{Timeout: h.Timeout}
+		client := &http.Client{
+			Timeout: h.Timeout,
+			// Do not transparently follow redirects (HE-3): the message
+			// below reports the status as if it came from addr/url — a
+			// silently-followed redirect could hand back a DIFFERENT
+			// server's status code under the original target's name.
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			return HealthStatus{Healthy: false, Message: err.Error()}, err
 		}
-		defer resp.Body.Close()
+		defer func() {
+			// Drain (bounded) before Close so the shared
+			// http.DefaultTransport can pool/reuse the underlying
+			// connection (HE-2) instead of a fresh dial per check.
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes))
+			_ = resp.Body.Close()
+		}()
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return HealthStatus{Healthy: true, Message: fmt.Sprintf("http %d", resp.StatusCode)}, nil
 		}

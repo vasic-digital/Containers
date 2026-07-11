@@ -28,7 +28,13 @@ func CheckTCP(ctx context.Context, target HealthTarget) *HealthResult {
 		}
 	}
 
-	conn, err := net.DialTimeout("tcp", addr, timeout)
+	// Use a Dialer bound to ctx (not net.DialTimeout, which takes no
+	// context and cannot observe cancellation) so an explicit cancel()
+	// on a deadline-less ctx aborts the dial promptly instead of
+	// blocking for the full timeout — matching grpc.go's DialContext
+	// use (Wave-20 HE-1).
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	duration := time.Since(start)
 
 	if err != nil {
