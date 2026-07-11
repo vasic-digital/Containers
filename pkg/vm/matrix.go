@@ -109,6 +109,22 @@ func (r *QEMUMatrixRunner) RunMatrix(ctx context.Context, config VMMatrixConfig)
 			)
 		}
 	}
+	// VM2-7 (§11.4.118 — the I1 guard above covers only
+	// CaptureSpec.HostSubpath, but runOne feeds target.ID into the SAME
+	// filepath.Join(EvidenceDir, target.ID, ...) for every captured file
+	// AND the screenshot-on-failure path; an unguarded target.ID like
+	// "../../etc" escapes the evidence sandbox exactly as a bad
+	// HostSubpath would). Reject any target whose ID resolves outside
+	// EvidenceDir, symmetric to the HostSubpath guard.
+	for i, target := range config.Targets {
+		cleaned := filepath.Clean(target.ID)
+		if cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.HasPrefix(cleaned, "/") {
+			return VMMatrixResult{}, fmt.Errorf(
+				"VMMatrixConfig.Targets[%d].ID %q escapes the evidence sandbox (target-id path traversal forbidden)",
+				i, target.ID,
+			)
+		}
+	}
 	if err := os.MkdirAll(config.EvidenceDir, 0o755); err != nil {
 		return VMMatrixResult{}, fmt.Errorf("create evidence dir: %w", err)
 	}

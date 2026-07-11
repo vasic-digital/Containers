@@ -497,20 +497,29 @@ func (r *realQMPClient) Screendump(ctx context.Context, hostPath string) error {
 	return nil
 }
 
-// escapeJSONString escapes a string for safe inclusion inside a
-// JSON string literal. Only the canonical 4 chars need escaping for
-// the QMP screendump filename; we keep this minimal rather than
-// pulling in encoding/json for one field.
+// escapeJSONString escapes a string for safe inclusion inside a JSON
+// string literal (the caller's command template supplies the
+// surrounding quotes).
+//
+// VM2-6: the prior implementation escaped via a
+// `for k, v := range map[string]string{...}` two-pass ReplaceAll. Go
+// DELIBERATELY randomizes map-iteration order, so on the calls where the
+// `"`→`\"` pass happened to run BEFORE the `\`→`\\` pass, the backslash
+// that escaping a quote introduced was itself double-escaped — producing
+// INVALID JSON (the `"` left unescaped, terminating the QMP `screendump`
+// filename string early and letting whatever followed it be parsed as
+// further QMP arguments) on a non-deterministic ~13% of calls for any
+// filename containing a `"`. It also never escaped control characters
+// (newline, tab, ...) at all, so a filename carrying one produced
+// invalid JSON unconditionally. encoding/json (already imported for
+// qmpEnvelope) escapes deterministically AND completely; we strip its
+// surrounding quotes because the command template supplies its own.
 func escapeJSONString(s string) string {
-	repl := map[string]string{
-		`\`: `\\`,
-		`"`: `\"`,
+	b, err := json.Marshal(s)
+	if err != nil || len(b) < 2 {
+		return s
 	}
-	out := s
-	for k, v := range repl {
-		out = strings.ReplaceAll(out, k, v)
-	}
-	return out
+	return string(b[1 : len(b)-1])
 }
 
 func (r *realQMPClient) Close() error {
