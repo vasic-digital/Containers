@@ -1,6 +1,8 @@
 package lifecycle
 
 import (
+	"log"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -145,6 +147,28 @@ func (is *IdleShutdown) fire() {
 	is.mu.Unlock()
 
 	if is.onIdle != nil {
-		is.onIdle()
+		// SW6-1: the timer's runtime goroutine (clock.go realClock.AfterFunc
+		// → time.AfterFunc) runs fire() on a stack with NO recover(), so a
+		// panic inside the consumer-supplied onIdle() would crash the whole
+		// daemon. Contain it here, mirroring the module's own established
+		// convention in pkg/event/subscriber.go dispatch(): a recovered panic
+		// is surfaced honestly (logged with the recovered value and the stack)
+		// — never silently swallowed — while the process survives. fire() has
+		// no logger in scope, so this mirrors dispatch()'s package-level
+		// log.Printf form exactly. The non-panic path is unchanged: onIdle()
+		// runs, no recover triggers, and fire() has already reset/rescheduled
+		// (or committed to shutdown) above.
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf(
+						"lifecycle: idle-shutdown onIdle callback "+
+							"panicked: %v\n%s",
+						r, debug.Stack(),
+					)
+				}
+			}()
+			is.onIdle()
+		}()
 	}
 }
