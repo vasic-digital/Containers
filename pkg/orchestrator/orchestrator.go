@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +60,11 @@ type DefaultOrchestrator struct {
 	remoteEnabled  bool
 	mu             sync.Mutex
 	excludePattern string
+	// startedByName records, per service name, HOW that service was most
+	// recently started (local compose-up vs SSH to a specific remote host) so
+	// a LATER StopAll call — which has no other way to know a service's
+	// provenance — can route its teardown correctly (OR-2). Guarded by mu.
+	startedByName map[string]startedService
 }
 
 type Option func(*DefaultOrchestrator)
@@ -106,21 +112,46 @@ func New(opts ...Option) *DefaultOrchestrator {
 	return o
 }
 
+// walkDir is the directory-walk function DiscoverServices uses to find
+// compose files. It is a package variable (not a hardcoded filepath.Walk
+// call) so tests can substitute a blocking/instrumented walker to prove
+// DiscoverServices does not hold o.mu across the walk (OR-5) without relying
+// on real-filesystem walk timing.
+var walkDir = filepath.Walk
+
 func (o *DefaultOrchestrator) DiscoverServices(dockerDir string) error {
+	// Snapshot config + the current service set under the lock, then release
+	// it BEFORE the blocking directory walk (OR-5, MANDATORY PRINCIPLE #2 —
+	// no blocking work inside a shared lock). Previously o.mu was held for the
+	// ENTIRE walk, stalling every other o.mu user (AddService, ListServices,
+	// ServiceCount, StartAll, StopAll, StartService) until a — potentially
+	// large — directory tree finished scanning.
 	o.mu.Lock()
-	defer o.mu.Unlock()
+	projectDir := o.projectDir
+	excludePattern := o.excludePattern
+	existing := make(map[string]bool, len(o.services))
+	for _, svc := range o.services {
+		existing[svc.ComposeFile] = true
+	}
+	o.mu.Unlock()
 
 	absDir := dockerDir
 	if !filepath.IsAbs(dockerDir) {
-		absDir = filepath.Join(o.projectDir, dockerDir)
+		absDir = filepath.Join(projectDir, dockerDir)
 	}
 
 	if _, err := os.Stat(absDir); os.IsNotExist(err) {
 		return fmt.Errorf("docker directory not found: %s", absDir)
 	}
 
-	return filepath.Walk(absDir, func(path string, info os.FileInfo, err error) error {
+	var discovered []Service
+	walkErr := walkDir(absDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			// OR-7: a per-entry walk error (e.g. an unreadable subdirectory)
+			// must be logged, not silently swallowed — a partial scan must
+			// never look like a complete one. filepath.Walk still continues
+			// with the remaining entries after this returns nil.
+			o.logger.Warn("orchestrator: DiscoverServices walk error at %s: %v", path, err)
 			return nil
 		}
 		if info.IsDir() {
@@ -128,32 +159,59 @@ func (o *DefaultOrchestrator) DiscoverServices(dockerDir string) error {
 		}
 
 		name := strings.ToLower(info.Name())
-		if !strings.Contains(name, "docker-compose") || !strings.HasSuffix(name, ".yml") {
+		// OR-6: accept both .yml and .yaml — both are canonical Docker
+		// Compose file extensions; only matching .yml silently missed
+		// legitimately-named services.
+		if !strings.Contains(name, "docker-compose") ||
+			(!strings.HasSuffix(name, ".yml") && !strings.HasSuffix(name, ".yaml")) {
 			return nil
 		}
 
-		if o.excludePattern != "" {
-			if matched, _ := filepath.Match(o.excludePattern, info.Name()); matched {
+		if excludePattern != "" {
+			if matched, _ := filepath.Match(excludePattern, info.Name()); matched {
 				return nil
 			}
 		}
 
-		relPath, _ := filepath.Rel(o.projectDir, path)
+		relPath, _ := filepath.Rel(projectDir, path)
 		dirName := filepath.Base(filepath.Dir(path))
 
-		for _, svc := range o.services {
-			if svc.ComposeFile == relPath || svc.ComposeFile == path {
-				return nil
-			}
+		if existing[relPath] || existing[path] {
+			return nil
 		}
 
-		o.services = append(o.services, Service{
+		discovered = append(discovered, Service{
 			Name:        dirName,
 			ComposeFile: relPath,
 			Description: fmt.Sprintf("Auto-discovered from %s", relPath),
 		})
 		return nil
 	})
+	if walkErr != nil {
+		return walkErr
+	}
+
+	if len(discovered) == 0 {
+		return nil
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	// Re-check duplicates against the CURRENT o.services — it may have
+	// changed concurrently since the snapshot above, since the lock was
+	// released across the blocking walk — before inserting.
+	seen := make(map[string]bool, len(o.services))
+	for _, svc := range o.services {
+		seen[svc.ComposeFile] = true
+	}
+	for _, svc := range discovered {
+		if seen[svc.ComposeFile] {
+			continue
+		}
+		o.services = append(o.services, svc)
+		seen[svc.ComposeFile] = true
+	}
+	return nil
 }
 
 func (o *DefaultOrchestrator) AddService(svc Service) {
@@ -162,11 +220,174 @@ func (o *DefaultOrchestrator) AddService(svc Service) {
 	o.services = append(o.services, svc)
 }
 
-// startedService records a service StartAll successfully started, so it can be
-// rolled back (compose-down) if a required service later fails mid-boot.
+// startedService records a service StartAll (or StartService) successfully
+// started, so it can be torn down (compose-down) correctly later — either
+// immediately by rollback() if a required service fails mid-boot, or later by
+// StopAll(). remote/remoteHost/remoteDest record WHERE it was started (OR-2):
+// a service started via startRemote (SSH to a specific host) MUST be torn
+// down on that SAME host via the remote executor, never assumed to be a
+// local compose-down.
 type startedService struct {
 	svc        Service
 	composeAbs string
+	remote     bool
+	remoteHost remote.RemoteHost
+	remoteDest string
+}
+
+// remoteStartInfo records the host and remote destination directory a
+// service was booted into on a successful remote start (OR-2), so a later
+// teardown (rollback or StopAll) can be routed to the SAME host/directory
+// instead of defaulting to a local-only compose-down.
+type remoteStartInfo struct {
+	host remote.RemoteHost
+	dest string
+}
+
+// resolveRemoteStartInfo re-derives the host + remote destination directory
+// startRemote used for composeAbs's successful start. It performs NO I/O — it
+// re-applies the SAME formula startRemote uses (remoteServiceDest) against
+// whatever HostManager.ListHosts() reports right now, so it stays consistent
+// with the host startRemote actually picked (hosts[0]) for a call that just
+// succeeded. Returns nil if remote is not configured or no hosts are
+// available (should not happen immediately after a successful startRemote,
+// but is handled defensively rather than assumed).
+func (o *DefaultOrchestrator) resolveRemoteStartInfo(composeAbs string) *remoteStartInfo {
+	if o.hostMgr == nil {
+		return nil
+	}
+	hosts := o.hostMgr.ListHosts()
+	if len(hosts) == 0 {
+		return nil
+	}
+	host := hosts[0]
+	return &remoteStartInfo{host: host, dest: remoteServiceDest(host, composeAbs)}
+}
+
+// trackStarted records svc as currently running so a later StopAll call can
+// route its teardown correctly (OR-2). Callers MUST hold o.mu.
+func (o *DefaultOrchestrator) trackStarted(s startedService) {
+	if o.startedByName == nil {
+		o.startedByName = make(map[string]startedService)
+	}
+	o.startedByName[s.svc.Name] = s
+}
+
+// forgetStarted removes name's tracked start record after its teardown has
+// been attempted, so a subsequent StopAll does not re-attempt tearing down a
+// service that is already gone.
+func (o *DefaultOrchestrator) forgetStarted(name string) {
+	o.mu.Lock()
+	delete(o.startedByName, name)
+	o.mu.Unlock()
+}
+
+// shellQuote wraps s in single quotes for safe interpolation into a POSIX
+// shell command run on a remote host via ssh (OR-1). Any embedded single
+// quote is rendered as the canonical close-quote, backslash-escaped-quote,
+// reopen-quote sequence. startRemote hands its whole composed command string
+// to `ssh` as ONE argv element (pkg/remote's SSHExecutor.Execute), so the
+// REMOTE LOGIN SHELL parses it — any unescaped shell metacharacter in a
+// dynamic value (Service.Profile, a compose-dir basename taken from a disk
+// directory name, the remote destination directory) is remote command
+// execution. It always wraps (never leaves a value bare), so an empty value
+// renders as an empty single-quoted argument. Mirrors pkg/distribution's
+// proven shellQuote; kept local so this package stays decoupled (§11.4.28).
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// remoteHomeDir returns the per-host working directory startRemote copies a
+// service's compose directory into.
+func remoteHomeDir(host remote.RemoteHost) string {
+	return fmt.Sprintf("/home/%s/helixagent", host.User)
+}
+
+// remoteServiceDest returns the full remote destination directory startRemote
+// copies composePath's containing directory into, on host.
+func remoteServiceDest(host remote.RemoteHost, composePath string) string {
+	localDir := filepath.Dir(composePath)
+	return remoteHomeDir(host) + "/" + filepath.Base(localDir)
+}
+
+// buildRemoteComposeCommand renders a `docker compose` command to run on a
+// remote host inside remoteDest, for the given compose-file basename,
+// optional profile, and action ("up -d" / "down"). remoteDest,
+// composeFileBase, and profile are shell-quoted before interpolation (OR-1):
+// remoteDest derives from a disk directory name, composeFileBase from a disk
+// file name, and profile from Service.Profile configuration — this package
+// does not control the character set of any of them, and the whole string is
+// handed to the remote host's LOGIN SHELL as one argv element, so an
+// unescaped shell metacharacter in any of them is remote command execution.
+// action is an internal literal ("up -d"/"down" only, never user data) and is
+// not quoted.
+func buildRemoteComposeCommand(remoteDest, composeFileBase, profile, action string) string {
+	cmd := fmt.Sprintf("cd %s && docker compose -f %s", shellQuote(remoteDest), shellQuote(composeFileBase))
+	if profile != "" {
+		cmd += fmt.Sprintf(" --profile %s", shellQuote(profile))
+	}
+	return cmd + " " + action
+}
+
+// remoteComposeDown runs `docker compose ... down` for composeAbs's service
+// on host inside remoteDest, via the configured remote executor (OR-2's
+// remote-teardown path, the SSH-side counterpart of localOrch.Down).
+func (o *DefaultOrchestrator) remoteComposeDown(ctx context.Context, host remote.RemoteHost, remoteDest, composeAbs, profile string) error {
+	cmd := buildRemoteComposeCommand(remoteDest, filepath.Base(composeAbs), profile, "down")
+	result, err := o.remoteExec.Execute(ctx, host, cmd)
+	if err != nil {
+		return err
+	}
+	if result.ExitCode != 0 {
+		return fmt.Errorf("remote compose down failed: %s", result.Stderr)
+	}
+	return nil
+}
+
+// checkServiceHealth invokes o.healthChecker (if configured) against svc
+// after its compose entity has come up (OR-4: WithHealthChecker's documented
+// "Required services failing = boot failure" contract was never honoured —
+// a healthChecker could be wired and StartAll would still report success the
+// instant `docker compose up -d` exited 0, even for a container that
+// immediately crash-loops). A service opts into health checking by declaring
+// HealthPort > 0; HealthPort == 0 means "no health check for this service"
+// and is always a pass (nil), preserving existing behaviour for every
+// service that does not declare one. remoteInfo, when non-nil, targets the
+// health check at the remote host the service was started on instead of
+// localhost.
+func (o *DefaultOrchestrator) checkServiceHealth(ctx context.Context, svc Service, remoteInfo *remoteStartInfo) error {
+	if o.healthChecker == nil || svc.HealthPort <= 0 {
+		return nil
+	}
+
+	hostAddr := "localhost"
+	if remoteInfo != nil && remoteInfo.host.Address != "" {
+		hostAddr = remoteInfo.host.Address
+	}
+
+	target := health.HealthTarget{
+		Name:     svc.Name,
+		Host:     hostAddr,
+		Port:     strconv.Itoa(svc.HealthPort),
+		Path:     svc.HealthPath,
+		Type:     health.HealthTCP,
+		Required: svc.Required,
+	}
+	if svc.HealthPath != "" {
+		target.Type = health.HealthHTTP
+	}
+
+	result := o.healthChecker.Check(ctx, target)
+	if result == nil {
+		return fmt.Errorf("health check for %s returned no result", svc.Name)
+	}
+	if !result.Healthy {
+		if result.Error != "" {
+			return fmt.Errorf("health check failed: %s", result.Error)
+		}
+		return fmt.Errorf("health check failed")
+	}
+	return nil
 }
 
 // computeStartLevels orders services into dependency waves: level 0 holds the
@@ -273,7 +494,9 @@ func (o *DefaultOrchestrator) StartAll(ctx context.Context) error {
 	type startOutcome struct {
 		svc        Service
 		composeAbs string
-		err        error
+		err        error // non-nil => counts toward Required-failure gating
+		startedOK  bool  // true => the compose entity is up (track for possible rollback/StopAll)
+		remoteInfo *remoteStartInfo
 	}
 
 	// nameTotal counts how many service entries share each name. A name may
@@ -356,17 +579,41 @@ func (o *DefaultOrchestrator) StartAll(ctx context.Context) error {
 				o.logger.Info("orchestrator: starting %s", s.Name)
 
 				var startErr error
+				var remoteInfo *remoteStartInfo
 				if remoteEnabled {
 					startErr = o.startRemote(ctx, s, composeAbs)
 					if startErr != nil {
 						o.logger.Warn("orchestrator: remote start failed for %s: %v", s.Name, startErr)
 						startErr = o.startLocal(ctx, s, composeAbs)
+					} else {
+						remoteInfo = o.resolveRemoteStartInfo(composeAbs)
 					}
 				} else {
 					startErr = o.startLocal(ctx, s, composeAbs)
 				}
 
-				resultChan <- startOutcome{svc: s, composeAbs: composeAbs, err: startErr}
+				startedOK := startErr == nil
+				if startedOK {
+					// OR-4: the compose entity is up — if a healthChecker is
+					// configured and this service opted in (HealthPort > 0),
+					// confirm it is actually healthy before declaring success.
+					if healthErr := o.checkServiceHealth(ctx, s, remoteInfo); healthErr != nil {
+						o.logger.Warn("orchestrator: health check failed for %s: %v", s.Name, healthErr)
+						if s.Required {
+							startErr = healthErr
+						}
+						// startedOK stays true: the compose entity IS running
+						// (just unhealthy) — it must still be recorded so
+						// rollback/StopAll can tear it down. A Required
+						// service's health failure feeds the EXISTING
+						// rollback path rather than bypassing it.
+					}
+				}
+
+				resultChan <- startOutcome{
+					svc: s, composeAbs: composeAbs, err: startErr,
+					startedOK: startedOK, remoteInfo: remoteInfo,
+				}
 			}(svc, composePath)
 		}
 
@@ -384,7 +631,15 @@ func (o *DefaultOrchestrator) StartAll(ctx context.Context) error {
 				}
 			} else {
 				o.logger.Info("orchestrator: started %s", r.svc.Name)
-				started = append(started, startedService{svc: r.svc, composeAbs: r.composeAbs})
+			}
+			if r.startedOK {
+				ss := startedService{svc: r.svc, composeAbs: r.composeAbs}
+				if r.remoteInfo != nil {
+					ss.remote = true
+					ss.remoteHost = r.remoteInfo.host
+					ss.remoteDest = r.remoteInfo.dest
+				}
+				started = append(started, ss)
 			}
 		}
 	}
@@ -395,6 +650,16 @@ func (o *DefaultOrchestrator) StartAll(ctx context.Context) error {
 		o.rollback(ctx, started)
 		return fmt.Errorf("orchestrator: %d service(s) failed", len(failures))
 	}
+
+	// Every service that came up is now considered "running" for a LATER
+	// StopAll call's purposes (OR-2) — record how each was started (local vs
+	// a specific remote host) so StopAll can route its teardown correctly.
+	o.mu.Lock()
+	for _, s := range started {
+		o.trackStarted(s)
+	}
+	o.mu.Unlock()
+
 	return nil
 }
 
@@ -409,13 +674,20 @@ func (o *DefaultOrchestrator) StartAll(ctx context.Context) error {
 const rollbackTimeout = 30 * time.Second
 
 // rollback tears down services that StartAll had already started, used when a
-// required service failed mid-boot. Best-effort local compose-down, matching
-// StopAll's teardown semantics (a Down failure is logged, not surfaced — the
-// StartAll error already reports the boot failure). Services started on remote
-// hosts share StopAll's pre-existing local-only teardown limitation; that gap
-// is tracked separately and is not regressed here.
+// required service failed mid-boot. Best-effort teardown, matching StopAll's
+// semantics (a Down failure is logged, not surfaced — the StartAll error
+// already reports the boot failure). Routes each entry to the teardown path
+// matching HOW it was started (OR-2): a remote-started service is torn down
+// via the remote executor on the SAME host it was started on; a
+// local-started service via localOrch.Down. Previously this bailed out
+// entirely (silent, zero log) whenever o.localOrch was nil — a supported
+// remote-only deployment shape — orphaning every remote-started service
+// forever. Now each entry is handled on its own merits, and a genuinely
+// unwireable teardown (no remote executor for a remote-started entry, or no
+// local orchestrator for a local-started entry) is surfaced with a loud
+// error log rather than silently skipped.
 func (o *DefaultOrchestrator) rollback(ctx context.Context, started []startedService) {
-	if o.localOrch == nil {
+	if len(started) == 0 {
 		return
 	}
 	// Tear down on a context detached from the parent's cancellation: when the
@@ -427,12 +699,31 @@ func (o *DefaultOrchestrator) rollback(ctx context.Context, started []startedSer
 	downCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
 	defer cancel()
 	for _, s := range started {
+		if s.remote {
+			if o.remoteExec == nil {
+				o.logger.Error("orchestrator: cannot roll back remote-started service %s on host %s: no remote executor configured — service left running", s.svc.Name, s.remoteHost.Name)
+				continue
+			}
+			if err := o.remoteComposeDown(downCtx, s.remoteHost, s.remoteDest, s.composeAbs, s.svc.Profile); err != nil {
+				o.logger.Warn("orchestrator: rollback remote down failed for %s: %v", s.svc.Name, err)
+				continue
+			}
+			o.forgetStarted(s.svc.Name)
+			continue
+		}
+
+		if o.localOrch == nil {
+			o.logger.Error("orchestrator: cannot roll back local-started service %s: no local orchestrator configured — service left running", s.svc.Name)
+			continue
+		}
 		if err := o.localOrch.Down(downCtx, compose.ComposeProject{
 			File:    s.composeAbs,
 			Profile: s.svc.Profile,
 		}); err != nil {
 			o.logger.Warn("orchestrator: rollback down failed for %s: %v", s.svc.Name, err)
+			continue
 		}
+		o.forgetStarted(s.svc.Name)
 	}
 }
 
@@ -465,9 +756,13 @@ func (o *DefaultOrchestrator) startRemote(ctx context.Context, svc Service, comp
 	}
 
 	host := hosts[0]
-	remoteDir := fmt.Sprintf("/home/%s/helixagent", host.User)
+	remoteDir := remoteHomeDir(host)
 
-	mkdirCmd := fmt.Sprintf("mkdir -p %s", remoteDir)
+	// OR-1 (HIGH SECURITY / RCE): remoteDir is shell-quoted before
+	// interpolation — it embeds host.User, and the whole command string is
+	// handed to `ssh` as one argv element that the remote LOGIN SHELL parses
+	// (see buildRemoteComposeCommand's doc comment for the full mandate).
+	mkdirCmd := fmt.Sprintf("mkdir -p %s", shellQuote(remoteDir))
 	result, err := o.remoteExec.Execute(ctx, host, mkdirCmd)
 	if err != nil {
 		return fmt.Errorf("create remote dir: %w", err)
@@ -477,17 +772,20 @@ func (o *DefaultOrchestrator) startRemote(ctx context.Context, svc Service, comp
 	}
 
 	localDir := filepath.Dir(composePath)
-	remoteDest := remoteDir + "/" + filepath.Base(localDir)
+	remoteDest := remoteServiceDest(host, composePath)
 	copyCtx, cancel := context.WithTimeout(ctx, remoteCopyDirTimeout)
 	defer cancel()
 	if err := o.remoteExec.CopyDir(copyCtx, host, localDir, remoteDest); err != nil {
 		return fmt.Errorf("copy to remote: %w", err)
 	}
 
-	composeCmd := fmt.Sprintf("cd %s && docker compose -f %s up -d", remoteDest, filepath.Base(composePath))
-	if svc.Profile != "" {
-		composeCmd = fmt.Sprintf("cd %s && docker compose -f %s --profile %s up -d", remoteDest, filepath.Base(composePath), svc.Profile)
-	}
+	// OR-1: remoteDest derives from a disk directory name and
+	// filepath.Base(composePath) from a disk file name — neither is
+	// controlled by this package — and svc.Profile is Service configuration;
+	// all three are shell-quoted by buildRemoteComposeCommand before
+	// interpolation. Without this, a shell metacharacter in any of them
+	// (e.g. Profile: "core; touch /tmp/pwned #") is remote command execution.
+	composeCmd := buildRemoteComposeCommand(remoteDest, filepath.Base(composePath), svc.Profile, "up -d")
 
 	execResult, execErr := o.remoteExec.Execute(ctx, host, composeCmd)
 	if execErr != nil {
@@ -526,10 +824,37 @@ func (o *DefaultOrchestrator) StartService(ctx context.Context, name string) err
 	if !filepath.IsAbs(composePath) {
 		composePath = filepath.Join(projectDir, composePath)
 	}
+
 	if remoteEnabled {
-		return o.startRemote(ctx, target, composePath)
+		if err := o.startRemote(ctx, target, composePath); err != nil {
+			return err
+		}
+		info := o.resolveRemoteStartInfo(composePath)
+		if err := o.checkServiceHealth(ctx, target, info); err != nil {
+			return err
+		}
+		o.mu.Lock()
+		ss := startedService{svc: target, composeAbs: composePath}
+		if info != nil {
+			ss.remote = true
+			ss.remoteHost = info.host
+			ss.remoteDest = info.dest
+		}
+		o.trackStarted(ss)
+		o.mu.Unlock()
+		return nil
 	}
-	return o.startLocal(ctx, target, composePath)
+
+	if err := o.startLocal(ctx, target, composePath); err != nil {
+		return err
+	}
+	if err := o.checkServiceHealth(ctx, target, nil); err != nil {
+		return err
+	}
+	o.mu.Lock()
+	o.trackStarted(startedService{svc: target, composeAbs: composePath})
+	o.mu.Unlock()
+	return nil
 }
 
 func (o *DefaultOrchestrator) StopAll(ctx context.Context) error {
@@ -540,24 +865,81 @@ func (o *DefaultOrchestrator) StopAll(ctx context.Context) error {
 	services := make([]Service, len(o.services))
 	copy(services, o.services)
 	localOrch := o.localOrch
+	remoteExec := o.remoteExec
 	projectDir := o.projectDir
+	started := make(map[string]startedService, len(o.startedByName))
+	for k, v := range o.startedByName {
+		started[k] = v
+	}
 	o.mu.Unlock()
 
-	if localOrch == nil {
+	if localOrch == nil && remoteExec == nil {
+		// Nothing is wired for EITHER local or remote teardown (and, absent a
+		// remote executor, nothing could ever have been remote-started
+		// either) — the long-standing "not configured" no-op.
 		return nil
 	}
 
+	// Bound the WHOLE teardown pass on a context detached from the caller's
+	// cancellation, mirroring rollback's rollbackTimeout budget (OR-3): a
+	// single wedged Down (docker daemon hang, dead SSH session) must not
+	// block shutdown forever, AND it must not prevent every OTHER service
+	// from at least being attempted. Previously this loop ran sequentially on
+	// the caller's raw, unbounded ctx — a single blocked Down call hung
+	// StopAll forever and the remaining services were never even attempted.
+	downCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+	defer cancel()
+
 	var firstErr error
 	for _, svc := range services {
+		rec, tracked := started[svc.Name]
+		if tracked && rec.remote {
+			// OR-2: this service was started via SSH on a specific remote
+			// host — tear it down there, never via localOrch.Down (which
+			// would silently no-op or, at best, act on the wrong target).
+			if remoteExec == nil {
+				o.logger.Error("orchestrator: cannot stop remote-started service %s on host %s: no remote executor configured — service left running", svc.Name, rec.remoteHost.Name)
+				if firstErr == nil {
+					firstErr = fmt.Errorf("service %s was started remotely but no remote executor is configured to stop it", svc.Name)
+				}
+				continue
+			}
+			if err := o.remoteComposeDown(downCtx, rec.remoteHost, rec.remoteDest, rec.composeAbs, svc.Profile); err != nil {
+				o.logger.Warn("orchestrator: stop remote down failed for %s: %v", svc.Name, err)
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			o.forgetStarted(svc.Name)
+			continue
+		}
+
+		if localOrch == nil {
+			// No local orchestrator AND no remote-start record for this
+			// specific service: nothing here to honestly tear down (it was
+			// never started via THIS orchestrator instance, e.g. only ever
+			// registered via AddService/DiscoverServices) — preserves the
+			// long-standing per-service "not configured for local teardown"
+			// no-op.
+			continue
+		}
+
 		composePath := svc.ComposeFile
 		if !filepath.IsAbs(composePath) {
 			composePath = filepath.Join(projectDir, composePath)
 		}
-		if err := localOrch.Down(ctx, compose.ComposeProject{
+		if err := localOrch.Down(downCtx, compose.ComposeProject{
 			File:    composePath,
 			Profile: svc.Profile,
-		}); err != nil && firstErr == nil {
-			firstErr = err
+		}); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if tracked {
+			o.forgetStarted(svc.Name)
 		}
 	}
 	return firstErr
