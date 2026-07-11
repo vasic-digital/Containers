@@ -61,8 +61,27 @@ func (r *RsyncSyncer) Sync(
 	// -race detector flags the write here and the strings.Join read below).
 	flags := append([]string(nil), r.opts.RsyncFlags...)
 	if mount.ReadOnly {
-		// For read-only, we still sync but just flag it.
-		flags = append(flags, "--dry-run")
+		// VOL-HIGH-3: rsync's --dry-run flag transfers NOTHING — by rsync's
+		// own documented semantics it is a trial run that reports what
+		// would happen without touching the destination. The pre-fix code
+		// added --dry-run here (comment: "still sync but just flag it",
+		// which contradicts rsync's actual behavior), so every ReadOnly
+		// Sync reported success (exit 0) while the remote directory was
+		// NEVER populated — a permanent §11.4.108 false-success. Read-only
+		// protection is instead enforced by (a) omitting --delete so this
+		// sync never prunes files that may exist on the destination through
+		// another path, and (b) making the destination directory
+		// non-writable at the OS level (chmod) AFTER a REAL transfer below
+		// — the remote copy is genuinely populated AND write-protected,
+		// which is what a caller requesting a read-only volume expects.
+		filtered := make([]string, 0, len(flags))
+		for _, f := range flags {
+			if f == "--delete" {
+				continue
+			}
+			filtered = append(filtered, f)
+		}
+		flags = filtered
 	}
 
 	r.logger.Info("rsync to %s: %s -> %s",
@@ -95,6 +114,27 @@ func (r *RsyncSyncer) Sync(
 			"rsync to %s: exit %d: %s",
 			host.Name, result.ExitCode, result.Stderr,
 		)
+	}
+
+	if mount.ReadOnly {
+		// VOL-HIGH-3 (continued): the transfer above is REAL (no
+		// --dry-run), so the destination is now genuinely populated.
+		// Enforce the caller's read-only request via OS-level
+		// write-protection on the destination directory, rather than by
+		// skipping the transfer.
+		chmodCmd := fmt.Sprintf("chmod -R a-w %s", shellQuote(mount.RemotePath))
+		result, err = r.executor.Execute(ctx, host, chmodCmd)
+		if err != nil {
+			return fmt.Errorf(
+				"rsync read-only chmod on %s: %w", host.Name, err,
+			)
+		}
+		if result.ExitCode != 0 {
+			return fmt.Errorf(
+				"rsync read-only chmod on %s: exit %d: %s",
+				host.Name, result.ExitCode, result.Stderr,
+			)
+		}
 	}
 
 	return nil

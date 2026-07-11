@@ -37,7 +37,10 @@ func TestWave16_Volume_ShellQuote_PreventsInjection(t *testing.T) {
 			return &remote.CommandResult{ExitCode: 0}, nil
 		},
 	}
-	m := NewSSHFSMounter(exec, logging.NopLogger{}, DefaultMountOptions())
+	// testMountOptionsWithAddress (see VOL-HIGH-2): a configured
+	// LocalHostAddress is required for SSHFSMounter.Mount to proceed past
+	// its VOL-HIGH-2 fail-loud check to the mkdir call this test inspects.
+	m := NewSSHFSMounter(exec, logging.NopLogger{}, testMountOptionsWithAddress())
 	host := remote.RemoteHost{Name: "h", Address: "1.2.3.4", User: "u"}
 	evil := "/mnt/a b;touch /tmp/pwned"
 	require.NoError(t, m.Mount(

@@ -36,6 +36,25 @@ func (m *SSHFSMounter) Mount(
 	host remote.RemoteHost,
 	mount VolumeMount,
 ) error {
+	// VOL-HIGH-2: sshfs's source argument MUST carry a "[user@]host:path"
+	// prefix — the remote host uses it to open its OWN ssh connection back
+	// to the local orchestrator. The pre-fix code interpolated only
+	// mount.LocalPath with no host prefix at all (`sshfs <flags>
+	// '/local/data' '/remote/data'`), which sshfs rejects (or
+	// misinterprets) as a bare local path, not a remote source — same root
+	// cause as VOL-HIGH-1: VolumeMount carries no local-orchestrator-
+	// address field. Fail loudly when no address is configured rather than
+	// silently emit that known-broken command — configure via
+	// WithLocalHostAddress.
+	if m.opts.LocalHostAddress == "" {
+		return fmt.Errorf(
+			"sshfs mount %q: no local host address configured (see "+
+				"WithLocalHostAddress); refusing to build a mount command "+
+				"using LocalPath (%s) with no \"[user@]host:\" source prefix",
+			mount.Name, mount.LocalPath,
+		)
+	}
+
 	// Create the remote mount point.
 	mkdirCmd := fmt.Sprintf("mkdir -p %s", shellQuote(mount.RemotePath))
 	result, err := m.executor.Execute(ctx, host, mkdirCmd)
@@ -61,9 +80,9 @@ func (m *SSHFSMounter) Mount(
 	// The remote host uses sshfs to mount from the local host.
 	// This requires the local host to be SSH-accessible from
 	// the remote host, or use a reverse tunnel.
-	sshfsCmd := fmt.Sprintf("%s %s %s",
+	sshfsCmd := fmt.Sprintf("%s %s:%s %s",
 		strings.Join(sshfsArgs, " "),
-		shellQuote(mount.LocalPath),
+		shellQuote(m.opts.LocalHostAddress), shellQuote(mount.LocalPath),
 		shellQuote(mount.RemotePath),
 	)
 

@@ -112,8 +112,27 @@ func newTestVolumeManager() (*DefaultVolumeManager, *mockExecutor) {
 			},
 		},
 	}
-	mgr := NewVolumeManager(hm, exec, logging.NopLogger{})
+	// WithLocalHostAddress is required for NFSMounter/SSHFSMounter (see
+	// VOL-HIGH-1 / VOL-HIGH-2): without a configured local-host identity
+	// they now fail loudly instead of emitting a command built from
+	// LocalPath alone. The tests through this shared helper exercise
+	// unrelated behavior (dedup / execution-error / host lookup / status /
+	// etc.) using MountSSHFS/MountNFS as filler types, so a placeholder
+	// address keeps them exercising what they were written to exercise.
+	mgr := NewVolumeManager(
+		hm, exec, logging.NopLogger{}, WithLocalHostAddress("10.0.0.99"),
+	)
 	return mgr, exec
+}
+
+// testMountOptionsWithAddress returns MountOptions with a placeholder
+// LocalHostAddress configured (see VOL-HIGH-1 / VOL-HIGH-2), for tests that
+// directly construct an NFSMounter/SSHFSMounter and exercise its mkdir/
+// mount-command paths rather than the unconfigured-address fail-loud
+// behavior itself (that path has its own dedicated guard in
+// wave20_vol2hard_test.go).
+func testMountOptionsWithAddress() MountOptions {
+	return ApplyOptions([]Option{WithLocalHostAddress("10.0.0.99")})
 }
 
 func TestDefaultVolumeManager_Mount_SSHFS(t *testing.T) {
@@ -281,12 +300,20 @@ func TestDefaultVolumeManager_Sync_NotFound(t *testing.T) {
 func TestDefaultVolumeManager_ListMounts(t *testing.T) {
 	mgr, _ := newTestVolumeManager()
 
+	// Distinct RemotePath per mount (VOL-HIGH-4 reconcile): the manager now
+	// rejects a Mount whose (HostName, RemotePath) collides with an
+	// already-registered mount under a different name (three different
+	// names all sharing host-1:/b would previously silently stack onto one
+	// remote directory — exactly the defect VOL-HIGH-4 closes). Using a
+	// distinct RemotePath per iteration preserves this test's original
+	// intent: three independent, successful mounts, all listed.
 	for i := 0; i < 3; i++ {
 		mount := VolumeMount{
 			Name: fmt.Sprintf("data-%d", i), Type: MountSSHFS,
-			LocalPath: "/a", RemotePath: "/b", HostName: "host-1",
+			LocalPath: "/a", RemotePath: fmt.Sprintf("/b-%d", i),
+			HostName: "host-1",
 		}
-		_ = mgr.Mount(context.Background(), mount)
+		require.NoError(t, mgr.Mount(context.Background(), mount))
 	}
 
 	mounts := mgr.ListMounts()
@@ -296,14 +323,21 @@ func TestDefaultVolumeManager_ListMounts(t *testing.T) {
 func TestDefaultVolumeManager_UnmountAll(t *testing.T) {
 	mgr, _ := newTestVolumeManager()
 
+	// Distinct RemotePath per mount (VOL-HIGH-4 reconcile, see
+	// TestDefaultVolumeManager_ListMounts above) so all three mounts
+	// genuinely register and UnmountAll exercises tearing down three
+	// independent mounts, not one.
 	for i := 0; i < 3; i++ {
 		mount := VolumeMount{
 			Name: fmt.Sprintf("data-%d", i), Type: MountSSHFS,
-			LocalPath: "/a", RemotePath: "/b", HostName: "host-1",
+			LocalPath: "/a", RemotePath: fmt.Sprintf("/b-%d", i),
+			HostName: "host-1",
 		}
-		_ = mgr.Mount(context.Background(), mount)
+		require.NoError(t, mgr.Mount(context.Background(), mount))
 	}
+	require.Len(t, mgr.ListMounts(), 3)
 
 	err := mgr.UnmountAll(context.Background())
 	assert.NoError(t, err)
+	assert.Empty(t, mgr.ListMounts())
 }

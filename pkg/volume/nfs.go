@@ -35,6 +35,26 @@ func (m *NFSMounter) Mount(
 	host remote.RemoteHost,
 	mount VolumeMount,
 ) error {
+	// VOL-HIGH-1: the remote `mount -t nfs <server>:<export> <mountpoint>`
+	// command needs a real, network-reachable NFS SERVER address distinct
+	// from the export path. The pre-fix code used mount.LocalPath for BOTH
+	// — `mount.LocalPath:mount.LocalPath` — because VolumeMount carries no
+	// local-orchestrator-address field, so the "server" was always a bare
+	// filesystem path (e.g. "/local/data:/local/data"), which no NFS client
+	// can resolve; every NFS mount was categorically broken. Fail loudly
+	// when no address is configured rather than silently emit that known-
+	// broken command (§11.4.14 / §11.4.108) — configure via
+	// WithLocalHostAddress.
+	if m.opts.LocalHostAddress == "" {
+		return fmt.Errorf(
+			"nfs mount %q: no local host address configured (see "+
+				"WithLocalHostAddress); refusing to build a mount command "+
+				"using LocalPath (%s) as both the NFS server and the export "+
+				"path",
+			mount.Name, mount.LocalPath,
+		)
+	}
+
 	// Create the remote mount point.
 	mkdirCmd := fmt.Sprintf("mkdir -p %s", shellQuote(mount.RemotePath))
 	result, err := m.executor.Execute(ctx, host, mkdirCmd)
@@ -62,7 +82,7 @@ func (m *NFSMounter) Mount(
 	nfsCmd := fmt.Sprintf(
 		"mount %s %s:%s %s",
 		mountFlags,
-		shellQuote(mount.LocalPath), shellQuote(mount.LocalPath),
+		shellQuote(m.opts.LocalHostAddress), shellQuote(mount.LocalPath),
 		shellQuote(mount.RemotePath),
 	)
 

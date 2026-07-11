@@ -63,6 +63,23 @@ func NewVolumeManager(
 	}
 }
 
+// withCommandTimeout returns a context bounded by opts.CommandTimeout when
+// configured (> 0), so a stalled remote mount/unmount/rsync command is
+// cancelled at a local deadline instead of blocking the caller forever —
+// mirroring the per-call deadline every sibling package in this module
+// (pkg/genymotion, pkg/cuttlefish, pkg/emulator, pkg/orchestrator, pkg/vm)
+// already applies to its remote calls (VOL-MED-8). CommandTimeout <= 0 (the
+// default) returns ctx unmodified, preserving prior behavior exactly. The
+// returned cancel is always non-nil and safe to defer unconditionally.
+func (m *DefaultVolumeManager) withCommandTimeout(
+	ctx context.Context,
+) (context.Context, context.CancelFunc) {
+	if m.opts.CommandTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, m.opts.CommandTimeout)
+}
+
 // Mount creates a volume mount on a remote host.
 func (m *DefaultVolumeManager) Mount(
 	ctx context.Context, mount VolumeMount,
@@ -70,6 +87,9 @@ func (m *DefaultVolumeManager) Mount(
 	if mount.Name == "" {
 		return fmt.Errorf("mount name cannot be empty")
 	}
+
+	cctx, cancel := m.withCommandTimeout(ctx)
+	defer cancel()
 
 	// Reserve the name atomically with the existence check. Previously the
 	// check and the map insert used two separate m.mu acquisitions with the
@@ -87,6 +107,28 @@ func (m *DefaultVolumeManager) Mount(
 		return fmt.Errorf(
 			"mount %q already exists", mount.Name,
 		)
+	}
+	// VOL-HIGH-4: reject a Mount whose (HostName, RemotePath) collides with
+	// an already-registered mount under a DIFFERENT name. Deduping only by
+	// Name (the check above) let two differently-named mounts stack onto
+	// the SAME remote directory on the SAME host — both would issue their
+	// own mkdir/mount/sshfs/rsync against that one remote path, and tearing
+	// either one down (Unmount deletes its own entry) left the manager
+	// believing the path fully reclaimed while the OTHER name's mount was
+	// still live on that exact directory. Checked under the SAME lock as
+	// the reservation above so this is atomic with the Name uniqueness
+	// check, closing the same TOCTOU class EGVOL-1 closed for Name.
+	for _, existing := range m.mounts {
+		if existing.Mount.HostName == mount.HostName &&
+			existing.Mount.RemotePath == mount.RemotePath {
+			m.mu.Unlock()
+			return fmt.Errorf(
+				"mount %q rejected: host %q remote path %q is already "+
+					"in use by mount %q",
+				mount.Name, mount.HostName, mount.RemotePath,
+				existing.Mount.Name,
+			)
+		}
 	}
 	m.mounts[mount.Name] = info
 	m.mu.Unlock()
@@ -120,11 +162,11 @@ func (m *DefaultVolumeManager) Mount(
 	var mountErr error
 	switch mount.Type {
 	case MountSSHFS:
-		mountErr = m.sshfs.Mount(ctx, *host, mount)
+		mountErr = m.sshfs.Mount(cctx, *host, mount)
 	case MountNFS:
-		mountErr = m.nfs.Mount(ctx, *host, mount)
+		mountErr = m.nfs.Mount(cctx, *host, mount)
 	case MountRsync:
-		mountErr = m.rsync.Sync(ctx, *host, mount)
+		mountErr = m.rsync.Sync(cctx, *host, mount)
 	default:
 		unreserve()
 		return fmt.Errorf(
@@ -158,16 +200,50 @@ func (m *DefaultVolumeManager) Mount(
 func (m *DefaultVolumeManager) Unmount(
 	ctx context.Context, name string,
 ) error {
+	cctx, cancel := m.withCommandTimeout(ctx)
+	defer cancel()
+
 	m.mu.Lock()
 	info, exists := m.mounts[name]
 	if !exists {
 		m.mu.Unlock()
 		return fmt.Errorf("mount %q not found", name)
 	}
+	// VOL-HIGH-5: reserve the unmount atomically with the exists-check,
+	// under the SAME lock — mirrors Mount()'s MountPending barrier
+	// (EGVOL-1). Without this, two concurrent Unmount(name) calls both
+	// read the SAME *MountInfo past the exists-check and both proceed to
+	// the switch below, issuing the REAL remote unmount command twice
+	// concurrently; whichever loses the race finds the volume already torn
+	// down (busy / not mounted) and reports a false FAIL for what is, from
+	// the caller's perspective, an already cleanly-unmounted volume — a
+	// §11.4.108 false-failure mirroring EGVOL-1's false-success. Exactly
+	// one caller may drive the real unmount at a time; a second concurrent
+	// caller is rejected here, before it issues any remote command.
+	if info.State == MountUnmounting {
+		m.mu.Unlock()
+		return fmt.Errorf("mount %q is already being unmounted", name)
+	}
+	prevState := info.State
+	info.State = MountUnmounting
 	m.mu.Unlock()
+
+	// restore reverts the reservation on a pre-remote-op early return
+	// (host lookup error/absent), so a legitimate retry sees the mount's
+	// real prior state rather than being stuck reporting "already being
+	// unmounted" forever. Only touches OUR info (matched by identity), so
+	// it can never clobber an unrelated later entry under the same name.
+	restore := func() {
+		m.mu.Lock()
+		if cur, ok := m.mounts[name]; ok && cur == info {
+			info.State = prevState
+		}
+		m.mu.Unlock()
+	}
 
 	host, err := m.hostManager.GetHost(info.Mount.HostName)
 	if err != nil {
+		restore()
 		return fmt.Errorf("get host %s: %w", info.Mount.HostName, err)
 	}
 	if host == nil {
@@ -175,15 +251,36 @@ func (m *DefaultVolumeManager) Unmount(
 		// honestly rather than marking the volume unmounted (it may still be
 		// mounted on a host we lost track of) — a false "unmounted" success is
 		// a §11.4 bluff, and UnmountAll must be able to surface it.
+		restore()
 		return fmt.Errorf("host %s not found", info.Mount.HostName)
 	}
 
 	var unmountErr error
 	switch info.Mount.Type {
 	case MountSSHFS:
-		unmountErr = m.sshfs.Unmount(ctx, *host, info.Mount)
+		unmountErr = m.sshfs.Unmount(cctx, *host, info.Mount)
 	case MountNFS:
-		unmountErr = m.nfs.Unmount(ctx, *host, info.Mount)
+		unmountErr = m.nfs.Unmount(cctx, *host, info.Mount)
+	case MountRsync:
+		// VOL-HIGH-6: rsync mounts have no filesystem attach point to
+		// detach — the remote directory is a periodically-synced COPY, not
+		// a live mount. The pre-fix switch had no case for MountRsync and
+		// no default, so unmountErr silently stayed nil here: Unmount
+		// reported success, deleted the tracking entry, and never touched
+		// the remote host at all — the remote directory and its full
+		// content remained in place while the manager (and every caller)
+		// believed the volume gone. Fail loudly instead of silently
+		// succeeding, so callers never mistake this for a real teardown.
+		unmountErr = fmt.Errorf(
+			"rsync volumes are not unmountable via this path: remote "+
+				"directory %q on host %q was populated by rsync copy, not "+
+				"a filesystem mount, and must be reclaimed independently",
+			info.Mount.RemotePath, info.Mount.HostName,
+		)
+	default:
+		unmountErr = fmt.Errorf(
+			"unsupported mount type for unmount: %s", info.Mount.Type,
+		)
 	}
 	if unmountErr != nil {
 		// The remote unmount failed (busy, unreachable). Do NOT drop the entry
@@ -210,6 +307,9 @@ func (m *DefaultVolumeManager) Unmount(
 func (m *DefaultVolumeManager) Sync(
 	ctx context.Context, name string,
 ) error {
+	cctx, cancel := m.withCommandTimeout(ctx)
+	defer cancel()
+
 	m.mu.RLock()
 	info, exists := m.mounts[name]
 	m.mu.RUnlock()
@@ -229,7 +329,7 @@ func (m *DefaultVolumeManager) Sync(
 	info.State = MountSyncing
 	m.mu.Unlock()
 
-	err := m.rsync.Sync(ctx, *host, info.Mount)
+	err := m.rsync.Sync(cctx, *host, info.Mount)
 
 	m.mu.Lock()
 	if err != nil {

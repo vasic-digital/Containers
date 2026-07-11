@@ -150,10 +150,16 @@ func TestWave19_EGVOL2_RsyncFlagsAliasRace(t *testing.T) {
 		)
 		ctx := context.Background()
 
+		// Distinct RemotePath per mount name (VOL-HIGH-4 reconcile): the
+		// manager now rejects a Mount whose (HostName, RemotePath) collides
+		// with an already-registered mount under a different name — "ro-a"
+		// and "ro-b" sharing host-1:/b would be rejected outright. A
+		// distinct path per name preserves this test's intent (two
+		// independent mounts, synced concurrently, no aliasing race).
 		for _, name := range []string{"ro-a", "ro-b"} {
 			require.NoError(t, mgr.Mount(ctx, VolumeMount{
 				Name: name, Type: MountRsync,
-				LocalPath: "/a", RemotePath: "/b",
+				LocalPath: "/a", RemotePath: "/b-" + name,
 				HostName: "host-1", ReadOnly: true,
 			}))
 		}
@@ -199,8 +205,12 @@ func TestWave19_EGVOL2_RsyncFlagsAliasRace(t *testing.T) {
 			LocalPath: "/a", RemotePath: "/b",
 			HostName: "test-host", ReadOnly: true,
 		}
-		// Two sequential read-only syncs: both must emit --dry-run exactly
-		// once; the shared RsyncFlags must never accumulate/corrupt.
+		// Two sequential read-only syncs: neither may use --dry-run (see
+		// VOL-HIGH-3 — --dry-run transfers nothing, so a ReadOnly Sync
+		// reported success while never populating the remote directory) nor
+		// --delete (read-only protection is destination write-protection,
+		// not a pruning transfer); the shared RsyncFlags must never
+		// accumulate/corrupt.
 		require.NoError(t, syncer.Sync(context.Background(), testHost(), roMount))
 		require.NoError(t, syncer.Sync(context.Background(), testHost(), roMount))
 
@@ -208,9 +218,11 @@ func TestWave19_EGVOL2_RsyncFlagsAliasRace(t *testing.T) {
 		for _, cmd := range rsyncCmds {
 			t.Logf("read-only rsync command: %s", cmd)
 			require.Contains(t, cmd, "-avz")
-			require.Contains(t, cmd, "--delete")
-			require.Equal(t, 1, strings.Count(cmd, "--dry-run"),
-				"read-only rsync must carry exactly one --dry-run: %q", cmd)
+			require.NotContains(t, cmd, "--delete",
+				"VOL-HIGH-3: read-only rsync must omit --delete: %q", cmd)
+			require.NotContains(t, cmd, "--dry-run",
+				"VOL-HIGH-3: read-only rsync must NOT use --dry-run (it "+
+					"transfers nothing): %q", cmd)
 		}
 		// The option slice itself must be untouched by the per-call copy.
 		require.Equal(t, []string{"-avz", "--delete"}, rf,
@@ -236,7 +248,10 @@ func TestWave19_EGVOL3_NFSReadOnlyCommandWellFormed(t *testing.T) {
 		}
 		return &remote.CommandResult{ExitCode: 0}, nil
 	}}
-	mounter := NewNFSMounter(exec, logging.NopLogger{}, DefaultMountOptions())
+	// testMountOptionsWithAddress (see VOL-HIGH-1): a configured
+	// LocalHostAddress is required for NFSMounter.Mount to proceed past its
+	// VOL-HIGH-1 fail-loud check to the mount command this test inspects.
+	mounter := NewNFSMounter(exec, logging.NopLogger{}, testMountOptionsWithAddress())
 
 	mount := VolumeMount{
 		Name: "nfs-ro", Type: MountNFS,
