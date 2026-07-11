@@ -59,7 +59,26 @@ func (e *defaultExecutor) Execute(
 ) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.WaitDelay = 2 * time.Second
-	return cmd.Output()
+	out, err := cmd.Output()
+	if err != nil {
+		// cmd.Output() already captures the child's stderr into
+		// (*exec.ExitError).Stderr internally (up to 32KiB, via Go's
+		// prefixSuffixSaver) when cmd.Stderr is nil — but ExitError.Error()
+		// only renders "exit status N" and never includes that captured
+		// text. Every caller across all six runtimes (Start/Stop/Remove/
+		// Status/List/Stats/Version) wraps this error with %w, so the real
+		// CLI diagnostic ("no such container", "permission denied", "daemon
+		// unreachable") was silently discarded. Surface it by appending the
+		// trimmed stderr text to the returned error while still preserving
+		// %w-wrapping of the original *exec.ExitError.
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" {
+				return out, fmt.Errorf("%w: %s", err, stderr)
+			}
+		}
+		return out, err
+	}
+	return out, nil
 }
 
 func (e *defaultExecutor) ExecuteWithStderr(
@@ -344,6 +363,23 @@ func parseDockerPSOutput(data []byte) ([]ContainerInfo, error) {
 	return containers, nil
 }
 
+// parseLabelsString parses `docker ps --format json`'s "Labels" field, a
+// flat comma-joined "k1=v1,k2=v2" string.
+//
+// RT-LABEL-1 (§11.4.6 honest documentation, not a fix): a label VALUE
+// containing a literal comma (e.g. `description=hello, world`) is silently
+// truncated/split by this parser, because Docker's own `docker ps` JSON
+// formatter joins labels with "," and provides NO escaping mechanism for a
+// comma embedded in a value — this is a genuine upstream format limitation,
+// not a bug introduced here (confirmed: moby/moby#30575, "Unable to use
+// docker ps --filter when a label value has a comma", the same unescaped-
+// comma-join format). There is no `docker ps --format` variant that emits
+// Labels as a structured map instead of this flat string; obtaining
+// unambiguous label values would require a separate `docker inspect
+// --format '{{json .Config.Labels}}'` call per container, which changes
+// List()'s round-trip cost/contract and is out of scope for a surgical fix.
+// See wave20_rthard_test.go's RT-LABEL-1 case for a test that documents
+// (rather than "fixes") this known truncation behavior.
 func parseLabelsString(s string) map[string]string {
 	labels := make(map[string]string)
 	if s == "" {

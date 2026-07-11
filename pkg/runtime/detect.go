@@ -17,6 +17,23 @@ type RuntimeFactory func() []ContainerRuntime
 // Access it through GetRuntimePriority / SetRuntimePriority, which serialise
 // reads and writes under priorityMu. AutoDetect consults the current value, so
 // SetRuntimePriority genuinely reorders subsequent AutoDetect calls.
+//
+// RT-RACE-1 (§11.4.6 honest documentation, flagged not fixed): reading or
+// assigning this exported var DIRECTLY (`runtime.RuntimePriority`) bypasses
+// priorityMu and is a genuine data race against concurrent
+// GetRuntimePriority/SetRuntimePriority calls from another goroutine — `go
+// test -race` on a synthetic direct-read-during-SetRuntimePriority scenario
+// reproduces it. There is no non-breaking fix: Go cannot make a plain
+// exported `[]string` package var itself race-safe against direct access
+// without either changing its type (e.g. to an atomic.Pointer[[]string],
+// which breaks every existing `for _, x := range runtime.RuntimePriority`-
+// style caller) or unexporting it (RuntimePriority -> runtimePriority, which
+// removes a public symbol outright, §11.4.122). Both are breaking public-API
+// changes and are NOT applied here unilaterally; this is an operator
+// decision item. Recommendation: unexport to `runtimePriority` and keep
+// Get/SetRuntimePriority as the sole accessors, in a deliberate, announced
+// API-break window (major-version bump / CHANGELOG entry), NOT a silent
+// patch-level edit.
 var (
 	priorityMu      sync.RWMutex
 	RuntimePriority = []string{

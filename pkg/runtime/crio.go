@@ -291,8 +291,20 @@ func (c *CRIORuntime) Logs(ctx context.Context, id string, opts ...LogOption) (i
 	if o.Follow {
 		args = append(args, "-f")
 	}
+	// crictl's --tail is an Int64Flag (default -1, meaning "all"); it is NOT
+	// Docker/Podman's "all" string sentinel and rejects it outright
+	// (strconv parse error). The package default LogOption.Tail is "all", so
+	// mirror lxd.go's guard: convert a genuinely-numeric Tail to crictl's
+	// integer form, and OMIT --tail entirely for "all"/any non-numeric value
+	// — crictl's own default (-1) already means "all lines", matching the
+	// intended semantics without ever passing an invalid flag value.
+	// Source: cri-tools `logs` command defines `--tail` as an Int64Flag
+	// default -1, usage "Number of lines to show from the end of the logs.
+	// Defaults to all" (kubernetes-sigs/cri-tools cmd/crictl/logs.go).
 	if o.Tail != "" {
-		args = append(args, "--tail", o.Tail)
+		if n, err := strconv.Atoi(o.Tail); err == nil {
+			args = append(args, "--tail", strconv.Itoa(n))
+		}
 	}
 	args = append(args, id)
 

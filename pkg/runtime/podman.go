@@ -7,6 +7,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // PodmanRuntime implements ContainerRuntime using the podman CLI.
@@ -188,10 +189,40 @@ func parsePodmanPSOutput(data []byte) ([]ContainerInfo, error) {
 			ImageID: item.ImageID,
 			State:   mapContainerState(item.State),
 			Status:  item.Status,
+			Created: parsePodmanCreated(item.Created),
 			Labels:  labels,
 		})
 	}
 	return containers, nil
+}
+
+// parsePodmanCreated normalises podman ps --format json's polymorphic
+// Created field. Real podman emits a unix-SECONDS number — captured evidence:
+// pkg/ctop/wave18_real_runtime_output_test.go's realPodmanPS fixture carries
+// `"Created": 1783192758`, taken from real `podman ps -a --format json`
+// output on this project's own rootless-podman build host (§11.4.161). A
+// JSON number decoded into an `interface{}` field always arrives as float64,
+// never int64, so that is the primary case handled here. Some podman-
+// compatible tooling instead emits an RFC3339 string, so that shape is
+// tolerated too. Any other shape (or a non-positive timestamp) yields the
+// zero time rather than a decode failure — Created is best-effort listing
+// metadata, never a hard List() error.
+func parsePodmanCreated(raw interface{}) time.Time {
+	switch v := raw.(type) {
+	case float64:
+		if v <= 0 {
+			return time.Time{}
+		}
+		return time.Unix(int64(v), 0).UTC()
+	case string:
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			return t
+		}
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return time.Unix(n, 0).UTC()
+		}
+	}
+	return time.Time{}
 }
 
 func (p *PodmanRuntime) Stats(
