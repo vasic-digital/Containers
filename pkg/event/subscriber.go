@@ -6,6 +6,7 @@ import (
 	"log"
 	"runtime/debug"
 	"sync"
+	"time"
 )
 
 // deliverableEvent pairs an event with the context active at the
@@ -96,14 +97,33 @@ func (s *subscription) requestStop() {
 	})
 }
 
-// stop signals the delivery goroutine to terminate and then waits for
-// it to finish. It MUST NOT be called from the subscription's own
-// delivery goroutine (that would join the goroutine on itself and
-// deadlock); use requestStop from a handler instead. stop is the
-// teardown path for Close, which runs outside any delivery goroutine.
-func (s *subscription) stop() {
-	s.requestStop()
-	<-s.done
+// waitDone blocks until the subscription's delivery goroutine has
+// returned (s.done closed) or until timeout elapses, whichever comes
+// first. It reports whether the goroutine returned within the
+// deadline.
+//
+// waitDone does NOT itself request termination — call requestStop()
+// first (Close does this for every subscriber up front; see bus.go).
+// It never blocks indefinitely: a caller joining many subscriptions
+// must not let a single handler that never returns (blocked on I/O
+// with no deadline, or a channel that never fires) wedge the wait
+// forever (CT-HARDEN-EV-1). A non-positive timeout is treated as an
+// immediate, non-blocking poll rather than an infinite wait.
+func (s *subscription) waitDone(timeout time.Duration) bool {
+	if timeout <= 0 {
+		select {
+		case <-s.done:
+			return true
+		default:
+			return false
+		}
+	}
+	select {
+	case <-s.done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // matches returns true if the event satisfies the subscription's

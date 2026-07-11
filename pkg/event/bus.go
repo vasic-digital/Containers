@@ -3,7 +3,20 @@ package event
 import (
 	"context"
 	"sync"
+	"time"
 )
+
+// closeSubscriberJoinTimeout bounds how long Close() waits, IN TOTAL,
+// for all subscribers' delivery goroutines to finish once every one of
+// them has been signalled to stop. A single handler that never returns
+// (blocked on I/O with no deadline, or waiting on a channel that never
+// fires) must not be able to wedge Close() — and therefore the whole
+// process's graceful shutdown — forever (CT-HARDEN-EV-1). Close()
+// still requests every subscriber to stop FIRST (regardless of a stuck
+// sibling) so a healthy sibling is never starved of its own stop
+// signal by one that hangs; this timeout only bounds how long Close()
+// is willing to wait for the JOIN of the whole batch.
+const closeSubscriberJoinTimeout = 2 * time.Second
 
 // EventHandler is a callback that processes a single event.
 type EventHandler func(ctx context.Context, event Event)
@@ -49,7 +62,34 @@ type DefaultEventBus struct {
 }
 
 // NewEventBus creates a DefaultEventBus. bufferSize controls the
-// per-subscriber channel buffer; use 0 for synchronous delivery.
+// per-subscriber channel buffer.
+//
+// Honesty note (§11.4.108): bufferSize == 0 does NOT provide synchronous, guaranteed delivery.
+// An earlier version of this comment claimed otherwise, which was
+// false. Publish's per-subscriber
+// send is ALWAYS a non-blocking best-effort send (`select ...
+// default:` — see Publish's doc comment): with bufferSize == 0 (an
+// unbuffered channel), that send's `default:` branch is taken, and the
+// event is DROPPED, whenever the subscriber's delivery goroutine is
+// not, at that exact instant, parked in its channel receive — which in
+// practice is most of the time its handler is doing any real work.
+//
+// A genuinely blocking, guaranteed-delivery send for bufferSize == 0
+// was assessed and rejected: holding Publish's read lock across a
+// blocking channel send would let one slow/stuck subscriber wedge
+// Close/Unsubscribe/Subscribe (which need the write lock) for the
+// ENTIRE bus; releasing the lock before sending would let a concurrent
+// Close()/Unsubscribe() close that subscriber's channel first, making
+// the send panic. Both alternatives are worse than today's best-effort
+// semantics, so bufferSize == 0 keeps the SAME best-effort,
+// non-blocking, drop-when-full contract as every other buffer size —
+// it is simply the smallest possible drop window, not a different
+// (synchronous) delivery mode.
+//
+// There is no bufferSize value that guarantees delivery. Callers that
+// need a subscriber to miss as few events as possible under load
+// should size bufferSize generously for their workload; a larger
+// buffer only shrinks the drop window, it does not eliminate it.
 func NewEventBus(bufferSize int) *DefaultEventBus {
 	if bufferSize < 0 {
 		bufferSize = 0
@@ -90,12 +130,25 @@ func (b *DefaultEventBus) Publish(
 
 // Subscribe registers a handler and starts a goroutine that
 // delivers matching events to it.
+//
+// Subscribe is a no-op once the bus has been Close()d: it returns the
+// empty SubscriptionID sentinel without inserting a map entry or
+// spawning a delivery goroutine (CT-HARDEN-EV-3). Mirrors the guard
+// Publish already has (`if b.closed { return }`) — without it, a
+// Subscribe() call arriving after Close() (e.g. a retry loop racing
+// shutdown) would insert a map entry that Close() has already run and
+// will never come back to reclaim: an unbounded leak, plus a normal-
+// looking SubscriptionID with no signal the bus is actually shut down.
 func (b *DefaultEventBus) Subscribe(
 	filter EventFilter,
 	handler EventHandler,
 ) SubscriptionID {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if b.closed {
+		return SubscriptionID("")
+	}
 
 	b.nextID++
 	id := newSubscriptionID(b.nextID)
@@ -135,18 +188,31 @@ func (b *DefaultEventBus) Unsubscribe(id SubscriptionID) {
 
 // Close shuts down the event bus and all active subscriptions.
 //
-// sub.stop() closes the subscription's channel and then blocks
-// (`<-s.done`) until the subscription's delivery goroutine returns. That
-// goroutine may, at the moment Close is called, be in the middle of
-// invoking the subscriber's handler — and a handler that re-enters the
-// bus (Publish/Subscribe/Unsubscribe), a normal pattern for chained or
-// derived events, needs b.mu to proceed. Previously b.mu was held for
-// Close's entire body (deferred Unlock), so that re-entrant call blocked
-// forever waiting for a lock Close would never release until the very
-// goroutine it's blocking was done — a deadlock. Unsubscribe already
-// gets this right (it releases b.mu before calling sub.stop()); Close
-// must do the same: collect+remove the subscriptions under the lock,
-// release it, then stop each subscription outside the lock.
+// A subscription's delivery goroutine may, at the moment Close is
+// called, be in the middle of invoking the subscriber's handler — and a
+// handler that re-enters the bus (Publish/Subscribe/Unsubscribe), a
+// normal pattern for chained or derived events, needs b.mu to proceed.
+// Previously b.mu was held for Close's entire body (deferred Unlock),
+// so that re-entrant call blocked forever waiting for a lock Close
+// would never release until the very goroutine it's blocking was done
+// — a deadlock. Unsubscribe already gets this right (it releases b.mu
+// before touching any subscription); Close does the same: collect+
+// remove the subscriptions under the lock, release it, then signal and
+// join each subscription outside the lock.
+//
+// CT-HARDEN-EV-1: signal-all-before-join-any. A single handler that
+// never returns (blocked on I/O with no deadline, or a channel that
+// never fires) must not be able to wedge Close() forever, nor starve
+// any OTHER subscriber of its own stop signal. So Close() first calls
+// requestStop() on EVERY subscriber (non-blocking, idempotent — safe
+// regardless of order), and only THEN joins them, all together, under
+// one shared closeSubscriberJoinTimeout deadline rather than an
+// unbounded per-subscriber wait. A subscriber whose handler never
+// returns leaves its own delivery goroutine running past the deadline
+// — a known, isolated, single-goroutine leak this accepts (there is no
+// way to force a running goroutine to stop from the outside) — but
+// Close() itself, and every OTHER subscriber's teardown, is never held
+// hostage by it.
 func (b *DefaultEventBus) Close() {
 	b.mu.Lock()
 	if b.closed {
@@ -164,6 +230,12 @@ func (b *DefaultEventBus) Close() {
 	b.mu.Unlock()
 
 	for _, sub := range subs {
-		sub.stop()
+		sub.requestStop()
+	}
+
+	deadline := time.Now().Add(closeSubscriberJoinTimeout)
+	for _, sub := range subs {
+		remaining := time.Until(deadline)
+		sub.waitDone(remaining)
 	}
 }
