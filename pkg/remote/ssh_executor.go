@@ -210,12 +210,13 @@ func (e *SSHExecutor) CopyFile(
 	if e.pool != nil {
 		defer e.pool.Release(host)
 	}
-	args = append(args,
-		localPath,
-		fmt.Sprintf(
-			"%s@%s:%s", host.User, host.Address, remotePath,
-		),
-	)
+	// RM3 (SECURITY): refuse a leading-dash scp destination (ProxyCommand RCE
+	// via a tainted host.User) before spawning scp — see sshDestination.
+	dest, err := scpDestination(host, remotePath)
+	if err != nil {
+		return err
+	}
+	args = append(args, localPath, dest)
 
 	e.logger.Debug(
 		"scp file to %s: %s -> %s",
@@ -302,10 +303,12 @@ func (e *SSHExecutor) CopyDir(
 		// Universal case: copy source into the PARENT of the remote
 		// destination so scp's basename rule lands the contents where
 		// the caller expects, without any pre-state assumption.
-		args = append(args,
-			localDir,
-			fmt.Sprintf("%s@%s:%s", host.User, host.Address, remoteParent),
-		)
+		// RM3 (SECURITY): refuse a leading-dash scp destination before spawn.
+		dest, err := scpDestination(host, remoteParent)
+		if err != nil {
+			return err
+		}
+		args = append(args, localDir, dest)
 		e.logger.Debug(
 			"scp dir to %s: %s -> %s (via parent %s)",
 			host.Name, localDir, remoteDir, remoteParent,
@@ -332,10 +335,12 @@ func (e *SSHExecutor) CopyDir(
 				host.Name, localDir, remoteDir, err,
 			)
 		}
-		args = append(args,
-			localDir,
-			fmt.Sprintf("%s@%s:%s", host.User, host.Address, remoteDir),
-		)
+		// RM3 (SECURITY): refuse a leading-dash scp destination before spawn.
+		dest, err := scpDestination(host, remoteDir)
+		if err != nil {
+			return err
+		}
+		args = append(args, localDir, dest)
 		e.logger.Debug(
 			"scp dir to %s (basename mismatch): %s -> %s",
 			host.Name, localDir, remoteDir,
@@ -396,6 +401,52 @@ func replaceAll(s, old, new string) string {
 		}
 	}
 	return out
+}
+
+// sshDestination renders the ssh/scp destination positional
+// ("<user>@<address>") for host AND refuses a value that ssh/scp's own
+// getopt would parse as an OPTION rather than a host (RM3 SECURITY).
+//
+// ssh/scp are spawned as a bare argv (exec.CommandContext("ssh"/"scp",
+// args...) / iexec.Run, no shell), so shell metacharacters in the
+// destination are inert — but the destination is a POSITIONAL argv element
+// with no reliable "--" end-of-options terminator for the host, so a value
+// that BEGINS WITH '-' is consumed by ssh/scp's getopt as an option.
+// host.User + host.Address are verbatim env config
+// (CONTAINERS_REMOTE_HOST_N_USER / _ADDRESS) with ZERO validation, so a
+// host.User of e.g. "-oProxyCommand=<cmd>" injects ssh's ProxyCommand
+// (arbitrary command execution) on the CONTROL-PLANE host that runs the
+// executor. Refuse it BEFORE any spawn (ssh/scp have no reliable "--" host
+// terminator, so rejection is the safe, deterministic fix). This is the
+// single source of truth for the class in pkg/remote — sshArgs,
+// scpDestination, ConnectionPool.masterArgs, and ConnectionPool.closeEntry
+// all route through here, so the checked value and the spawned value are
+// provably identical. Mirrors pkg/network CreateTunnel's §NET3 leading-dash
+// guard on tunnelDestination. An empty User yields "@<address>", which
+// begins with '@' and is inert to getopt.
+func sshDestination(host RemoteHost) (string, error) {
+	dest := fmt.Sprintf("%s@%s", host.User, host.Address)
+	if strings.HasPrefix(dest, "-") {
+		return "", fmt.Errorf(
+			"refusing ssh/scp destination %q that begins with '-' "+
+				"(would be parsed as an ssh/scp option — argument injection)",
+			dest,
+		)
+	}
+	return dest, nil
+}
+
+// scpDestination renders the scp destination positional
+// ("<user>@<address>:<remotePath>") for host, composing on sshDestination so
+// the leading-dash refusal lives in exactly ONE place: appending
+// ":<remotePath>" can never change whether the composed string begins with
+// '-' (that is fixed by the user@address prefix sshDestination validates).
+func scpDestination(host RemoteHost, remotePath string) (string, error) {
+	dest, err := sshDestination(host)
+	if err != nil {
+		return "", err
+	}
+	return dest + ":" + remotePath, nil
 }
 
 // IsReachable checks whether the host accepts SSH connections.
@@ -473,9 +524,15 @@ func (e *SSHExecutor) sshArgs(
 		args = append(args, "-i", host.KeyPath)
 	}
 
-	args = append(args,
-		fmt.Sprintf("%s@%s", host.User, host.Address),
-	)
+	// RM3 (SECURITY): host.User/host.Address are verbatim env config; refuse a
+	// leading-dash destination that ssh's getopt would parse as an option
+	// (ProxyCommand RCE) BEFORE the caller spawns ssh. Single source of truth
+	// with scpDestination/masterArgs/closeEntry via sshDestination.
+	dest, err := sshDestination(host)
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, dest)
 	return args, nil
 }
 

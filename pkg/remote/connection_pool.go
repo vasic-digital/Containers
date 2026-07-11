@@ -185,7 +185,10 @@ func (p *ConnectionPool) Acquire(
 
 	socketPath := p.controlSocketPath(host)
 
-	args := p.masterArgs(host, socketPath)
+	args, err := p.masterArgs(host, socketPath)
+	if err != nil {
+		return "", err
+	}
 	// Only impose a deadline when ConnectTimeout is positive. A zero
 	// ConnectTimeout means "no artificial deadline" (matching the
 	// KeepAlive/CommandTimeout 0=disable convention and ssh's own
@@ -307,21 +310,35 @@ func (p *ConnectionPool) closeEntry(entry *controlEntry) error {
 	)
 	defer cancel()
 
+	// RM3 (SECURITY): refuse a leading-dash `-O exit` destination (a tainted
+	// host.User → ssh ProxyCommand RCE) before spawning ssh. The socket file
+	// is still removed so a poisoned entry never lingers on disk.
+	dest, err := sshDestination(entry.host)
+	if err != nil {
+		_ = os.Remove(entry.socketPath)
+		return err
+	}
 	args := []string{
 		"-S", entry.socketPath,
 		"-O", "exit",
-		fmt.Sprintf(
-			"%s@%s", entry.host.User, entry.host.Address,
-		),
+		dest,
 	}
-	_, _, err := iexec.Run(ctx, "ssh", args...)
+	_, _, err = iexec.Run(ctx, "ssh", args...)
 	_ = os.Remove(entry.socketPath)
 	return err
 }
 
 func (p *ConnectionPool) masterArgs(
 	host RemoteHost, socketPath string,
-) []string {
+) ([]string, error) {
+	// RM3 (SECURITY): refuse a leading-dash ControlMaster destination (a
+	// tainted host.User such as "-oProxyCommand=<cmd>" → ssh ProxyCommand RCE
+	// on the control-plane host) BEFORE the `-fNM` master dial. Single source
+	// of truth with sshArgs/scpDestination/closeEntry via sshDestination.
+	dest, err := sshDestination(host)
+	if err != nil {
+		return nil, err
+	}
 	args := []string{
 		"-fNM",
 		"-S", socketPath,
@@ -358,10 +375,8 @@ func (p *ConnectionPool) masterArgs(
 		args = append(args, "-i", host.KeyPath)
 	}
 
-	args = append(args,
-		fmt.Sprintf("%s@%s", host.User, host.Address),
-	)
-	return args
+	args = append(args, dest)
+	return args, nil
 }
 
 // controlSocketPath returns the on-disk ControlMaster socket path for

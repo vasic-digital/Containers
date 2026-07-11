@@ -236,7 +236,13 @@ func TestMasterArgs_EmitsControlPersistWhenPositive(t *testing.T) {
 	}}
 	host := RemoteHost{Name: "h", Address: "10.0.0.1", User: "u", Port: 22}
 
-	args := pool.masterArgs(host, "/tmp/sock-controlpersist-pos")
+	// RM3 §11.4.120 reconcile: masterArgs now returns (args, error) so it can
+	// refuse a leading-dash ControlMaster destination (SECURITY). The benign
+	// host here (User "u") never triggers that refusal, so err must be nil;
+	// the ControlPersist assertion below is unchanged (mutation-catching for
+	// REMOTE-HIGH-3 preserved).
+	args, err := pool.masterArgs(host, "/tmp/sock-controlpersist-pos")
+	require.NoError(t, err)
 
 	if !containsSequence(args, "-o", "ControlPersist=300") {
 		t.Fatalf("REMOTE-HIGH-3: masterArgs must include -o ControlPersist=<seconds> when ControlPersist>0 (5min=300s); got %v", args)
@@ -257,7 +263,11 @@ func TestMasterArgs_OmitsControlPersistWhenZero(t *testing.T) {
 	}}
 	host := RemoteHost{Name: "h", Address: "10.0.0.1", User: "u", Port: 22}
 
-	args := pool.masterArgs(host, "/tmp/sock-controlpersist-zero")
+	// RM3 §11.4.120 reconcile: masterArgs now returns (args, error); the
+	// benign host (User "u") is accepted so err is nil. The "omit
+	// ControlPersist when zero" assertion below is unchanged.
+	args, err := pool.masterArgs(host, "/tmp/sock-controlpersist-zero")
+	require.NoError(t, err)
 
 	for i, a := range args {
 		if strings.Contains(a, "ControlPersist") {

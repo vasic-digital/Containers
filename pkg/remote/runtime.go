@@ -231,7 +231,15 @@ func (r *RemoteRuntime) runtimeCmd(args string) string {
 	if rt == "" {
 		rt = "docker"
 	}
-	return fmt.Sprintf("%s %s", rt, args)
+	// RM3 (SECURITY): host.Runtime is verbatim env config
+	// (CONTAINERS_REMOTE_HOST_N_RUNTIME) spliced as the LEADING token of the
+	// remote `ssh <host> <cmd>` string the remote login shell re-parses —
+	// while the container-id / filter args in the SAME command are already
+	// shellEscape'd (Start/Stop/Remove/Status/List/Stats/Exec/Logs). Escape rt
+	// too so a value like "docker;evilcmd" cannot inject a second remote
+	// command; shellEscape is a no-op for the ordinary `[A-Za-z0-9_/.-]`
+	// runtime names (docker/podman), so legitimate configs are unchanged.
+	return fmt.Sprintf("%s %s", shellEscape(rt), args)
 }
 
 func parseRemoteStatus(
