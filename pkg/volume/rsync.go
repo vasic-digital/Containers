@@ -93,12 +93,24 @@ func (r *RsyncSyncer) Sync(
 	// NOTE: the source host is host.Address (the remote host itself), so this
 	// rsyncs the remote's own LocalPath rather than pushing the local
 	// orchestrator's files — a separate tracked defect (needs a local-host
-	// identity threaded through config). The path quoting here closes the
-	// shell-injection / word-splitting vector regardless of that.
+	// identity threaded through config).
+	//
+	// VOL2-1: host.User and host.Address are interpolated into the remote
+	// `user@host:path` spec and MUST be shell-quoted just like the paths.
+	// The prior code quoted only mount.LocalPath / mount.RemotePath and passed
+	// host.User / host.Address RAW, so its own claim that path quoting "closes
+	// the shell-injection / word-splitting vector" was false: a host User or
+	// Address carrying a space (word-split → wrong remote spec) or a shell
+	// metacharacter (`;`, `$(...)`, backticks → arbitrary command injection on
+	// the remote host, which is exactly where this command runs) still reached
+	// the remote shell verbatim. These values flow from host config (§6.R),
+	// never a request, but an unescaped interpolation into a shell command is a
+	// defect regardless of source — mirror the SSHFSMounter address-quoting
+	// (VOL-HIGH-2) so the whole `user@host:path` triple is quoted.
 	pullCmd := fmt.Sprintf(
 		"rsync %s %s@%s:%s/ %s/",
 		strings.Join(flags, " "),
-		host.User, host.Address,
+		shellQuote(host.User), shellQuote(host.Address),
 		shellQuote(mount.LocalPath),
 		shellQuote(mount.RemotePath),
 	)

@@ -318,6 +318,23 @@ func (m *DefaultVolumeManager) Sync(
 		return fmt.Errorf("mount %q not found", name)
 	}
 
+	// VOL2-2: Sync performs an rsync push, which is meaningful ONLY for an
+	// rsync-type mount. An SSHFS/NFS mount is a live network filesystem, not a
+	// periodically-synced copy — rsyncing into its RemotePath writes THROUGH the
+	// live mountpoint (for SSHFS, back onto the orchestrator's own exported
+	// LocalPath) while this method flips State to MountSyncing→MountMounted and
+	// returns nil, reporting success for an operation that never belonged to
+	// that mount type (a §11.4.108 false-success / wrong-operation). The pre-fix
+	// Sync called m.rsync.Sync for ANY registered mount type with no type
+	// guard. Reject a Sync of a non-rsync mount BEFORE mutating state or issuing
+	// any remote command.
+	if info.Mount.Type != MountRsync {
+		return fmt.Errorf(
+			"sync %q: only rsync-type mounts support Sync; mount %q is type %q",
+			name, name, info.Mount.Type,
+		)
+	}
+
 	host, _ := m.hostManager.GetHost(info.Mount.HostName)
 	if host == nil {
 		return fmt.Errorf(
