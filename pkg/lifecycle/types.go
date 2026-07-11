@@ -40,7 +40,12 @@ type ServiceSpec struct {
 	// MaxConcurrent limits the number of parallel Acquire holders.
 	// Zero means unlimited.
 	MaxConcurrent int
-	// Priority controls start order; lower values start first.
+	// Priority is a reserved ordering hint: lower values are intended to
+	// start first. LIFE-3 doc-honesty: it is declared but NOT YET WIRED — no
+	// code reads it, so it currently has no effect on start or shutdown order.
+	// Start ordering is driven by Dependencies; Shutdown iterates in
+	// unspecified order. Kept as a public API field for forward compatibility
+	// (wiring it is future work, never silently assumed).
 	Priority int
 	// Dependencies lists service names that must be running
 	// before this service can start.
