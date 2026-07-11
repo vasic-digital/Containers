@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"time"
 )
 
 // hostLookup defines the interface for DNS host lookups.
@@ -36,8 +35,21 @@ func NewDNSDiscoverer() *DNSDiscoverer {
 	}
 }
 
-// Discover performs a DNS lookup for target.Host and returns true
-// when at least one address resolves.
+// Discover performs a DNS host lookup for target.Host and returns
+// (true, nil) when at least one address resolves.
+//
+// A true result proves only that the NAME RESOLVES to >= 1 A/AAAA address.
+// It says NOTHING about whether a service actually listens at that address,
+// whether it is the intended service, or whether it is healthy — a wildcard
+// DNS entry or a stale record resolves successfully while nothing serves the
+// name. This package deliberately splits discovery from health; compose with
+// pkg/health for a liveness signal.
+//
+// On failure it returns (false, err). found==false does NOT prove the name is
+// absent: an NXDOMAIN (definitive absent) and a context cancel/timeout or
+// network-unreachable (indeterminate) both yield (false, err). The wrapped
+// cause is preserved via %w, so callers needing to tell these apart MUST
+// inspect the error class (e.g. errors.Is(err, context.DeadlineExceeded)).
 func (d *DNSDiscoverer) Discover(
 	ctx context.Context,
 	target DiscoveryTarget,
@@ -51,7 +63,7 @@ func (d *DNSDiscoverer) Discover(
 
 	timeout := target.Timeout
 	if timeout == 0 {
-		timeout = 5 * time.Second
+		timeout = defaultDiscoveryTimeout
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)

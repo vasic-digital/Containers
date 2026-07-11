@@ -97,6 +97,41 @@ func TestTCPDiscoverer_Discover_CancelledContext(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// TestTCPDiscoverer_Discover_HandshakeOnly_Characterization documents the
+// deliberately weak contract stated on TCPDiscoverer.Discover: a listener
+// that NEVER calls Accept still reports reachable, because the kernel
+// completes the TCP handshake from the listen backlog with no application
+// bytes exchanged.
+//
+// This is a CHARACTERIZATION / CONTRACT test recording the CURRENT intended
+// behaviour (§11.4.108 doc-honesty) — it is NOT a §11.4.115 RED->GREEN defect
+// guard: "handshake-only" is the designed contract, not a bug, so there is no
+// broken state to reproduce and flip to green.
+func TestTCPDiscoverer_Discover_HandshakeOnly_Characterization(t *testing.T) {
+	// Open a listener but NEVER call Accept; inbound connections sit in the
+	// kernel accept backlog. A dial still completes the handshake.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	require.NoError(t, err)
+
+	d := discovery.NewTCPDiscoverer()
+	target := discovery.DiscoveryTarget{
+		Name:    "handshake-only",
+		Host:    "127.0.0.1",
+		Port:    port,
+		Method:  "tcp",
+		Timeout: 2 * time.Second,
+	}
+
+	found, discErr := d.Discover(context.Background(), target)
+	// Reachable == handshake completed, NOT that any service served bytes.
+	require.NoError(t, discErr)
+	assert.True(t, found)
+}
+
 // TestTCPDiscoverer_Discover_ZeroTimeout tests that a zero timeout
 // uses the default 5 second timeout.
 func TestTCPDiscoverer_Discover_ZeroTimeout(t *testing.T) {

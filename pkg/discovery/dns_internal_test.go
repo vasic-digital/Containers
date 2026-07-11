@@ -10,6 +10,15 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// TestDefaultDiscoveryTimeout_Value locks the single hoisted default probe
+// timeout shared by the DNS and TCP discoverers (§6.R de-duplication). This
+// is a HYGIENE test pinning the const's value — NOT a §11.4.115 RED->GREEN
+// behavioural guard: hoisting the two duplicate literals into this const
+// preserves the identical 5s value, there is no defect to reproduce.
+func TestDefaultDiscoveryTimeout_Value(t *testing.T) {
+	assert.Equal(t, 5*time.Second, defaultDiscoveryTimeout)
+}
+
 // mockHostLookup is a test double for DNS lookups.
 type mockHostLookup struct {
 	addrs []string
