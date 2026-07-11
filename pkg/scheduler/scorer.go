@@ -247,21 +247,31 @@ func matchingGPUs(
 ) []remote.GPUDevice {
 	out := make([]remote.GPUDevice, 0, len(host))
 	for _, g := range host {
-		if req.Vendor != "" && g.Vendor != req.Vendor {
-			continue
+		if gpuMatchesReq(g, req) {
+			out = append(out, g)
 		}
-		if req.MinVRAMMB > 0 && g.VRAMFreeMB < req.MinVRAMMB {
-			continue
-		}
-		if req.MinCompute != "" && computeCapabilityLess(g.ComputeCapability, req.MinCompute) {
-			continue
-		}
-		if !capabilitiesMatch(g, req.Capabilities) {
-			continue
-		}
-		out = append(out, g)
 	}
 	return out
+}
+
+// gpuMatchesReq reports whether a single host GPU satisfies req. Extracted from
+// matchingGPUs (behavior byte-identical) so the within-batch GPU deduction
+// (deductGPU in scheduler.go, CT-HARDEN-SCHED-1/Wave-20) reuses the same match
+// predicate rather than re-implementing (and risking divergence from) it.
+func gpuMatchesReq(g remote.GPUDevice, req GPURequirement) bool {
+	if req.Vendor != "" && g.Vendor != req.Vendor {
+		return false
+	}
+	if req.MinVRAMMB > 0 && g.VRAMFreeMB < req.MinVRAMMB {
+		return false
+	}
+	if req.MinCompute != "" && computeCapabilityLess(g.ComputeCapability, req.MinCompute) {
+		return false
+	}
+	if !capabilitiesMatch(g, req.Capabilities) {
+		return false
+	}
+	return true
 }
 
 func capabilitiesMatch(g remote.GPUDevice, req []string) bool {
