@@ -2,7 +2,9 @@ package metrics
 
 import (
 	"errors"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -125,21 +127,44 @@ func registerOrExisting[T prometheus.Collector](
 	return c
 }
 
+// sanitizeLabelValue coerces v into a valid-UTF-8 string. prometheus
+// *Vec.WithLabelValues PANICS ("label value ... is not valid UTF-8") when a
+// label value contains invalid UTF-8 bytes, and *Vec.DeleteLabelValues then
+// fails to match a series recorded under the sanitized value. Because this is a
+// generic reusable library, the caller-supplied container name flows straight
+// into the label with no upstream validation — an ephemeral or externally
+// derived name carrying stray bytes would crash the whole process on the
+// metrics hot path (the same panic-in-normal-call-path class the constructor
+// fix closed, here on the record path). Coercing invalid runs to U+FFFD keeps
+// recording panic-free AND keeps the exposition well-formed (an invalid-UTF-8
+// label value also corrupts the text/OpenMetrics scrape, which a strict scraper
+// drops). The valid-UTF-8 fast path allocates nothing for the common case
+// (§11.4.6 — proven by probe, not assumed).
+func sanitizeLabelValue(v string) string {
+	if utf8.ValidString(v) {
+		return v
+	}
+	return strings.ToValidUTF8(v, "�")
+}
+
 // IncContainerStarts increments the start counter for the named
 // container.
 func (c *PrometheusCollector) IncContainerStarts(name string) {
+	name = sanitizeLabelValue(name)
 	c.containerStarts.WithLabelValues(name).Inc()
 }
 
 // IncContainerStops increments the stop counter for the named
 // container.
 func (c *PrometheusCollector) IncContainerStops(name string) {
+	name = sanitizeLabelValue(name)
 	c.containerStops.WithLabelValues(name).Inc()
 }
 
 // IncContainerFailures increments the failure counter for the
 // named container.
 func (c *PrometheusCollector) IncContainerFailures(name string) {
+	name = sanitizeLabelValue(name)
 	c.containerFailures.WithLabelValues(name).Inc()
 }
 
@@ -157,6 +182,7 @@ func (c *PrometheusCollector) ObserveHealthCheckDuration(
 	if d < 0 {
 		d = 0
 	}
+	name = sanitizeLabelValue(name)
 	c.healthCheckDur.WithLabelValues(name).Observe(d.Seconds())
 }
 
@@ -178,6 +204,7 @@ func (c *PrometheusCollector) SetContainerUp(
 	if up {
 		val = 1.0
 	}
+	name = sanitizeLabelValue(name) // MET2-1 anti-tautology anchor: coerce invalid UTF-8 so WithLabelValues never panics
 	c.containerUp.WithLabelValues(name).Set(val)
 }
 
@@ -193,6 +220,10 @@ func (c *PrometheusCollector) SetContainerUp(
 // type-asserts to *PrometheusCollector or interface{ Forget(string) } to
 // invoke it.
 func (c *PrometheusCollector) Forget(name string) {
+	// Match the sanitized value the record methods stored, otherwise a
+	// bad-UTF-8 name's series would never be evicted (MET-2 cardinality bound
+	// would silently leak for such names).
+	name = sanitizeLabelValue(name)
 	c.containerUp.DeleteLabelValues(name)
 	c.containerStarts.DeleteLabelValues(name)
 	c.containerStops.DeleteLabelValues(name)
