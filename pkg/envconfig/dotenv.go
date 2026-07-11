@@ -66,9 +66,20 @@ func parseDotEnvLine(line string) (key, value string, ok bool) {
 		}
 	}
 
-	// Strip inline comments (only for unquoted values).
-	if idx := strings.IndexByte(value, '#'); idx >= 0 {
-		value = strings.TrimSpace(value[:idx])
+	// Strip inline comments (unquoted values only). A '#' is an
+	// inline comment ONLY when it starts the value or is preceded by
+	// whitespace (the dotenv convention). This preserves a '#' that is
+	// part of an unquoted value — e.g. a password like p@ss#word —
+	// instead of silently truncating it to p@ss (ENV-4 / §11.4.10
+	// credential-corruption).
+	for i := 0; i < len(value); i++ {
+		if value[i] != '#' {
+			continue
+		}
+		if i == 0 || value[i-1] == ' ' || value[i-1] == '\t' {
+			value = strings.TrimSpace(value[:i])
+			break
+		}
 	}
 
 	return key, value, true
