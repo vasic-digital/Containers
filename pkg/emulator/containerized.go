@@ -440,10 +440,18 @@ func (c *Containerized) WaitForBoot(
 	// a copy/restart failure does NOT fail WaitForBoot outright — the
 	// boot-completed poll below is the load-bearing assertion, and a
 	// host whose own adbkey already matches (re-run) still succeeds.
+	// SW2-2: capture authorizeADB's error instead of discarding it. There is
+	// no logger field on Containerized, so a discarded error left the
+	// 2026-06-23 adb-authorization blocker undiagnosable — the timeout error
+	// returned below never mentioned that authorizeADB had failed. Keep the
+	// best-effort continue-to-the-poll behaviour (the poll is the §6.J primary
+	// assertion), but remember authErr so a subsequent poll timeout can
+	// surface it in the returned error.
+	var authErr error
 	if err := c.authorizeADB(cctx); err != nil {
 		// Surface for diagnosis but continue to the poll; the poll is
 		// the §6.J primary assertion (boot_completed OBSERVED on wire).
-		_ = err
+		authErr = err
 	}
 
 	// Connect host adb to the forwarded port first.
@@ -471,6 +479,18 @@ func (c *Containerized) WaitForBoot(
 			// before this fix.
 		case <-time.After(2 * time.Second):
 		}
+	}
+	// SW2-2: when authorizeADB failed earlier AND the poll then timed out,
+	// wrap the authorization failure into the returned error so the
+	// previously-discarded diagnostic surfaces (this reproduces the exact
+	// diagnostic blindness that made the 2026-06-23 adb-authorization blocker
+	// hard to root-cause). When authErr == nil the message is byte-identical
+	// to the prior behaviour.
+	if authErr != nil {
+		return time.Since(startedAt), fmt.Errorf(
+			"WaitForBoot timed out after %s waiting for sys.boot_completed=1 on port %d (adb authorization also failed: %w)",
+			timeout, port, authErr,
+		)
 	}
 	return time.Since(startedAt), fmt.Errorf(
 		"WaitForBoot timed out after %s waiting for sys.boot_completed=1 on port %d",
