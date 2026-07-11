@@ -464,6 +464,24 @@ func (m *DefaultTunnelManager) tunnelArgs(
 		"-N",
 		fwdFlag, fwdSpec,
 		"-o", "StrictHostKeyChecking=" + yesNo(m.opts.StrictHostKeyCheck),
+		// NET2-6: run the tunnel ssh strictly non-interactively. Both sibling
+		// ssh-arg builders in this module already do this — pkg/remote's
+		// SSHExecutor.sshArgs and pkg/egress's buildDynamicForwardArgs each
+		// pass "-o BatchMode=yes" — and tunnelArgs was the lone omission.
+		// Without it, a tunnel whose auth needs a password/passphrase, OR a
+		// host-key confirmation prompt (StrictHostKeyChecking=ask, ssh's
+		// compiled default), makes ssh read the prompt from the controlling
+		// terminal and BLOCK INDEFINITELY: ssh opens /dev/tty for the prompt,
+		// bypassing the child's /dev/null stdin, so cmd.Start() returns but the
+		// child never proceeds and never dies. That silent hang directly
+		// contradicts the "never hang" liveness intent documented on
+		// confirmLocalBind (which only bounds the local-bind poll, not the ssh
+		// child itself). BatchMode=yes forces ssh to fail fast on any
+		// interactive requirement, so the reaper's exit capture surfaces an
+		// honest State=TunnelFailed instead of a wedged tunnel. It is a fixed
+		// literal (matching both siblings, which hardcode it), so an
+		// unconfigured caller's key-based tunnels are unaffected.
+		"-o", "BatchMode=yes",
 	}
 
 	// NET2-3: keep-alive is now Option-driven (mirrors pkg/remote.Options),

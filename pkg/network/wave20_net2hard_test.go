@@ -367,3 +367,76 @@ func TestNET2_5_TunnelOverlay_Connect_DistinctContainersStillBothAdded(t *testin
 
 	assert.ElementsMatch(t, []string{"container-1", "container-2"}, members)
 }
+
+// --- NET2-6: tunnel ssh runs strictly non-interactively (BatchMode=yes) ----
+
+// TestWave20_NET2_TunnelArgs_BatchModeNonInteractive proves the tunnel ssh
+// command is built with `-o BatchMode=yes`, matching the two OTHER ssh-arg
+// builders in this module (pkg/remote.SSHExecutor.sshArgs and
+// pkg/egress.buildDynamicForwardArgs, both of which hardcode + test it).
+// tunnelArgs was the lone omission. Without BatchMode, a tunnel whose auth
+// needs a password/passphrase, or a host-key confirmation prompt
+// (StrictHostKeyChecking=ask, ssh's compiled default), makes ssh read from the
+// controlling terminal and BLOCK INDEFINITELY (ssh prompts on /dev/tty,
+// bypassing the child's /dev/null stdin) — the exact "never hang" liveness gap
+// the fork/bind guards in this file close, left open on the auth path.
+//
+// §11.4.115 RED/GREEN: PASSes on the fixed tree. A surgical revert removing the
+// `"-o", "BatchMode=yes"` element from tunnelArgs reproduces RED — the built
+// arg vector no longer contains "BatchMode=yes".
+func TestWave20_NET2_TunnelArgs_BatchModeNonInteractive(t *testing.T) {
+	hm := &mockHostManager{hosts: map[string]remote.RemoteHost{}}
+	mgr := NewTunnelManager(hm, logging.NopLogger{})
+
+	host := remote.RemoteHost{Name: "h", Address: "10.0.0.1", User: "user", Port: 22}
+	spec := TunnelSpec{
+		Direction:  TunnelLocal,
+		LocalPort:  "8080",
+		RemoteHost: "db-server",
+		RemotePort: "5432",
+	}
+
+	args := mgr.tunnelArgs(host, spec)
+
+	// Mirrors the NET2-3 StrictHostKeyChecking / ServerAlive assertions above.
+	assert.Contains(t, args, "BatchMode=yes",
+		"the tunnel ssh command must run non-interactively (BatchMode=yes), "+
+			"matching pkg/remote + pkg/egress, so it can never block on an "+
+			"interactive auth/host-key prompt")
+
+	// Discriminator (anti-tautology): BatchMode=yes must be the VALUE of an
+	// `-o` option — i.e. the argv element immediately preceding it must be the
+	// "-o" flag, not some unrelated bare token — so ssh actually parses it as
+	// the BatchMode option rather than a positional argument.
+	found := false
+	for i := 1; i < len(args); i++ {
+		if args[i] == "BatchMode=yes" && args[i-1] == "-o" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found,
+		"BatchMode=yes must be passed as the value of an -o option (preceded "+
+			"by the -o flag token)")
+}
+
+// TestWave20_NET2_TunnelArgs_BatchModeBothDirections proves the non-interactive
+// hardening is applied for BOTH tunnel directions (local -L and remote -R),
+// since either direction shells out an ssh child that could otherwise wedge on
+// an interactive prompt. Complements the discriminator above by pinning that
+// the fix is unconditional, not accidentally scoped to one Direction branch.
+func TestWave20_NET2_TunnelArgs_BatchModeBothDirections(t *testing.T) {
+	hm := &mockHostManager{hosts: map[string]remote.RemoteHost{}}
+	mgr := NewTunnelManager(hm, logging.NopLogger{})
+	host := remote.RemoteHost{Name: "h", Address: "10.0.0.1", User: "user", Port: 22}
+
+	for _, dir := range []TunnelDirection{TunnelLocal, TunnelRemote} {
+		args := mgr.tunnelArgs(host, TunnelSpec{
+			Direction:  dir,
+			LocalPort:  "8080",
+			RemotePort: "5432",
+		})
+		assert.Contains(t, args, "BatchMode=yes",
+			"BatchMode=yes must be present for direction %q", dir)
+	}
+}
