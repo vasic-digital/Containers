@@ -234,6 +234,15 @@ type Containerized struct {
 	// drive `adb -s emulator-<port>` invocations.
 	hostADBPort int
 
+	// adbKeyTmpDir is the host temp directory authorizeADB creates via
+	// os.MkdirTemp("", "lava-emu-adbkey-") to hold a copy of the
+	// container's PRIVATE adb key (ADB_VENDOR_KEYS points at a file
+	// inside it for the whole boot/test cycle). EMU-4: Teardown removes
+	// this directory so no copy of private key material survives past
+	// Teardown. Empty when authorizeADB has not (yet) run, or after
+	// Teardown has cleaned it up.
+	adbKeyTmpDir string
+
 	// adbBinaryPath is the host-side path to `adb`. The container
 	// runs its own adb internally; this is the host's adb that
 	// connects to the forwarded port. Empty defaults to "adb" on
@@ -395,6 +404,16 @@ func (c *Containerized) WaitForBoot(
 	startedAt := time.Now()
 	deadline := startedAt.Add(timeout)
 
+	// EMU-1 (GENY-1/CF-1 class, §11.4.108): bind every underlying exec in
+	// this wait (authorizeADB's container `cp` + adb kill-server/
+	// start-server, the initial `adb connect`, and every poll iteration's
+	// `adb shell getprop`) to a context derived from `timeout`, NOT the
+	// raw caller ctx. Real callers (cmd/emulator-matrix, cmd/emulator-
+	// canary) pass context.Background(); without this, a wedged adb or
+	// container exec hangs WaitForBoot FOREVER past the stated timeout.
+	cctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
 	// RC2 (2026-06-23 thinker.local blocker): authorise the host adb
 	// client against the guest BEFORE connecting. The image bakes a
 	// fixed adb keypair (Containerfile) which the AVD authorises; copy
@@ -406,7 +425,7 @@ func (c *Containerized) WaitForBoot(
 	// a copy/restart failure does NOT fail WaitForBoot outright — the
 	// boot-completed poll below is the load-bearing assertion, and a
 	// host whose own adbkey already matches (re-run) still succeeds.
-	if err := c.authorizeADB(ctx); err != nil {
+	if err := c.authorizeADB(cctx); err != nil {
 		// Surface for diagnosis but continue to the poll; the poll is
 		// the §6.J primary assertion (boot_completed OBSERVED on wire).
 		_ = err
@@ -414,21 +433,27 @@ func (c *Containerized) WaitForBoot(
 
 	// Connect host adb to the forwarded port first.
 	if _, err := c.executor.Execute(
-		ctx, c.adbBinaryPath, "connect", fmt.Sprintf("localhost:%d", port),
+		cctx, c.adbBinaryPath, "connect", fmt.Sprintf("localhost:%d", port),
 	); err != nil {
 		return time.Since(startedAt), fmt.Errorf("adb connect: %w", err)
 	}
 	target := fmt.Sprintf("localhost:%d", port)
 	for time.Now().Before(deadline) {
 		out, err := c.executor.Execute(
-			ctx, c.adbBinaryPath, "-s", target, "shell", "getprop", "sys.boot_completed",
+			cctx, c.adbBinaryPath, "-s", target, "shell", "getprop", "sys.boot_completed",
 		)
 		if err == nil && strings.TrimSpace(string(out)) == "1" {
 			return time.Since(startedAt), nil
 		}
 		select {
-		case <-ctx.Done():
-			return time.Since(startedAt), ctx.Err()
+		case <-cctx.Done():
+			if ctx.Err() != nil {
+				return time.Since(startedAt), ctx.Err()
+			}
+			// Our own internal `timeout` budget elapsed, not the caller's
+			// ctx — fall through; the loop condition below becomes false
+			// and the timed-out error below is returned, exactly as
+			// before this fix.
 		case <-time.After(2 * time.Second):
 		}
 	}
@@ -463,6 +488,11 @@ func (c *Containerized) authorizeADB(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("authorizeADB: mkdtemp: %w", err)
 	}
+	// EMU-4 (§11.4.14 + secret hygiene): track the created temp dir on
+	// the struct so Teardown can remove it. Do NOT defer-remove here —
+	// ADB_VENDOR_KEYS must stay valid for the whole boot/test cycle, not
+	// just this call.
+	c.adbKeyTmpDir = tmpDir
 	hostKey := tmpDir + "/adbkey"
 	cpSrc := fmt.Sprintf("%s:%s", c.containerName, containerADBKeyPath)
 	if out, err := c.executor.Execute(
@@ -570,6 +600,12 @@ func (c *Containerized) Teardown(ctx context.Context, _ int) error {
 		// instance. Per clause 6.J this is a no-op SUCCESS, not a
 		// silent error, because callers may invoke Teardown
 		// defensively in a defer block.
+		//
+		// EMU-4: still reap any adb-vendor-key temp dir defensively —
+		// authorizeADB only runs after Boot, so this is normally already
+		// empty, but a caller invoking Teardown out of the usual
+		// Boot/WaitForBoot sequence must not leak it either.
+		c.removeADBKeyTmpDir()
 		return nil
 	}
 	out, err := c.executor.Execute(
@@ -577,10 +613,32 @@ func (c *Containerized) Teardown(ctx context.Context, _ int) error {
 	)
 	c.containerName = ""
 	c.hostADBPort = 0
+	// EMU-4 (§11.4.14 + secret hygiene): authorizeADB (invoked from
+	// WaitForBoot) copies the container's PRIVATE adb key into
+	// c.adbKeyTmpDir and never removes it itself (ADB_VENDOR_KEYS must
+	// stay valid for the whole boot/test cycle). Remove it here, on
+	// EVERY Teardown exit path — including the container-rm error path
+	// below — so no copy of private key material survives past
+	// Teardown.
+	c.removeADBKeyTmpDir()
 	if err != nil {
 		return fmt.Errorf("%s rm: %w (output: %s)", c.runtimeBinary, err, string(out))
 	}
 	return nil
+}
+
+// removeADBKeyTmpDir removes the adb-vendor-key temp directory created
+// by authorizeADB, if any, and clears the tracking field. Best-effort:
+// a removal failure is not surfaced as a Teardown error (Teardown's
+// primary contract is stopping the container; a leftover empty/
+// unwritable temp dir does not affect that), but the field is always
+// cleared so a later authorizeADB call does not re-track a stale path.
+func (c *Containerized) removeADBKeyTmpDir() {
+	if c.adbKeyTmpDir == "" {
+		return
+	}
+	_ = os.RemoveAll(c.adbKeyTmpDir)
+	c.adbKeyTmpDir = ""
 }
 
 // ContainerName returns the runtime-side container name set by

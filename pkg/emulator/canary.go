@@ -250,11 +250,24 @@ func observeActivityAndLogcat(
 ) (resumed, fatalDetected bool, logcatOutput string) {
 	deadline := time.Now().Add(activityTimeout)
 
+	// EMU-1 (GENY-1/CF-1 class, §11.4.108): bind every dumpsys poll exec
+	// to a context derived from activityTimeout, NOT the raw caller ctx.
+	// RunCanary's callers pass context.Background(); without this, a
+	// wedged `adb shell dumpsys` hangs this poll FOREVER past
+	// activityTimeout because the underlying exec.CommandContext(ctx, ...)
+	// never gets cancelled. The subsequent logcat capture below
+	// deliberately keeps using the raw `ctx` (via its own
+	// context.WithTimeout(ctx, logcatWindow)) — logcat capture MUST still
+	// run its own fresh window even when this activity-resumed wait timed
+	// out, so it must not inherit an already-expired cctx.
+	cctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
 	// First: poll dumpsys activity until the package appears as resumed
 	// or the timeout fires.
 	for time.Now().Before(deadline) {
 		dumpsysOut, err := emu.executor.Execute(
-			ctx, adb, "-s", target,
+			cctx, adb, "-s", target,
 			"shell", "dumpsys", "activity", "activities",
 		)
 		if err == nil {
@@ -269,8 +282,15 @@ func observeActivityAndLogcat(
 			break
 		}
 		select {
-		case <-ctx.Done():
-			return false, false, ""
+		case <-cctx.Done():
+			if ctx.Err() != nil {
+				return false, false, ""
+			}
+			// Our own internal activityTimeout elapsed, not the caller's
+			// ctx — fall through; the loop condition below becomes false
+			// and the logcat capture below still runs (unchanged
+			// behavior: a timed-out activity-resumed wait still captures
+			// logcat for the observation window).
 		case <-time.After(1 * time.Second):
 		}
 	}
