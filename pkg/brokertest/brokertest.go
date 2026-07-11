@@ -150,8 +150,8 @@ func StartNATS(ctx context.Context, opts ...Option) (endpoint string, stop func(
 		// Map container 4222 to a host port. Empty host port => runtime picks a
 		// free high port, which we then resolve via pkg/runtime Status.
 		"-p", hostPortSpec(cfg.hostPort) + natsClientPort,
-		cfg.image,
 	}
+	args = appendImagePositional(args, cfg.image)
 	if cfg.jetStream {
 		args = append(args, "-js")
 	}
@@ -291,6 +291,18 @@ func failIfExited(ctx context.Context, rt runtime.ContainerRuntime, name string)
 type containerRunner func(ctx context.Context, binary string, args []string) ([]byte, error)
 
 // execRun is the production containerRunner: it shells the detected runtime CLI.
+// appendImagePositional appends QEMU/docker/podman's end-of-options `--`
+// delimiter followed by the image to a `run` args slice, so a leading-dash
+// image (e.g. supplied via WithImage) is parsed as the IMAGE positional and
+// never as a run flag (Wave-20 SITE-10a ARGSWEEP argv flag-injection; mirrors
+// the emulator EMU2-1 / cuttlefish CF2 / genymotion GENY2 `--`-before-image
+// precedent). Any container command + args are appended by the caller AFTER
+// the image. Pure function so the built args are unit testable without a live
+// runtime.
+func appendImagePositional(args []string, image string) []string {
+	return append(args, "--", image)
+}
+
 func execRun(ctx context.Context, binary string, args []string) ([]byte, error) {
 	return exec.CommandContext(ctx, binary, args...).CombinedOutput()
 }

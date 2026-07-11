@@ -137,8 +137,8 @@ func StartPostgres(ctx context.Context, opts ...Option) (dsn string, stop func()
 		"-e", "POSTGRES_DB=" + postgresDB,
 		// Publish the client port to a host loopback port.
 		"-p", hostPortSpec(cfg.hostPort) + postgresPort,
-		cfg.image,
 	}
+	args = appendImagePositional(args, cfg.image)
 
 	// The one capability pkg/runtime's interface lacks: run a NEW container from
 	// an image with published ports. Done via the detected runtime's CLI,

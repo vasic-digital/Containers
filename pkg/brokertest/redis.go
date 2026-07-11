@@ -120,14 +120,16 @@ func StartRedis(ctx context.Context, opts ...Option) (addr string, stop func(), 
 		"--memory", cfg.memoryLimit,
 		// Publish the client port to a host loopback port.
 		"-p", hostPortSpec(cfg.hostPort) + redisPort,
-		cfg.image,
+	}
+	args = appendImagePositional(args, cfg.image)
+	args = append(args,
 		// Bound Redis's own maxmemory inside the container as a second belt to
 		// the cgroup --memory cap, with an eviction policy so a test that floods
 		// keys degrades gracefully rather than OOM-killing the container.
 		"redis-server",
 		"--maxmemory", "64mb",
 		"--maxmemory-policy", "allkeys-lru",
-	}
+	)
 
 	// The one capability pkg/runtime's interface lacks: run a NEW container from
 	// an image with published ports. Done via the detected runtime's CLI,

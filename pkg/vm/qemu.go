@@ -39,6 +39,17 @@ type osProcessRunner struct{}
 // multi-second VM boot).
 var livenessCheckWindow = 300 * time.Millisecond
 
+// qemuDriveFile builds the `-drive file=<path>,if=virtio` value, escaping any
+// comma in the path as `,,` per QEMU's -drive option grammar (comma is the
+// key=value delimiter, so an unescaped comma in the path would split the option
+// and misparse the drive). QCowPath is a content-addressed cache path, so a
+// comma is not expected in practice — this is defense-in-depth (Wave-20
+// SITE-10b ARGSWEEP) for a path that ever carries one. Pure function, unit
+// testable without a live QEMU.
+func qemuDriveFile(qcowPath string) string {
+	return "file=" + strings.ReplaceAll(qcowPath, ",", ",,") + ",if=virtio"
+}
+
 func (osProcessRunner) StartDetached(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	var stderrBuf bytes.Buffer
@@ -186,7 +197,7 @@ func (v *QEMUVM) Boot(ctx context.Context, config VMConfig) (BootResult, error) 
 		"-smp", "2",
 		"-nographic",
 		"-no-reboot",
-		"-drive", "file=" + config.QCowPath + ",if=virtio",
+		"-drive", qemuDriveFile(config.QCowPath),
 		"-netdev", fmt.Sprintf("user,id=net0,hostfwd=tcp:127.0.0.1:%d-:22", sshPort),
 		"-device", "virtio-net-pci,netdev=net0",
 		"-monitor", fmt.Sprintf("tcp:127.0.0.1:%d,server,nowait", monPort),
