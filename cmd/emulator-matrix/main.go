@@ -205,22 +205,45 @@ func main() {
 	}
 
 	ctx := context.Background()
-	var emu emulator.Emulator
+	// EMU-2: build a per-invocation Emulator FACTORY rather than a single
+	// shared instance. Under Concurrent>1 the matrix runner hands each
+	// concurrent AVD its OWN fresh Emulator, so a per-AVD Teardown always
+	// acts on the container its own Boot created — a single shared
+	// Containerized would let AVD-B's Boot overwrite the shared
+	// containerName before AVD-A's Teardown, force-removing the wrong
+	// container. The factory also isolates gradleModule per invocation
+	// (EMU-3). Serial runs get a fresh instance per AVD too.
+	var newEmu func() emulator.Emulator
 	if resolvedRunner == emulator.RunnerContainerized {
-		c, ferr := emulator.NewContainerized(emulator.ContainerizedConfig{
+		cfg := emulator.ContainerizedConfig{
 			RuntimeBinary: *flagContainerRuntime,
 			Image:         *flagContainerImage,
 			GradleModule:  *flagGradleModule,
-		})
-		if ferr != nil {
+		}
+		// Validate the config ONCE up front (fail-loud) so the factory
+		// below operates on already-validated, constant inputs.
+		if _, ferr := emulator.NewContainerized(cfg); ferr != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: NewContainerized: %v\n", ferr)
 			os.Exit(2)
 		}
-		emu = c
+		newEmu = func() emulator.Emulator {
+			c, ferr := emulator.NewContainerized(cfg)
+			if ferr != nil {
+				// Unreachable: cfg was validated non-empty above and is
+				// constant, so NewContainerized cannot fail here. Fail loud
+				// on any invariant break rather than return a nil Emulator.
+				panic(fmt.Sprintf("emulator-matrix: NewContainerized unexpectedly failed on validated config: %v", ferr))
+			}
+			return c
+		}
 		fmt.Printf("[§6.X] runner=containerized image=%s runtime=%s\n",
 			*flagContainerImage, *flagContainerRuntime)
 	} else {
-		emu = emulator.NewAndroidEmulatorWithModule(*flagSdkRoot, *flagGradleModule)
+		sdkRoot := *flagSdkRoot
+		gradleModule := *flagGradleModule
+		newEmu = func() emulator.Emulator {
+			return emulator.NewAndroidEmulatorWithModule(sdkRoot, gradleModule)
+		}
 		// host-direct is OS-correct on macOS (HVF) and Windows (WHPX) —
 		// there it IS the accelerated, gate-eligible runner, not a
 		// workstation-iteration fallback. It is a workstation-iteration
@@ -234,7 +257,7 @@ func main() {
 			fmt.Println("[§6.X] runner=host-direct (workstation iteration mode; not gate-eligible on this OS — §6.X gate runs require containerized)")
 		}
 	}
-	runner := emulator.NewAndroidMatrixRunner(emu)
+	runner := emulator.NewAndroidMatrixRunnerWithFactory(newEmu)
 	result, err := runner.RunMatrix(ctx, emulator.MatrixConfig{
 		AVDs:              avds,
 		AndroidSdkRoot:    *flagSdkRoot,
