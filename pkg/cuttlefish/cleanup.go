@@ -59,10 +59,26 @@ func (osKiller) Exists(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
 }
 
+// defaultCleanupGracePeriod / defaultCleanupPollInterval are the fixed
+// grace/poll window Cleanup and cleanupWithDeps have always used. They are
+// retained verbatim as the default for those two unparameterised entry
+// points so every existing caller (including every pre-existing test in
+// this package) keeps its EXACT prior behavior. CF-3 (§11.4.124) introduces
+// a NEW, separately-callable, grace-period-parameterised core
+// (cleanupWithDepsGrace / CleanupWithGracePeriod) rather than changing
+// these two signatures, so nothing that already calls cleanupWithDeps(ctx,
+// token, w, k) needs to change.
+const (
+	defaultCleanupGracePeriod  = 5 * time.Second
+	defaultCleanupPollInterval = 250 * time.Millisecond
+)
+
 // Cleanup finds orphan Cuttlefish processes whose comm is in the exact
 // allowlist (crosvm / run_cvd / cvd_internal_start), sends SIGTERM, waits
-// up to 5 seconds for graceful exit, then SIGKILLs stragglers. Returns a
-// CleanupReport.
+// up to defaultCleanupGracePeriod (5s) for graceful exit, then SIGKILLs
+// stragglers. Returns a CleanupReport. Callers that need the grace period
+// to come from configuration (e.g. Cuttlefish.Stop's cfg.StopGracePeriod)
+// use [CleanupWithGracePeriod] instead.
 //
 // On Linux the process list is walked via /proc; on macOS and other POSIX
 // systems it is obtained via `ps -A`. The per-OS dispatch happens inside
@@ -79,8 +95,55 @@ func Cleanup(ctx context.Context, ownerToken string) (CleanupReport, error) {
 	return cleanupWithDeps(ctx, ownerToken, newOSProcWalker(runtime.GOOS), osKiller{})
 }
 
-// cleanupWithDeps is the testable core. Production uses Cleanup; tests
-// inject a synthetic procWalker + killer.
+// CleanupWithGracePeriod is [Cleanup] with a caller-supplied grace period —
+// how long to wait for a graceful SIGTERM exit before escalating to
+// SIGKILL — instead of the fixed defaultCleanupGracePeriod.
+//
+// CF-3 (§11.4.124 investigate-before-remove): Config.StopGracePeriod is
+// documented as "how long Stop waits after stop_cvd before reaping orphan
+// crosvm/run_cvd processes" (types.go), which is exactly this grace/poll
+// window — but nothing threaded the config value into it, so the
+// documented knob controlled nothing. Cuttlefish.Stop calls this function
+// (not the fixed-window Cleanup) with cfg.StopGracePeriod so the knob is
+// genuinely consumed. gracePeriod<=0 falls back to
+// defaultCleanupGracePeriod (never a zero/instant deadline, which would
+// skip the SIGTERM grace window entirely).
+func CleanupWithGracePeriod(ctx context.Context, ownerToken string, gracePeriod time.Duration) (CleanupReport, error) {
+	if gracePeriod <= 0 {
+		gracePeriod = defaultCleanupGracePeriod
+	}
+	return cleanupWithDepsGrace(ctx, ownerToken, newOSProcWalker(runtime.GOOS), osKiller{},
+		gracePeriod, cleanupPollIntervalFor(gracePeriod))
+}
+
+// cleanupPollIntervalFor derives a poll interval proportional to gracePeriod
+// (capped at defaultCleanupPollInterval, floored at 1ms) so a SHORT
+// configured grace period does not force at least one full 250ms wait
+// regardless of its value — the short-vs-long-grace-period distinction
+// must be OBSERVABLE, not swamped by a fixed poll tick.
+func cleanupPollIntervalFor(gracePeriod time.Duration) time.Duration {
+	iv := gracePeriod / 20
+	if iv > defaultCleanupPollInterval {
+		iv = defaultCleanupPollInterval
+	}
+	if iv < time.Millisecond {
+		iv = time.Millisecond
+	}
+	return iv
+}
+
+// cleanupWithDeps is the testable core with the historical FIXED grace/poll
+// window. Production uses Cleanup; tests inject a synthetic procWalker +
+// killer. Kept as a thin wrapper over cleanupWithDepsGrace so every
+// existing call site (this package's cleanup_test.go / stress_test.go /
+// chaos_test.go) is untouched.
+func cleanupWithDeps(ctx context.Context, ownerToken string, w procWalker, k killer) (CleanupReport, error) {
+	return cleanupWithDepsGrace(ctx, ownerToken, w, k, defaultCleanupGracePeriod, defaultCleanupPollInterval)
+}
+
+// cleanupWithDepsGrace is the grace-period-parameterised core CF-3 adds.
+// gracePeriod bounds the SIGTERM→SIGKILL escalation wait; pollInterval is
+// how often liveness is re-checked within that window.
 //
 // §11.4.174 ownership scoping: the exact comm allowlist (crosvm / run_cvd /
 // cvd_internal_start) is ONLY a process-CLASS pre-filter; the LOAD-BEARING
@@ -92,7 +155,7 @@ func Cleanup(ctx context.Context, ownerToken string) (CleanupReport, error) {
 // side ownership token exists for its container-namespaced cvd), so this
 // refuse-guard guarantees Stop performs NO host-wide reap; `rm -f <container>`
 // is the authoritative teardown.
-func cleanupWithDeps(ctx context.Context, ownerToken string, w procWalker, k killer) (CleanupReport, error) {
+func cleanupWithDepsGrace(ctx context.Context, ownerToken string, w procWalker, k killer, gracePeriod, pollInterval time.Duration) (CleanupReport, error) {
 	var report CleanupReport
 	if ownerToken == "" {
 		return report, nil
@@ -125,14 +188,14 @@ func cleanupWithDeps(ctx context.Context, ownerToken string, w procWalker, k kil
 	for _, pid := range report.Found {
 		_ = k.Signal(pid, syscall.SIGTERM)
 	}
-	// Wait up to 5 seconds, polling every 250ms.
-	deadline := time.Now().Add(5 * time.Second)
+	// Wait up to gracePeriod, polling every pollInterval.
+	deadline := time.Now().Add(gracePeriod)
 	var stragglers []int
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
 			return report, ctx.Err()
-		case <-time.After(250 * time.Millisecond):
+		case <-time.After(pollInterval):
 		}
 		stragglers = stragglers[:0]
 		for _, pid := range report.Found {

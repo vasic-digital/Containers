@@ -191,7 +191,10 @@ type Config struct {
 
 	// StopGracePeriod is how long Stop waits after `stop_cvd` before
 	// reaping orphan crosvm/run_cvd processes. Zero defaults to
-	// defaultStopGracePeriod.
+	// defaultStopGracePeriod. CF-3: threaded into
+	// CleanupWithGracePeriod's SIGTERM-to-SIGKILL escalation window (see
+	// Cuttlefish.Stop) — this field genuinely controls that wait, it is
+	// not read-only-for-defaulting.
 	StopGracePeriod time.Duration
 }
 

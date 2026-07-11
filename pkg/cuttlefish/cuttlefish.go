@@ -99,13 +99,21 @@ func (c *Cuttlefish) Launch(ctx context.Context) (LaunchResult, error) {
 	startedAt := time.Now()
 	present, missing := FilterPresentDevices(c.cfg.Devices)
 	name := containerNameFor(c.cfg.InstanceName)
-	c.containerName = name
 
 	args := buildContainerRunArgs(name, c.cfg.Image, present, c.cfg.Groups,
 		c.cfg.Privileged, c.cfg.NetworkHost)
 
 	out, err := c.executor.Execute(ctx, c.cfg.RuntimeBinary, args...)
 	if err != nil {
+		// CF-2 (§11.4.174 ownership hazard): do NOT commit c.containerName
+		// on a failed run — no container was created. `name` is still
+		// returned in LaunchResult.ContainerName as the diagnostic name
+		// (unchanged public contract), but c.ContainerName() MUST report
+		// empty so a caller's natural `res, _ := c.Launch(ctx); defer
+		// c.Stop(ctx)` does not issue `<runtime> rm -f <name>` against a
+		// nonexistent container — or, since containerNameFor is a pure
+		// function of InstanceName, against a DIFFERENT concurrent
+		// instance's real container.
 		wrapped := fmt.Errorf("%s run: %w (output: %s)", c.cfg.RuntimeBinary, err, string(out))
 		return LaunchResult{
 			ContainerName:  name,
@@ -117,6 +125,7 @@ func (c *Cuttlefish) Launch(ctx context.Context) (LaunchResult, error) {
 			Error:          wrapped,
 		}, wrapped
 	}
+	c.containerName = name
 	return LaunchResult{
 		ContainerName:  name,
 		Target:         c.cfg.Target,
@@ -149,17 +158,50 @@ func (c *Cuttlefish) Status(ctx context.Context) (StatusResult, error) {
 // timeout elapses. Returns the elapsed duration. A non-nil error means the
 // device was NOT observed online within the budget — this function does
 // NOT report "probably ready" (composes §11.4.6 no-guessing).
+//
+// CF-1 (GENY-1 class, §11.4.108): every Status call is bound to a deadline
+// derived from `timeout`, NOT the raw caller ctx. Without this, a caller
+// passing context.Background() plus a wedged `adb devices` (stalled vsock
+// transport / crashed crosvm / hung adb-server) hangs WaitForReady FOREVER:
+// the underlying exec.CommandContext(ctx, ...) in Status->Execute never
+// gets cancelled because the raw ctx never fires, so the `timeout` argument
+// is silently not honored. Deriving cctx here (mirroring
+// genymotion.Tool.StartAndWait's GENY-1 fix) guarantees the deadline
+// cancels every in-flight Status exec even when the caller's ctx never
+// would.
+//
+// The poll select deliberately distinguishes CALLER cancellation from our
+// OWN internal deadline elapsing: cctx.Done() fires for either reason (it
+// is derived from ctx via context.WithDeadline, so it also fires the
+// instant the caller's own ctx is cancelled/expires — context.WithDeadline
+// takes the EARLIER of the two deadlines). When it fires we check ctx.Err()
+// directly — if the CALLER's ctx is what expired, we return that error
+// promptly (unchanged contract: an operator-cancelled wait fails fast with
+// the caller's own error, exercised by the WaitForReadyContextCancelled
+// chaos case). If ctx is still alive (context.Background() or any ctx
+// without its own earlier deadline never returns a non-nil Err()), only
+// OUR internal `timeout` budget elapsed — we fall through instead of
+// returning early, so the `for` loop condition below becomes false and the
+// existing friendly, named-serial "timed out" error is returned, exactly
+// as before this fix (exercised by the ProcessDeathDuringReadinessWait
+// chaos case, which asserts on that exact message).
 func (c *Cuttlefish) WaitForReady(ctx context.Context, timeout time.Duration) (time.Duration, error) {
 	startedAt := time.Now()
 	deadline := startedAt.Add(timeout)
+	cctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	for time.Now().Before(deadline) {
-		st, err := c.Status(ctx)
+		st, err := c.Status(cctx)
 		if err == nil && st.Ready {
 			return time.Since(startedAt), nil
 		}
 		select {
-		case <-ctx.Done():
-			return time.Since(startedAt), ctx.Err()
+		case <-cctx.Done():
+			if ctx.Err() != nil {
+				return time.Since(startedAt), ctx.Err()
+			}
+			// Our own internal deadline elapsed, not the caller's ctx —
+			// fall through; the loop condition below is now false.
 		case <-time.After(2 * time.Second):
 		}
 	}
@@ -206,7 +248,17 @@ func (c *Cuttlefish) Stop(ctx context.Context) error {
 	// instance's cvd — the exact §11.4.174 violation. We therefore hand the
 	// reaper an EMPTY ownership token, which makes it REFUSE (safe no-op); `rm
 	// -f` above is the sole teardown.
-	_, _ = Cleanup(ctx, "")
+	//
+	// CF-3 (§11.4.124): call CleanupWithGracePeriod (not the fixed-window
+	// Cleanup) so cfg.StopGracePeriod is genuinely threaded into the
+	// mechanism its own doc comment describes ("how long Stop waits after
+	// stop_cvd before reaping orphan crosvm/run_cvd processes"). The empty
+	// ownerToken still makes this an immediate no-op today (the §11.4.174
+	// safety property above is unchanged) — but the configured grace period
+	// is no longer a dead field: it is the value this call would honor the
+	// moment a host-visible ownership token is ever plumbed in, and it is
+	// directly exercised by cleanupWithDepsGrace's own unit coverage.
+	_, _ = CleanupWithGracePeriod(ctx, "", c.cfg.StopGracePeriod)
 
 	c.containerName = ""
 
