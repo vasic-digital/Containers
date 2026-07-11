@@ -32,6 +32,22 @@ import (
 // no-op, no "pretend to work" — every error path is wrapped with the
 // site name + the underlying cause so failures are diagnosable.
 
+// shellQuote wraps s in single quotes so the guest login shell — which is what
+// executes the string handed to crypto/ssh session.Run/Start — treats every byte
+// of s literally (VM3-7). Without it, a guest path carrying a shell metacharacter
+// (`;`, `$(...)`, backtick, `|`, `&`, whitespace, newline) breaks out of the
+// `scp -t <dir>` / `scp -f <path>` command string and runs attacker-chosen
+// commands on the guest — a real command-injection gap even though the blast
+// radius is the local QEMU guest the matrix runner owns. Single-quoting is the
+// canonical POSIX-shell neutralisation: inside single quotes every character is
+// literal except `'` itself, which is emitted as the standard `'\”` splice
+// (close-quote, backslash-escaped-quote, reopen-quote). The `--` the call sites
+// prepend additionally stops scp's OWN getopt from parsing a leading-'-' path as
+// an option once the shell has stripped the quotes.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // maxSCPDownloadSize is a sanity ceiling on the size field the SCP sink
 // protocol header declares (VM2-5). It is intentionally generous — real
 // captured-evidence artifacts (screenshots, logs) are tiny — this exists
@@ -167,7 +183,7 @@ func (r *realSSHClient) Upload(ctx context.Context, hostPath, vmPath string) err
 	targetDir := filepath.Dir(vmPath)
 	targetName := filepath.Base(vmPath)
 	runErr := make(chan error, 1)
-	go func() { runErr <- session.Run("scp -t " + targetDir) }()
+	go func() { runErr <- session.Run("scp -t -- " + shellQuote(targetDir)) }()
 	if _, err := fmt.Fprintf(stdin, "C%#o %d %s\n", info.Mode().Perm(), info.Size(), targetName); err != nil {
 		return fmt.Errorf("realSSHClient.Upload: write header: %w", err)
 	}
@@ -253,7 +269,7 @@ func (r *realSSHClient) Download(ctx context.Context, vmPath, hostPath string) e
 	if err != nil {
 		return fmt.Errorf("realSSHClient.Download: stdout pipe: %w", err)
 	}
-	if err := session.Start("scp -f " + vmPath); err != nil {
+	if err := session.Start("scp -f -- " + shellQuote(vmPath)); err != nil {
 		return fmt.Errorf("realSSHClient.Download: scp -f %s: %w", vmPath, err)
 	}
 	if _, err := fmt.Fprint(stdin, "\x00"); err != nil {

@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -342,6 +343,20 @@ func (o *osExecTartRunner) Run(ctx context.Context, vmName string, opts RunOptio
 }
 
 func (o *osExecTartRunner) SSHExec(ctx context.Context, vmName, user, pass, command string, timeout time.Duration) (stdout, stderr string, exitCode int, err error) {
+	// VM3-9 (SECURITY argv flag-injection): the ssh destination positional is
+	// "<user>@<ip>"; a user beginning with '-' (e.g. "-oProxyCommand=<cmd>")
+	// makes the whole destination begin with '-', which ssh's getopt parses as
+	// an OPTION rather than a host → ProxyCommand arbitrary command execution on
+	// the Tart HOST. ssh has no reliable "--" host terminator for the
+	// destination, so refuse a leading-dash user BEFORE any spawn (mirrors
+	// pkg/remote sshDestination + pkg/vm/ios checkSimctlArgs). A legitimate
+	// macOS VM user (the Tart default "admin") never begins with '-'; an empty
+	// user yields "@<ip>", which begins with '@' and is inert to getopt.
+	if strings.HasPrefix(user, "-") {
+		return "", "", -1, fmt.Errorf(
+			"macos: SSH user %q begins with '-' (would be parsed as an ssh "+
+				"option — argument injection); refusing", user)
+	}
 	// Tart provides `tart ip <vm>` to get the guest's IP; we then
 	// use standard ssh. This is the minimal production implementation.
 	// A full implementation would use golang.org/x/crypto/ssh for
