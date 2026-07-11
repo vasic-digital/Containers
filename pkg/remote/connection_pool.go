@@ -252,6 +252,21 @@ func (p *ConnectionPool) masterArgs(
 		"-p", strconv.Itoa(host.SSHPort()),
 	}
 
+	// REMOTE-HIGH-3: without -o ControlPersist=<seconds>, the -fNM -N
+	// master started here persists until an explicit `-O exit` — it never
+	// self-expires, contradicting Gotcha #1 ("the socket can outlive the
+	// last Release() by ControlPersist"). Combined with any ref-count
+	// leak (e.g. REMOTE-HIGH-2), that produces permanent orphan ssh
+	// processes (§11.4.14 no-leak). Only impose the flag when
+	// ControlPersist is positive, mirroring the ConnectTimeout==0 "no
+	// artificial deadline" guard idiom used in Acquire.
+	if p.opts.ControlPersist > 0 {
+		args = append(args, "-o", fmt.Sprintf(
+			"ControlPersist=%d",
+			int(p.opts.ControlPersist.Seconds()),
+		))
+	}
+
 	if host.KeyPath != "" {
 		args = append(args, "-i", host.KeyPath)
 	}

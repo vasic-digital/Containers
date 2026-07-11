@@ -116,8 +116,26 @@ func (e *SSHExecutor) ExecuteStream(
 	host RemoteHost,
 	command string,
 ) (io.ReadCloser, error) {
+	// REMOTE-MED-1: unlike Execute, ExecuteStream returns BEFORE the
+	// remote command finishes — the caller drains/closes the returned
+	// reader asynchronously. A CommandTimeout-derived context therefore
+	// cannot be released via `defer cancel()` in THIS function: that
+	// would cancel (and kill the just-started ssh process) the instant
+	// ExecuteStream returns, before the caller ever reads a byte.
+	// Ownership of cancel instead passes to the streamReader (success
+	// path) or is invoked directly on every early-error return below, so
+	// a caller supplying context.Background() (no deadline of its own)
+	// still gets a bounded call instead of an unbounded one.
+	var cancel context.CancelFunc
+	if e.opts.CommandTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, e.opts.CommandTimeout)
+	}
+
 	args, err := e.sshArgs(ctx, host)
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		return nil, err
 	}
 	// sshArgs may have acquired a pooled ControlMaster ref (refs++). On the
@@ -127,6 +145,9 @@ func (e *SSHExecutor) ExecuteStream(
 	releaseOnErr := func() {
 		if e.pool != nil {
 			e.pool.Release(host)
+		}
+		if cancel != nil {
+			cancel()
 		}
 	}
 	args = append(args, command)
@@ -154,6 +175,7 @@ func (e *SSHExecutor) ExecuteStream(
 		reader: stdout,
 		pool:   e.pool,
 		host:   host,
+		cancel: cancel,
 	}, nil
 }
 
@@ -163,6 +185,18 @@ func (e *SSHExecutor) CopyFile(
 	host RemoteHost,
 	localPath, remotePath string,
 ) error {
+	// REMOTE-MED-1: CopyFile is synchronous (blocks until cmd.Run()
+	// returns), so — unlike ExecuteStream — a defer here is safe: it
+	// fires only once the scp transfer has actually finished. Without
+	// this guard a caller passing context.Background() (no deadline of
+	// its own) got an unbounded scp call; a stalled/wedged remote scp
+	// endpoint would hang this call forever.
+	if e.opts.CommandTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, e.opts.CommandTimeout)
+		defer cancel()
+	}
+
 	args := e.scpArgs(host)
 	args = append(args,
 		localPath,
@@ -222,6 +256,17 @@ func (e *SSHExecutor) CopyDir(
 	host RemoteHost,
 	localDir, remoteDir string,
 ) error {
+	// REMOTE-MED-1: CopyDir is synchronous (blocks until cmd.Run()
+	// returns, and the basename-mismatch branch's own pre-clean also
+	// blocks before that), so a defer here is safe — see CopyFile's
+	// comment for the ExecuteStream contrast. Without this guard a
+	// caller passing context.Background() got an unbounded scp call.
+	if e.opts.CommandTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, e.opts.CommandTimeout)
+		defer cancel()
+	}
+
 	localBase := filepath.Base(localDir)
 	remoteBase := filepath.Base(remoteDir)
 	remoteParent := filepath.Dir(remoteDir)
@@ -248,18 +293,20 @@ func (e *SSHExecutor) CopyDir(
 		// to the destination. This path is race-prone if a sibling
 		// CopyFile is concurrently writing into the same parent, but
 		// it's also rarely exercised in practice.
+		// REMOTE-HIGH-2: route the pre-clean through e.Execute rather than
+		// a raw e.sshArgs(...) + exec.CommandContext(...) call. sshArgs
+		// internally does e.pool.Acquire (refs++) when ControlMasterEnabled,
+		// and Execute's own `defer e.pool.Release(host)` releases that ref
+		// on every return path. The previous direct call here acquired a
+		// pooled ControlMaster ref but never released it — leaking one ref
+		// per CopyDir(basename-mismatch) invocation, pinning the socket
+		// past its ControlPersist window (§11.4.14 no-leak).
 		cleanCmd := fmt.Sprintf("rm -rf -- %s", shellEscape(remoteDir))
-		if sshArgsList, sshErr := e.sshArgs(ctx, host); sshErr == nil {
-			cleanArgs := append(sshArgsList, cleanCmd)
-			cleanCmdRun := exec.CommandContext(ctx, "ssh", cleanArgs...)
-			var cleanStderr bytes.Buffer
-			cleanCmdRun.Stderr = &cleanStderr
-			if err := cleanCmdRun.Run(); err != nil {
-				e.logger.Debug(
-					"pre-scp rm on %s (ignored): %s -> %s: %v (stderr: %s)",
-					host.Name, localDir, remoteDir, err, cleanStderr.String(),
-				)
-			}
+		if _, err := e.Execute(ctx, host, cleanCmd); err != nil {
+			e.logger.Debug(
+				"pre-scp rm on %s (ignored): %s -> %s: %v",
+				host.Name, localDir, remoteDir, err,
+			)
 		}
 		args = append(args,
 			localDir,
@@ -449,6 +496,10 @@ type streamReader struct {
 	reader io.ReadCloser
 	pool   *ConnectionPool
 	host   RemoteHost
+	// cancel releases the CommandTimeout-derived context ExecuteStream
+	// created (REMOTE-MED-1), if any. Nil when CommandTimeout is
+	// disabled (0) — Close tolerates that.
+	cancel context.CancelFunc
 
 	// closeOnce makes Close idempotent: the pooled ControlMaster ref must be
 	// Released EXACTLY once per stream and cmd.Wait() called at most once, even
@@ -470,6 +521,9 @@ func (r *streamReader) Close() error {
 		r.closeErr = r.cmd.Wait()
 		if r.pool != nil {
 			r.pool.Release(r.host)
+		}
+		if r.cancel != nil {
+			r.cancel()
 		}
 	})
 	return r.closeErr

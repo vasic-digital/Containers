@@ -154,6 +154,27 @@ func (e *SSHExecutor) NeedsBootstrap(
 	return !e.IsReachable(checkCtx, host)
 }
 
+// sshDialFallbackTimeout bounds the post-connect SSH handshake when
+// BOTH ctx carries no deadline of its own AND config.Timeout is zero.
+// Chosen to comfortably exceed a healthy handshake's real turnaround
+// while still failing fast against a genuinely wedged peer.
+const sshDialFallbackTimeout = 30 * time.Second
+
+// sshDialDeadline derives an absolute deadline for the post-connect SSH
+// handshake performed by ssh.NewClientConn: ctx's own deadline when it
+// carries one, else now+configTimeout (the same budget already given to
+// the TCP connect phase), else now+sshDialFallbackTimeout when
+// configTimeout is itself zero.
+func sshDialDeadline(ctx context.Context, configTimeout time.Duration) time.Time {
+	if dl, ok := ctx.Deadline(); ok {
+		return dl
+	}
+	if configTimeout > 0 {
+		return time.Now().Add(configTimeout)
+	}
+	return time.Now().Add(sshDialFallbackTimeout)
+}
+
 // sshDial connects to an SSH server, respecting context cancellation.
 func sshDial(
 	ctx context.Context,
@@ -166,9 +187,31 @@ func sshDial(
 		return nil, err
 	}
 
+	// REMOTE-HIGH-1: DialContext bounds ONLY the TCP connect. The
+	// following ssh.NewClientConn call runs the full SSH transport
+	// handshake + userauth exchange and consults NEITHER ctx NOR
+	// config.Timeout (config.Timeout is honored only by the ssh.Dial
+	// convenience wrapper, never by raw NewClientConn) — a peer that
+	// accepts the TCP connection but stalls before speaking the SSH
+	// identification banner/kex would hang this call FOREVER regardless
+	// of ctx cancellation. Bound the handshake with an explicit conn
+	// deadline (mirrors the QMP conn deadline fix in pkg/vm/clients.go,
+	// qmpDeadline), then clear it once the handshake completes so the
+	// resulting *ssh.Client's later session traffic (e.g.
+	// BootstrapKeyAuth's session.CombinedOutput) is not silently
+	// deadline-capped by a stale, already-elapsed value.
+	if err := conn.SetDeadline(sshDialDeadline(ctx, config.Timeout)); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
 	c, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
 	if err != nil {
 		conn.Close()
+		return nil, err
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = c.Close()
 		return nil, err
 	}
 	return ssh.NewClient(c, chans, reqs), nil
