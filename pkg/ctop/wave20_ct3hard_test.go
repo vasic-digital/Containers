@@ -90,7 +90,12 @@ func TestWave20_CT3_9_BuildRemoteStatsCommand_AllowsSafeID(t *testing.T) {
 		t.Run(id, func(t *testing.T) {
 			cmd, err := buildRemoteStatsCommand("podman", id)
 			require.NoError(t, err, "CT3-9: a safe container id must not be refused")
-			assert.Equal(t, "podman stats --no-stream --format json "+id, cmd)
+			// §11.4.120 reconcile: Wave-20 CT3-ARGSWEEP now shell-quotes the
+			// runtime token (rt = host.Runtime, unvalidated env config), so the
+			// remote command is `'podman' stats ...` (the remote login shell
+			// strips the single quotes → resolves to podman identically). The
+			// CT3-9 safe-id assertion is otherwise unchanged.
+			assert.Equal(t, "'podman' stats --no-stream --format json "+id, cmd)
 			// Sanity: the safe id itself must never contain a shell
 			// metacharacter, proving the charset genuinely constrains it.
 			for _, ch := range []string{";", "&", "|", "`", "$", "(", ")", " ", "\n"} {

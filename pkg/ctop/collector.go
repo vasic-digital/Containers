@@ -233,7 +233,7 @@ func (c *Collector) collectFromHost(ctx context.Context, host remote.RemoteHost)
 		rt = "podman"
 	}
 
-	cmd := fmt.Sprintf("%s ps -a --format json", rt)
+	cmd := buildRemoteListCommand(rt)
 	result, err := c.sshExecutor.Execute(ctx, host, cmd)
 	if err != nil {
 		cmd = "docker ps -a --format json"
@@ -304,6 +304,29 @@ func (c *Collector) getContainerStats(ctx context.Context, rt, id string) (*Cont
 // rather than interpolated into a remote-shell command string (CT3-9).
 var containerIDSafePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
+// shellQuote wraps s in single quotes so the REMOTE login shell (which
+// sshExecutor.Execute hands the command string to, unlike the argv-based LOCAL
+// path that passes rt as a discrete exec.CommandContext argv[0]) treats every
+// byte of s literally. rt = host.Runtime is an unvalidated
+// CONTAINERS_REMOTE_HOST_N_RUNTIME env-config value; a value like
+// "docker;evilcmd" would inject a second remote command (CT3-ARGSWEEP,
+// §11.4.108). Single-quoting is the canonical POSIX neutralisation ('\” splice
+// for an embedded quote); it is functionally non-breaking because the remote
+// shell strips the quotes, so 'docker'/'podman' resolve identically.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// buildRemoteListCommand builds the `<runtime> ps -a --format json` command
+// handed to sshExecutor.Execute (remote shell, NO argv escaping). rt is
+// unvalidated host-config and MUST be shell quoted — leaving it raw was the
+// CT3-ARGSWEEP §11.4.108 injection sibling of buildRemoteStatsCommand's
+// (already-validated) id. Pure function so the built string is unit testable
+// without a live executor (§11.4.115).
+func buildRemoteListCommand(rt string) string {
+	return fmt.Sprintf("%s ps -a --format json", shellQuote(rt))
+}
+
 // buildRemoteStatsCommand builds the `<runtime> stats --no-stream --format
 // json <id>` command line later handed to sshExecutor.Execute, which runs it
 // through the remote user's shell with NO argv-style escaping (CT3-9). The
@@ -312,12 +335,14 @@ var containerIDSafePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 // container-ID charset before interpolation; an id outside that charset is
 // refused rather than silently escaped, since a rejected stats call is
 // vastly preferable to a shell-injection-shaped string ever reaching a
-// remote shell.
+// remote shell. rt (host.Runtime, unvalidated env config) is shell quoted for
+// the same reason (CT3-ARGSWEEP, §11.4.108) — the CT3-9 fix validated the id
+// but left rt raw.
 func buildRemoteStatsCommand(rt, id string) (string, error) {
 	if !containerIDSafePattern.MatchString(id) {
 		return "", fmt.Errorf("refusing to build remote stats command: unsafe container id %q", id)
 	}
-	return fmt.Sprintf("%s stats --no-stream --format json %s", rt, id), nil
+	return fmt.Sprintf("%s stats --no-stream --format json %s", shellQuote(rt), id), nil
 }
 
 func shortenID(id string) string {
