@@ -2,12 +2,14 @@ package distribution
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
 	"digital.vasic.containers/pkg/remote"
+	"digital.vasic.containers/pkg/runtime"
 	"digital.vasic.containers/pkg/scheduler"
 )
 
@@ -82,7 +84,28 @@ func (d *DefaultDistributor) Distribute(
 
 	// Phase 2-7: Deploy each container.
 	containers := make([]DistributedContainer, 0, len(plan.Decisions))
+	var ctxErr error
 	for _, decision := range plan.Decisions {
+		// CT-HARDEN-DIST-HARD DIST-4: honour context cancellation. The deploy
+		// loop previously never checked ctx.Err(), so a cancelled/expired
+		// context still issued every remote rm/run and every local Start. Once
+		// ctx is cancelled, mark this and every remaining decision failed (no
+		// command is issued to any host) and return the partial summary with the
+		// ctx error; containers deployed BEFORE cancellation stay tracked in
+		// d.containers so Undistribute() can still tear them down.
+		if err := ctx.Err(); err != nil {
+			ctxErr = err
+			failed := DistributedContainer{
+				Requirement: decision.Requirement,
+				HostName:    decision.HostName,
+				State:       StateFailed,
+				Error:       err.Error(),
+				TunnelPorts: make(map[string]string),
+			}
+			summary.FailedContainers++
+			containers = append(containers, failed)
+			continue
+		}
 		dc := DistributedContainer{
 			Requirement: decision.Requirement,
 			HostName:    decision.HostName,
@@ -130,9 +153,19 @@ func (d *DefaultDistributor) Distribute(
 	// summary's State (CT-HARDEN-DIST-2, escaped-alias half).
 	summary.Containers = append([]DistributedContainer(nil), containers...)
 
+	// Publish the new placement and capture the PRIOR one so a container that
+	// relocated (or was dropped) can be torn down on its OLD host. deployRemote
+	// only rm-f's the NEW host, so without this a re-Distribute/Rebalance moving
+	// `foo` from host A to host B leaks `foo` still running on A (CT-HARDEN-DIST-
+	// HARD DIST-2, a §11.4.69 sink-side leak). `prev` no longer aliases
+	// d.containers after this critical section, so reading it lock-free below is
+	// race-safe (in-package readers copy under the lock).
 	d.mu.Lock()
+	prev := d.containers
 	d.containers = containers
 	d.mu.Unlock()
+
+	d.reconcileRelocations(ctx, prev, containers)
 
 	d.opts.Logger.Info(
 		"distribution complete: %d local, %d remote, %d failed "+
@@ -141,27 +174,51 @@ func (d *DefaultDistributor) Distribute(
 		summary.FailedContainers, summary.Duration,
 	)
 
-	return summary, nil
+	return summary, ctxErr
 }
 
 // Undistribute stops all distributed containers.
 func (d *DefaultDistributor) Undistribute(
 	ctx context.Context,
 ) error {
-	// Mark the detached containers Stopped while STILL holding the lock:
-	// mutating them after Unlock raced with any in-package reader (e.g.
-	// HealthCheckAll) that had captured the same live backing array via
+	// Snapshot the tracked containers (a COPY, so the pre-stop State survives for
+	// the teardown predicate below) and mark the live array Stopped while STILL
+	// holding the lock: mutating after Unlock raced with any in-package reader
+	// (e.g. HealthCheckAll) that had captured the same live backing array via
 	// d.containers (CT-HARDEN-DIST-2). The escaped-summary alias is handled
-	// separately by the copy-on-publish in Distribute(), so a returned
-	// summary never shares this backing array. Same intent, in-package race
-	// closed.
+	// separately by the copy-on-publish in Distribute(), so a returned summary
+	// never shares this backing array. d.containers is niled under the lock, so
+	// the snapshot is exclusively ours once unlocked.
 	d.mu.Lock()
-	containers := d.containers
-	for i := range containers {
-		containers[i].State = StateStopped
+	snapshot := make([]DistributedContainer, len(d.containers))
+	copy(snapshot, d.containers)
+	for i := range d.containers {
+		d.containers[i].State = StateStopped
 	}
 	d.containers = nil
 	d.mu.Unlock()
+
+	// CT-HARDEN-DIST-HARD DIST-1: actually tear the containers DOWN on their
+	// hosts before dropping tracking. The prior code only flipped State to
+	// Stopped in memory while every container kept RUNNING on its host — a
+	// §11.4.69 sink-side bluff (State reports stopped, the host still runs it).
+	// Only containers that reached StateRunning have a live deployment to remove;
+	// failed/scheduled ones were never created. Per-container teardown errors are
+	// aggregated (returned) but never abort the sweep — CloseAll/UnmountAll below
+	// still run, and a double-Undistribute is safe (empty snapshot ⇒ no-op).
+	var teardownErrs []error
+	for _, dc := range snapshot {
+		if dc.State != StateRunning {
+			continue
+		}
+		if err := d.teardownContainer(ctx, dc); err != nil {
+			teardownErrs = append(teardownErrs, err)
+			d.opts.Logger.Error(
+				"undistribute: teardown %s on %s failed: %v",
+				dc.Requirement.Name, dc.HostName, err,
+			)
+		}
+	}
 
 	// Close tunnels.
 	if d.opts.TunnelManager != nil {
@@ -174,9 +231,9 @@ func (d *DefaultDistributor) Undistribute(
 	}
 
 	d.opts.Logger.Info("undistributed %d containers",
-		len(containers),
+		len(snapshot),
 	)
-	return nil
+	return errors.Join(teardownErrs...)
 }
 
 // Status returns all distributed containers.
@@ -308,16 +365,135 @@ func (d *DefaultDistributor) deployContainer(
 func (d *DefaultDistributor) deployLocal(
 	ctx context.Context, dc *DistributedContainer,
 ) error {
+	// CT-HARDEN-DIST-HARD DIST-3: a nil LocalRuntime is a MISCONFIGURATION, not a
+	// silent success. The prior `return nil` let the caller mark the container
+	// StateRunning + LocalContainers++ though nothing was deployed — a §11.4.69
+	// sink-side bluff, and asymmetric with deployRemote (which errors "no remote
+	// executor configured"). Restore symmetry: fail honestly.
 	if d.opts.LocalRuntime == nil {
-		return nil
+		return fmt.Errorf("no local runtime configured")
 	}
 
 	d.opts.Logger.Info("deploying %s locally",
 		dc.Requirement.Name,
 	)
+	// The ContainerRuntime.Start contract takes a container ID/NAME (its doc
+	// comment: "identified by its ID or name") — never an image. The prior code
+	// passed dc.Requirement.Image, a wrong-arg contract violation; pass the
+	// requirement Name (the container's identity, consistent with the remote
+	// --name/rm path and teardownContainer). KNOWN LIMITATION (§11.4.6, out of
+	// scope for this pkg/distribution-only batch): ContainerRuntime exposes NO
+	// create/run-from-image step, so local Start succeeds only for a pre-existing
+	// container — fully closing the local create-from-image gap needs a
+	// runtime-interface change in another package, which this batch must not
+	// make.
 	return d.opts.LocalRuntime.Start(
-		ctx, dc.Requirement.Image,
+		ctx, dc.Requirement.Name,
 	)
+}
+
+// normHost normalises a placement host name so the empty string and the
+// sentinel "local" compare equal — both denote the local host (mirrors
+// scheduler.PlacementDecision.IsLocal).
+func normHost(h string) string {
+	if h == "" {
+		return "local"
+	}
+	return h
+}
+
+// teardownContainer issues a best-effort stop+remove of a single tracked
+// container on the host where it was placed. Remote: `rt rm -f <name>` via the
+// Executor (mirrors deployRemote's pre-deploy rm — force-remove stops then
+// deletes, and `|| true` keeps it idempotent for an already-absent container).
+// Local: LocalRuntime.Stop then a force Remove. Used by both Undistribute()
+// (DIST-1) and reconcileRelocations() (DIST-2).
+//
+// HONEST BOUNDARY (§11.4.107): a unit test with no live runtime can only assert
+// the teardown COMMAND is ISSUED to the seam (Executor / LocalRuntime); it
+// cannot confirm a real container actually died.
+func (d *DefaultDistributor) teardownContainer(
+	ctx context.Context, dc DistributedContainer,
+) error {
+	name := dc.Requirement.Name
+	if normHost(dc.HostName) == "local" {
+		if d.opts.LocalRuntime == nil {
+			return nil
+		}
+		var errs []error
+		if err := d.opts.LocalRuntime.Stop(ctx, name); err != nil {
+			errs = append(errs, fmt.Errorf("stop %s: %w", name, err))
+		}
+		if err := d.opts.LocalRuntime.Remove(
+			ctx, name, runtime.WithForceRemove(true),
+		); err != nil {
+			errs = append(errs, fmt.Errorf("remove %s: %w", name, err))
+		}
+		return errors.Join(errs...)
+	}
+
+	if d.opts.Executor == nil {
+		return fmt.Errorf(
+			"teardown %s on %s: no remote executor configured",
+			name, dc.HostName,
+		)
+	}
+	// Mirror deployRemote's nil-HostManager guard (GetHost on a nil interface
+	// panics — CT-HARDEN-DIST-1).
+	if d.opts.HostManager == nil {
+		return fmt.Errorf(
+			"teardown %s on %s: no host manager configured",
+			name, dc.HostName,
+		)
+	}
+	host, err := d.opts.HostManager.GetHost(dc.HostName)
+	if err != nil || host == nil {
+		return fmt.Errorf("teardown %s: host %s not found", name, dc.HostName)
+	}
+	rt := host.Runtime
+	if rt == "" {
+		rt = "docker"
+	}
+	removeCmd := buildRemoteRemoveCommand(rt, name)
+	if _, err := d.opts.Executor.Execute(ctx, *host, removeCmd); err != nil {
+		return fmt.Errorf("teardown %s on %s: %w", name, dc.HostName, err)
+	}
+	return nil
+}
+
+// reconcileRelocations tears down containers stranded on their OLD host after a
+// re-Distribute/Rebalance moved or dropped them. deployRemote only rm-f's the
+// NEW host, so without this a container relocating from host A to host B keeps
+// running on A (CT-HARDEN-DIST-HARD DIST-2, a §11.4.69 sink-side leak). Only
+// previously-RUNNING placements are torn down (failed/scheduled ones were never
+// created); a name kept on the SAME host is left alone because deployRemote
+// already rm-f'd it in place. Best-effort — per-container errors are logged,
+// never abort the batch.
+func (d *DefaultDistributor) reconcileRelocations(
+	ctx context.Context, prev, current []DistributedContainer,
+) {
+	if len(prev) == 0 {
+		return
+	}
+	newHost := make(map[string]string, len(current))
+	for _, dc := range current {
+		newHost[dc.Requirement.Name] = normHost(dc.HostName)
+	}
+	for _, old := range prev {
+		if old.State != StateRunning {
+			continue
+		}
+		if h, ok := newHost[old.Requirement.Name]; ok &&
+			h == normHost(old.HostName) {
+			continue // same host: deployRemote already rm-f'd it in place
+		}
+		if err := d.teardownContainer(ctx, old); err != nil {
+			d.opts.Logger.Error(
+				"reconcile: teardown stale %s on %s failed: %v",
+				old.Requirement.Name, old.HostName, err,
+			)
+		}
+	}
 }
 
 // buildPublishFlags renders the `-p host:container[/proto]` fragment (each with

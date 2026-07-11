@@ -57,8 +57,14 @@ func TestDefaultDistributor_Rebalance_EmptyContainers(t *testing.T) {
 // TestDefaultDistributor_DistributeEndpoints_Success verifies
 // DistributeEndpoints converts names to requirements and distributes.
 func TestDefaultDistributor_DistributeEndpoints_Success(t *testing.T) {
+	// §11.4.120 RECONCILED for CT-HARDEN-DIST-HARD DIST-3: DistributeEndpoints
+	// returns LocalContainers+RemoteContainers, so the count==3 assertion is a
+	// bluff without a runtime — post-fix a nil LocalRuntime FAILS every local
+	// deploy (count would be 0). Supply a real (fake) runtime seam so the 3
+	// endpoints genuinely deploy locally and the count is honestly 3.
 	dist := NewDistributor(
 		WithScheduler(&mockScheduler{}),
+		WithLocalRuntime(&deployLocalRuntime{}),
 		WithLogger(logging.NopLogger{}),
 	)
 
