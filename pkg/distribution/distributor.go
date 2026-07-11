@@ -222,7 +222,7 @@ func (d *DefaultDistributor) Undistribute(
 	// still run, and a double-Undistribute is safe (empty snapshot ⇒ no-op).
 	var teardownErrs []error
 	for _, dc := range snapshot {
-		if dc.State != StateRunning {
+		if !stateNeedsTeardown(dc.State) {
 			continue
 		}
 		if err := d.teardownContainer(ctx, dc); err != nil {
@@ -586,6 +586,24 @@ func normHost(h string) string {
 	return h
 }
 
+// stateNeedsTeardown reports whether a tracked container was genuinely deployed
+// and may still be alive on its host, so the teardown sites (Undistribute +
+// reconcileRelocations) MUST still issue its stop/remove. StateRunning is the
+// obvious case; StateMigrating is the less-obvious one (CT-HARDEN-DIST3-DEEP):
+// CheckAndFailover flips a genuinely-deployed StateRunning container to
+// StateMigrating when it proves the host offline, but that DI-4 reschedule is a
+// documented NO-OP — the container is NOT actually moved and may still be
+// running on its (possibly since-recovered) host. Skipping it via a bare
+// `!= StateRunning` re-opened the §11.4.69 DIST-1 sink-side leak for the
+// StateMigrating subset (Undistribute reports success while the container keeps
+// running; a relocation strands/duplicates it on the old host). Teardown is
+// best-effort, so attempting it on a truly-dead host merely errors (joined) —
+// never worse than the silent orphan. StateFailed/StateScheduled/
+// StateDeploying/StateStopped have no live deployment to remove.
+func stateNeedsTeardown(s DistributionState) bool {
+	return s == StateRunning || s == StateMigrating
+}
+
 // teardownContainer issues a best-effort stop+remove of a single tracked
 // container on the host where it was placed. Remote: `rt rm -f <name>` via the
 // Executor (mirrors deployRemote's pre-deploy rm — force-remove stops then
@@ -649,7 +667,8 @@ func (d *DefaultDistributor) teardownContainer(
 // re-Distribute/Rebalance moved or dropped them. deployRemote only rm-f's the
 // NEW host, so without this a container relocating from host A to host B keeps
 // running on A (CT-HARDEN-DIST-HARD DIST-2, a §11.4.69 sink-side leak). Only
-// previously-RUNNING placements are torn down (failed/scheduled ones were never
+// previously-LIVE placements are torn down (stateNeedsTeardown: StateRunning OR
+// StateMigrating — CT-HARDEN-DIST3-DEEP; failed/scheduled ones were never
 // created); a name kept on the SAME host is left alone because deployRemote
 // already rm-f'd it in place. Best-effort — per-container errors are logged,
 // never abort the batch.
@@ -665,7 +684,7 @@ func (d *DefaultDistributor) reconcileRelocations(
 		newHost[dc.Requirement.Name] = normHost(dc.HostName)
 	}
 	for _, old := range prev {
-		if old.State != StateRunning {
+		if !stateNeedsTeardown(old.State) {
 			continue
 		}
 		// CT-HARDEN-DIST2HARD DI-2: "same host ⇒ already rm-f'd in place" is
