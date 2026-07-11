@@ -282,6 +282,29 @@ func (o *DefaultOrchestrator) forgetStarted(name string) {
 	o.mu.Unlock()
 }
 
+// trackStartedForStop records a StartService-started service as running so a
+// later StopAll can tear it down — INCLUDING the case where the service's
+// post-start health check then FAILS (OR3-1). The compose entity is already
+// up (startRemote/startLocal returned nil); returning the health error
+// WITHOUT recording it orphans a running REMOTE container in a remote-only
+// deployment: StopAll can only route a remote teardown to a tracked-remote
+// record, so an untracked remote start (localOrch nil) is silently skipped by
+// StopAll's per-service loop. This mirrors StartAll, which keeps
+// startedOK=true on a health failure precisely so rollback/StopAll can reap
+// the running-but-unhealthy entity. info==nil records a local start. Acquires
+// o.mu.
+func (o *DefaultOrchestrator) trackStartedForStop(target Service, composeAbs string, info *remoteStartInfo) {
+	ss := startedService{svc: target, composeAbs: composeAbs}
+	if info != nil {
+		ss.remote = true
+		ss.remoteHost = info.host
+		ss.remoteDest = info.dest
+	}
+	o.mu.Lock()
+	o.trackStarted(ss)
+	o.mu.Unlock()
+}
+
 // shellQuote wraps s in single quotes for safe interpolation into a POSIX
 // shell command run on a remote host via ssh (OR-1). Any embedded single
 // quote is rendered as the canonical close-quote, backslash-escaped-quote,
@@ -830,18 +853,17 @@ func (o *DefaultOrchestrator) StartService(ctx context.Context, name string) err
 			return err
 		}
 		info := o.resolveRemoteStartInfo(composePath)
+		// OR3-1: the remote compose entity is UP — record it BEFORE the health
+		// gate so a later StopAll can reap it even if the health check fails.
+		// StartAll keeps startedOK=true on a health failure for exactly this
+		// reason; StartService previously returned the health error WITHOUT
+		// tracking, orphaning the running remote container in a remote-only
+		// config (localOrch nil => StopAll's per-service loop can never route
+		// a remote teardown to an untracked entry).
+		o.trackStartedForStop(target, composePath, info)
 		if err := o.checkServiceHealth(ctx, target, info); err != nil {
 			return err
 		}
-		o.mu.Lock()
-		ss := startedService{svc: target, composeAbs: composePath}
-		if info != nil {
-			ss.remote = true
-			ss.remoteHost = info.host
-			ss.remoteDest = info.dest
-		}
-		o.trackStarted(ss)
-		o.mu.Unlock()
 		return nil
 	}
 
