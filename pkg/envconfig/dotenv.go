@@ -57,6 +57,27 @@ func parseDotEnvLine(line string) (key, value string, ok bool) {
 	key = strings.TrimSpace(line[:idx])
 	value = strings.TrimSpace(line[idx+1:])
 
+	// A quoted value may carry a trailing inline comment
+	// (PASSWORD="s3cr3t" # note). Cut that comment BEFORE the
+	// quote-stripping below inspects the value, so the closing quote is
+	// once again the last character. Without this, the both-ends-quoted
+	// strip is skipped (the last char is a comment char) and the value
+	// keeps its literal surrounding quotes — corrupting an SSH password /
+	// key into a wrong credential (ENV-4 / §11.4.10 quoted-path sibling);
+	// worse, a comment that itself ends in a quote fools the both-ends
+	// test into firing and embeds the comment text into the credential.
+	// The '#' inside the quotes (e.g. "a#b") is untouched: we only look at
+	// what follows the closing quote.
+	if len(value) >= 2 && (value[0] == '"' || value[0] == '\'') {
+		if rel := strings.IndexByte(value[1:], value[0]); rel >= 0 {
+			rest := value[1+rel+1:]
+			if t := strings.TrimLeft(rest, " \t"); t != rest &&
+				strings.HasPrefix(t, "#") {
+				value = value[:1+rel+1]
+			}
+		}
+	}
+
 	// Handle quoted values.
 	if len(value) >= 2 {
 		if (value[0] == '"' && value[len(value)-1] == '"') ||
