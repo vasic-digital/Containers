@@ -261,6 +261,27 @@ func exitedState(st *runtime.ContainerStatus) bool {
 	return st.State == runtime.StateStopped || st.State == runtime.StateDead
 }
 
+// failIfExited extends the BROK-4 exited-container fast-fail to the pinned
+// host-port branch of every resolver (BROK2-1). The auto-port branch inspects
+// the container in its resolve loop and already fast-fails on an exited/dead
+// container; the pinned branch returned the caller's port WITHOUT any status
+// check, so a pinned-port caller whose container exited immediately would spin
+// the downstream readiness loop all the way to the 90s startup timeout — the
+// exact "spinning only delays a certain failure" case BROK-4 was added to kill,
+// left uncovered for pinned ports. This helper closes that gap conservatively:
+// it fast-fails ONLY when a status inspection SUCCEEDS and reports an exited
+// container. A status error is ignored (nil returned) so the caller's pin is
+// still trusted exactly as before — the fix is a strict superset that changes
+// behaviour solely for a confirmed-exited pinned container.
+func failIfExited(ctx context.Context, rt runtime.ContainerRuntime, name string) error {
+	if st, err := rt.Status(ctx, name); err == nil && exitedState(st) {
+		return fmt.Errorf(
+			"container %s exited before becoming ready (state=%s, exit_code=%d)",
+			name, st.State, st.ExitCode)
+	}
+	return nil
+}
+
 // containerRunner runs a brand-new detached container from an image with
 // published ports — the single capability pkg/runtime's ContainerRuntime
 // interface does not expose (it only start/stop/removes EXISTING containers).
@@ -301,6 +322,9 @@ func resolveHostPort(
 	ctx context.Context, rt runtime.ContainerRuntime, name, pinned string,
 ) (string, error) {
 	if pinned != "" {
+		if err := failIfExited(ctx, rt, name); err != nil { // BROK2-1
+			return "", err
+		}
 		return pinned, nil
 	}
 	// Inspect can briefly race container creation; retry within ctx.

@@ -172,6 +172,9 @@ func resolveRedisHostPort(
 	ctx context.Context, rt runtime.ContainerRuntime, name, pinned string,
 ) (string, error) {
 	if pinned != "" {
+		if err := failIfExited(ctx, rt, name); err != nil { // BROK2-1
+			return "", err
+		}
 		return pinned, nil
 	}
 	var lastErr error
