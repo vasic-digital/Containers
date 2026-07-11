@@ -130,7 +130,10 @@ func resolveURL(host, port, path string) string {
 	}
 	authority := bareHost
 	if port != "" {
-		authority = net.JoinHostPort(bareHost, port)
+		// EP2-1: strip an already-bracketed IPv6 literal ("[::1]") first so
+		// JoinHostPort re-adds exactly one bracket layer, not an invalid
+		// double-wrapped "[[::1]]:port".
+		authority = net.JoinHostPort(unbracketHost(bareHost), port)
 	}
 	base := scheme + authority
 	if path != "" {
@@ -194,4 +197,19 @@ func hasSpaceOrControl(s string) bool {
 		}
 	}
 	return false
+}
+
+// unbracketHost removes a single surrounding "[" "]" pair from an
+// already-bracketed IPv6 host literal (e.g. "[::1]" -> "::1"). A downstream
+// net.JoinHostPort re-adds exactly one bracket layer for a colon-bearing
+// host, so without this an already-bracketed input double-wraps into an
+// invalid "[[::1]]:port" (rejected by url.Parse). Only a bracketed literal
+// whose inner text contains a colon (a genuine IPv6 address) is unwrapped;
+// IPv4 / hostname / bare-IPv6 / other bracketed text is returned unchanged.
+func unbracketHost(h string) string {
+	if len(h) >= 2 && h[0] == '[' && h[len(h)-1] == ']' &&
+		strings.Contains(h[1:len(h)-1], ":") {
+		return h[1 : len(h)-1]
+	}
+	return h
 }

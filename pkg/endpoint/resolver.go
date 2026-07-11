@@ -28,7 +28,9 @@ func ResolveHostPort(ep *ServiceEndpoint) string {
 	}
 	// EP-1: net.JoinHostPort bracket-wraps an IPv6 literal ("[::1]:8080")
 	// and leaves IPv4/hostnames unchanged, unlike a manual "%s:%s" concat.
-	return net.JoinHostPort(host, ep.Port)
+	// EP2-1: unbracketHost first so an already-bracketed literal ("[::1]")
+	// is not double-wrapped into an invalid "[[::1]]:port".
+	return net.JoinHostPort(unbracketHost(host), ep.Port)
 }
 
 // ResolveScheme returns the URL scheme for the endpoint. It mirrors the
@@ -58,7 +60,10 @@ func IsLocalEndpoint(ep *ServiceEndpoint) bool {
 	if ep.Remote {
 		return false
 	}
-	h := strings.ToLower(ep.Host)
+	// EP2-2: unbracketHost normalises an already-bracketed IPv6 literal
+	// ("[::1]") so the loopback comparison recognises it exactly like the
+	// bare "::1" form (otherwise "[::1]" is mis-classified as non-local).
+	h := strings.ToLower(unbracketHost(ep.Host))
 	return h == "" || h == "localhost" || h == "127.0.0.1" ||
 		h == "::1"
 }
