@@ -473,7 +473,24 @@ func (s *FilesystemStore) Verify(ctx context.Context, m *Manifest, imageID strin
 		// either way.
 		quarantine := s.quarantinePath(path)
 		if renameErr := renameFile(path, quarantine); renameErr != nil {
+			// Quarantine rename failed (cross-device link, permission, target
+			// races): fall back to REMOVING the corrupt blob so a subsequent Get
+			// misses the fast path and re-fetches a good copy. This removal MUST
+			// be made durable exactly like the quarantine-rename branch below
+			// (CACHE2-1, symmetric with CA-2): os.Remove unlinks the corrupt blob
+			// from the directory, but WITHOUT an fsync of the containing directory
+			// the unlink's metadata can be lost on a crash — recovery then
+			// resurrects the corrupt blob back at path, which Get's re-hash-free
+			// fast path serves forever as "verified", silently undoing the
+			// removal (the §11.4.14/§11.4.108 durability hole CA-2 closed only on
+			// the rename branch, left open on this sibling remove branch). fsync
+			// the blobs dir so the removal survives a power-loss.
 			_ = os.Remove(path)
+			postRemoveSync := syncDir(s.blobsDir()) // CACHE2-1: durably flush the corrupt-blob removal
+			if postRemoveSync != nil {
+				return fmt.Errorf("verify %q: SHA256 drift (got %s, want %s); post-remove dir-fsync failed: %w",
+					entry.ID, got, sha, postRemoveSync)
+			}
 		} else if syncErr := syncDir(s.blobsDir()); syncErr != nil {
 			return fmt.Errorf("verify %q: SHA256 drift (got %s, want %s); quarantine dir-fsync failed: %w",
 				entry.ID, got, sha, syncErr)
