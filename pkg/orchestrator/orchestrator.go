@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"digital.vasic.containers/pkg/compose"
 	"digital.vasic.containers/pkg/health"
@@ -275,9 +276,37 @@ func (o *DefaultOrchestrator) StartAll(ctx context.Context) error {
 		err        error
 	}
 
+	// nameTotal counts how many service entries share each name. A name may
+	// map to several service instances (computeStartLevels documents this —
+	// e.g. replicas of the same logical service), and a dependent's
+	// dependency on that name must only be treated as genuinely failed once
+	// EVERY instance sharing it has failed or been skipped for a failed
+	// dependency of its own (ORCH-1). Without this, a single failing
+	// instance among otherwise-healthy siblings marks the whole name failed
+	// and starves a dependent whose real prerequisite — a healthy sibling —
+	// started fine, then rollback() tears down that healthy sibling too.
+	nameTotal := make(map[string]int, len(services))
+	for _, s := range services {
+		nameTotal[s.Name]++
+	}
+	nameFailedCount := make(map[string]int, len(services))
+
 	failedNames := make(map[string]bool)
 	var failures []error
 	var started []startedService
+
+	// recordNameFailure accounts for one more failed-or-skipped instance of
+	// name and only flips failedNames[name] once every instance sharing that
+	// name has been accounted for (see nameTotal above). It is called only
+	// from this single level-processing loop (the dependency-skip branch
+	// below, and the resultChan drain after each level), never concurrently,
+	// so the plain map read-modify-write here needs no locking.
+	recordNameFailure := func(name string) {
+		nameFailedCount[name]++
+		if nameFailedCount[name] >= nameTotal[name] {
+			failedNames[name] = true
+		}
+	}
 
 	for _, level := range levels {
 		var wg sync.WaitGroup
@@ -289,7 +318,7 @@ func (o *DefaultOrchestrator) StartAll(ctx context.Context) error {
 			// own failure both for the Required gate and for ITS dependents.
 			if dependencyFailed(svc, failedNames) {
 				o.logger.Warn("orchestrator: skipping %s (dependency failed)", svc.Name)
-				failedNames[svc.Name] = true
+				recordNameFailure(svc.Name)
 				if svc.Required {
 					failures = append(failures, fmt.Errorf("required service %s skipped: dependency failed", svc.Name))
 				}
@@ -308,7 +337,15 @@ func (o *DefaultOrchestrator) StartAll(ctx context.Context) error {
 				// missing-file service still starts — a missing file means "this
 				// service isn't part of this deployment", not "its dependency
 				// failed". A dependency whose Up genuinely FAILS does cascade.
+				// It is also removed from nameTotal (ORCH-1): a missing-file
+				// instance never resolves to a success or a failure, so it must
+				// not count toward "every instance of this name has failed"
+				// (it would either mask a genuinely-failed sibling by never
+				// letting nameFailedCount catch up, or — if it were the only
+				// instance — wrongly flip failedNames true with zero real
+				// failures).
 				o.logger.Debug("orchestrator: skipping %s (file not found)", svc.Name)
+				nameTotal[svc.Name]--
 				continue
 			}
 
@@ -341,7 +378,7 @@ func (o *DefaultOrchestrator) StartAll(ctx context.Context) error {
 		for r := range resultChan {
 			if r.err != nil {
 				o.logger.Warn("orchestrator: failed to start %s: %v", r.svc.Name, r.err)
-				failedNames[r.svc.Name] = true
+				recordNameFailure(r.svc.Name)
 				if r.svc.Required {
 					failures = append(failures, fmt.Errorf("required service %s failed: %w", r.svc.Name, r.err))
 				}
@@ -361,6 +398,16 @@ func (o *DefaultOrchestrator) StartAll(ctx context.Context) error {
 	return nil
 }
 
+// rollbackTimeout bounds the best-effort teardown of already-started services
+// when a required service fails mid-boot (ORCH-2). It is a single shared
+// budget for the WHOLE rollback loop (every started service's Down call),
+// not a per-service timeout: WithoutCancel correctly detaches the parent's
+// cancellation (see rollback below) but, on its own, leaves the teardown
+// context with NO deadline at all — a single wedged Down call would then hang
+// rollback, and therefore StartAll (which calls rollback synchronously on a
+// required-service failure), forever.
+const rollbackTimeout = 30 * time.Second
+
 // rollback tears down services that StartAll had already started, used when a
 // required service failed mid-boot. Best-effort local compose-down, matching
 // StopAll's teardown semantics (a Down failure is logged, not surfaced — the
@@ -375,8 +422,10 @@ func (o *DefaultOrchestrator) rollback(ctx context.Context, started []startedSer
 	// boot failed BECAUSE ctx was canceled/timed out, reusing ctx would make
 	// every rollback Down no-op on an already-dead context, defeating the
 	// rollback exactly when it is most needed. WithoutCancel keeps ctx values
-	// but drops its cancellation.
-	downCtx := context.WithoutCancel(ctx)
+	// but drops its cancellation — and is then bounded by rollbackTimeout
+	// (ORCH-2) so a wedged Down cannot hang rollback (and StartAll) forever.
+	downCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+	defer cancel()
 	for _, s := range started {
 		if err := o.localOrch.Down(downCtx, compose.ComposeProject{
 			File:    s.composeAbs,
@@ -396,6 +445,14 @@ func (o *DefaultOrchestrator) startLocal(ctx context.Context, svc Service, compo
 		Profile: svc.Profile,
 	})
 }
+
+// remoteCopyDirTimeout bounds the directory copy to a remote host performed by
+// startRemote (ORCH-3). Unlike SSHExecutor.Execute/IsReachable, pkg/remote's
+// CopyDir has no internal timeout of its own — called on a raw, unbounded ctx
+// a stalled scp would hang that service's goroutine forever, and since
+// StartAll drains resultChan only after wg.Wait() completes, a single stalled
+// CopyDir hangs StartAll for EVERY service in the level, not just this one.
+const remoteCopyDirTimeout = 30 * time.Second
 
 func (o *DefaultOrchestrator) startRemote(ctx context.Context, svc Service, composePath string) error {
 	if o.hostMgr == nil || o.remoteExec == nil {
@@ -421,7 +478,9 @@ func (o *DefaultOrchestrator) startRemote(ctx context.Context, svc Service, comp
 
 	localDir := filepath.Dir(composePath)
 	remoteDest := remoteDir + "/" + filepath.Base(localDir)
-	if err := o.remoteExec.CopyDir(ctx, host, localDir, remoteDest); err != nil {
+	copyCtx, cancel := context.WithTimeout(ctx, remoteCopyDirTimeout)
+	defer cancel()
+	if err := o.remoteExec.CopyDir(copyCtx, host, localDir, remoteDest); err != nil {
 		return fmt.Errorf("copy to remote: %w", err)
 	}
 
