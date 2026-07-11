@@ -147,23 +147,25 @@ func TestPrometheusCollector_MultipleContainers(t *testing.T) {
 }
 
 func TestPrometheusCollector_NilRegisterer(t *testing.T) {
-	// This test covers the branch where reg is nil
-	// and uses the default registerer. We need to be careful
-	// not to register duplicate metrics, so we skip if
-	// metrics are already registered.
-	defer func() {
-		// If we panic due to duplicate registration,
-		// that's expected in repeated test runs.
-		if r := recover(); r != nil {
-			t.Logf("expected panic from duplicate registration: %v", r)
-		}
-	}()
-
-	c := NewPrometheusCollector(nil)
-	require.NotNil(t, c)
-
-	// Verify the collector works
-	c.IncContainerStarts("nil-reg-test")
+	// This test covers the branch where reg is nil and uses the default
+	// registerer. Reconciled per §11.4.120 for the Wave-20 MET-1 fix: the
+	// constructor used to PANIC on a duplicate registration (the old body
+	// wrapped this in recover() and logged "expected panic"). MET-1 made
+	// duplicate registration non-fatal via registerOrExisting, so this test
+	// now asserts the NEW guarantee — repeated NewPrometheusCollector(nil)
+	// against the default registerer must NOT panic and must return usable
+	// collectors. Real prometheus.DefaultRegisterer, no mock (§11.4.107).
+	assert.NotPanics(t, func() {
+		c1 := NewPrometheusCollector(nil)
+		require.NotNil(t, c1)
+		// Second construction on the same (default) registerer would panic
+		// pre-MET-1; post-fix it reuses the existing collectors.
+		c2 := NewPrometheusCollector(nil)
+		require.NotNil(t, c2)
+		// Both collectors must remain usable.
+		c1.IncContainerStarts("nil-reg-test")
+		c2.IncContainerStarts("nil-reg-test")
+	})
 }
 
 // findFamily searches gathered metric families by name.
