@@ -93,6 +93,95 @@ func isPodmanComposeCmd(composeCmd string, _ []string) bool {
 	return composeCmd == "podman-compose"
 }
 
+// podmanBannerMarkers are substrings that identify a podman-backed compose
+// invocation from its `version` output, matched case-insensitively against
+// the probe's combined stdout+stderr. Captured 2026-07-11 from a real
+// rootless-podman host (this project's own §11.4.161 runtime) where
+// `docker version` / `docker compose version` succeed by silently
+// re-execing into podman / podman-compose and print:
+//
+//	Emulate Docker CLI using podman. Create /etc/containers/nodocker to
+//	quiet msg.
+//	Client:       Podman Engine
+//	...
+//
+// and
+//
+//	Emulate Docker CLI using podman. Create /etc/containers/nodocker to
+//	quiet msg.
+//	Executing external compose provider "/usr/bin/podman-compose". ...
+//	podman version 5.7.1
+//	podman-compose version 1.5.0
+//
+// "podman" alone is a sufficiently precise marker here because it only ever
+// appears in this probe's OWN version/banner output, never in genuine
+// docker/docker-compose version output.
+var podmanBannerMarkers = []string{"podman"}
+
+// runVersionProbe runs `<name> [args...] version`, bounded by timeout (zero
+// means unbounded, mirroring composeCmdWorks), and returns the combined
+// stdout+stderr plus whether the command exited zero. args is copied before
+// appending "version" so the caller's slice is never aliased (COMP-1
+// discipline).
+func runVersionProbe(name string, args []string, timeout time.Duration) (string, bool) {
+	checkArgs := make([]string, 0, len(args)+1)
+	checkArgs = append(checkArgs, args...)
+	checkArgs = append(checkArgs, "version")
+
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	cmd := exec.CommandContext(ctx, name, checkArgs...)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	err := cmd.Run()
+	return buf.String(), err == nil
+}
+
+// isPodmanBackedCmd reports whether the resolved compose command actually
+// delegates to podman even when composeCmd is not literally "podman-compose"
+// (CO-1). detectComposeCmd tries {"docker", ["compose"]} FIRST, and on a
+// podman-docker compatibility-shim host `docker compose version` exits 0 by
+// silently re-execing into podman-compose -- isPodmanComposeCmd's literal
+// string match never fires for that case, so Status()/Up(WithWait) take the
+// docker-native code paths against a podman backend and break: the docker ps
+// Go-template errors out (Status() silently returns empty while containers
+// are actually running) and `--wait` (docker-native) is rejected by
+// podman-compose (Up(WithWait) hard-fails instead of falling back to
+// waitForServices polling).
+//
+// This probe runs `<composeCmd> [composeArgs...] version`, bounded by
+// timeout (mirrors composeCmdWorks/COMP-3 so a wedged binary cannot block
+// classification), and inspects the combined stdout+stderr for a podman
+// banner marker. composeCmd values already classified by isPodmanComposeCmd
+// ("podman-compose"), or that intentionally route through the
+// docker-compose-compatible `podman compose` provider ("podman"), are
+// skipped -- this probe exists only to catch a DIFFERENTLY-NAMED command
+// silently backed by podman.
+func isPodmanBackedCmd(composeCmd string, composeArgs []string, timeout time.Duration) bool {
+	if composeCmd == "podman" || composeCmd == "podman-compose" {
+		return false
+	}
+
+	out, ok := runVersionProbe(composeCmd, composeArgs, timeout)
+	if !ok {
+		return false
+	}
+
+	lower := strings.ToLower(out)
+	for _, marker := range podmanBannerMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // NewDefaultOrchestrator creates a DefaultOrchestrator, auto-detecting
 // the available compose command. The workDir is the directory from
 // which commands are executed.
@@ -107,12 +196,18 @@ func NewDefaultOrchestrator(
 		logger = logging.NopLogger{}
 	}
 	return &DefaultOrchestrator{
-		composeCmd:      cmd,
-		composeArgs:     args,
-		workDir:         workDir,
-		logger:          logger,
-		cmdFactory:      realCmdFactory{},
-		isPodmanCompose: isPodmanComposeCmd(cmd, args),
+		composeCmd:  cmd,
+		composeArgs: args,
+		workDir:     workDir,
+		logger:      logger,
+		cmdFactory:  realCmdFactory{},
+		// CO-1: classify by literal name first, then -- because
+		// detectComposeCmd tries {"docker", ["compose"]} FIRST and a
+		// podman-docker compatibility shim answers that probe successfully
+		// while actually delegating to podman -- fall back to a runtime
+		// probe of the resolved command itself.
+		isPodmanCompose: isPodmanComposeCmd(cmd, args) ||
+			isPodmanBackedCmd(cmd, args, composeProbeTimeout),
 	}, nil
 }
 
@@ -212,7 +307,14 @@ func (o *DefaultOrchestrator) Up(
 	// service is running (and any service with a healthcheck is healthy),
 	// or the context / timeout elapses.
 	if cfg.Wait && o.isPodmanCompose {
-		return o.waitForServices(ctx, project, cfg.Timeout)
+		// CO-2: cfg.WaitTimeout is a DISTINCT knob from cfg.Timeout --
+		// cfg.Timeout maps to compose's own `--timeout` graceful-shutdown
+		// flag (seconds given to a container to stop during a recreate),
+		// which is typically small and has nothing to do with how long the
+		// host-side health-poll fallback should wait for services to become
+		// ready. Reusing cfg.Timeout for both silently capped the poll
+		// deadline to whatever the caller set for shutdown grace.
+		return o.waitForServices(ctx, project, cfg.WaitTimeout)
 	}
 	return nil
 }
@@ -250,15 +352,26 @@ func (o *DefaultOrchestrator) waitForServices(
 		statuses, err := o.Status(ctx, project)
 		if err != nil {
 			lastErr = err
-		} else if servicesReady(statuses) {
-			o.logger.Debug(
-				"podman-compose wait: all services ready (%d)",
-				len(statuses),
-			)
-			return nil
 		} else {
+			// CO-2: Status() reports EVERY service in the compose project,
+			// but the caller may have scoped Up() to a SUBSET via
+			// project.Services (e.g. Up({Services:[web]})). Requiring
+			// readiness of every reported service -- including ones the
+			// caller never asked to start -- makes waitForServices false-FAIL
+			// whenever an unrelated service/profile in the same compose file
+			// is not ready. Scope the readiness check to the requested
+			// subset; an empty project.Services means "no filter", matching
+			// the prior whole-project semantics.
+			relevant := filterStatusesByServices(statuses, project.Services)
+			if servicesReady(relevant) {
+				o.logger.Debug(
+					"podman-compose wait: all requested services ready (%d)",
+					len(relevant),
+				)
+				return nil
+			}
 			lastErr = fmt.Errorf(
-				"services not ready: %s", summarizeStatuses(statuses),
+				"services not ready: %s", summarizeStatuses(relevant),
 			)
 		}
 
@@ -299,6 +412,30 @@ func servicesReady(statuses []ServiceStatus) bool {
 		}
 	}
 	return true
+}
+
+// filterStatusesByServices restricts statuses to the services explicitly
+// requested by the caller (project.Services). An empty/nil services slice
+// means "no filter" -- every reported status is in scope, preserving the
+// prior whole-project wait semantics for callers that never scope Up() to a
+// subset (CO-2).
+func filterStatusesByServices(
+	statuses []ServiceStatus, services []string,
+) []ServiceStatus {
+	if len(services) == 0 {
+		return statuses
+	}
+	want := make(map[string]struct{}, len(services))
+	for _, s := range services {
+		want[s] = struct{}{}
+	}
+	filtered := make([]ServiceStatus, 0, len(statuses))
+	for _, s := range statuses {
+		if _, ok := want[s.Name]; ok {
+			filtered = append(filtered, s)
+		}
+	}
+	return filtered
 }
 
 // summarizeStatuses renders a compact name=state/health summary for error

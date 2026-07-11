@@ -2,6 +2,7 @@ package compose
 
 import (
 	"fmt"
+	"os"
 	"time"
 )
 
@@ -104,24 +105,75 @@ func (p *HelixComposeProject) HasService(name string) bool {
 	return false
 }
 
+// envOrDefault returns the value of the named environment variable, or
+// fallback when unset/empty. DefaultHelixServices() uses this so every
+// credential embedded in the generated dev-stack compose definition can be
+// overridden by the environment (§6.R no-hardcoding) instead of being a
+// tracked-source literal; the literal values that remain are DOCUMENTED
+// dev-only fallback defaults for local bring-up, never a value this package
+// requires a real deployment to use.
+func envOrDefault(name, fallback string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback
+}
+
 // DefaultHelixServices returns the 20 standard Helix infrastructure services.
+//
+// CO-3 (§6.R no-hardcoding): the credentials below (Postgres user/password/db,
+// Grafana admin user/password, the Vault dev-mode root token) are sourced
+// from environment variables, falling back to the historical values ONLY
+// when the corresponding env var is unset -- those fallbacks are DEV-ONLY
+// defaults for local bring-up of the generated compose stack, not production
+// secrets, and MUST be overridden via the environment for any non-throwaway
+// deployment:
+//
+//	HELIX_COMPOSE_POSTGRES_USER          (default "helix")
+//	HELIX_COMPOSE_POSTGRES_PASSWORD      (default "helix")
+//	HELIX_COMPOSE_POSTGRES_DB            (default "helix")
+//	HELIX_COMPOSE_GRAFANA_ADMIN_USER     (default "admin")
+//	HELIX_COMPOSE_GRAFANA_ADMIN_PASSWORD (default "admin")
+//	HELIX_COMPOSE_VAULT_DEV_ROOT_TOKEN   (default "helix-root-token")
+//
+// CO-3 port-literal assessment: the HostPort/ContainerPort values below are
+// NOT sourced from the environment. Unlike the credentials above they are
+// mutually load-bearing across this single fixed 20-service topology (the
+// etcd cluster's ETCD_INITIAL_CLUSTER peer URLs are hardcoded to
+// etcd-{1,2,3}:2380 and the port list itself defines which host ports the 20
+// services occupy relative to one another) -- making them independently
+// env-overridable here without a coordinated per-deployment port-plan
+// mechanism would let a caller silently create colliding or
+// internally-inconsistent bindings, a worse outcome than a documented
+// literal. They are honest, non-secret, DEV-ONLY default port assignments
+// for local bring-up of this generated stack; a deployment needing different
+// ports should construct its own []HelixService rather than rely on this
+// slice verbatim.
 func DefaultHelixServices() []HelixService {
 	return []HelixService{
 		{
 			Name:  "postgres-primary",
 			Image: "postgres:16-alpine",
 			Ports: []PortMapping{{HostPort: 5432, ContainerPort: 5432, Protocol: "tcp"}},
-			Env:   map[string]string{"POSTGRES_USER": "helix", "POSTGRES_PASSWORD": "helix", "POSTGRES_DB": "helix"},
+			Env: map[string]string{
+				"POSTGRES_USER":     envOrDefault("HELIX_COMPOSE_POSTGRES_USER", "helix"),
+				"POSTGRES_PASSWORD": envOrDefault("HELIX_COMPOSE_POSTGRES_PASSWORD", "helix"),
+				"POSTGRES_DB":       envOrDefault("HELIX_COMPOSE_POSTGRES_DB", "helix"),
+			},
 			HealthCheck: &HelixHealthCheck{
 				Test:     []string{"CMD-SHELL", "pg_isready -U helix -d helix"},
 				Interval: 5 * time.Second, Timeout: 5 * time.Second, Retries: 5,
 			},
 		},
 		{
-			Name:      "postgres-replica",
-			Image:     "postgres:16-alpine",
-			Ports:     []PortMapping{{HostPort: 5433, ContainerPort: 5432, Protocol: "tcp"}},
-			Env:       map[string]string{"POSTGRES_USER": "helix", "POSTGRES_PASSWORD": "helix", "POSTGRES_DB": "helix"},
+			Name:  "postgres-replica",
+			Image: "postgres:16-alpine",
+			Ports: []PortMapping{{HostPort: 5433, ContainerPort: 5432, Protocol: "tcp"}},
+			Env: map[string]string{
+				"POSTGRES_USER":     envOrDefault("HELIX_COMPOSE_POSTGRES_USER", "helix"),
+				"POSTGRES_PASSWORD": envOrDefault("HELIX_COMPOSE_POSTGRES_PASSWORD", "helix"),
+				"POSTGRES_DB":       envOrDefault("HELIX_COMPOSE_POSTGRES_DB", "helix"),
+			},
 			DependsOn: []string{"postgres-primary"},
 			HealthCheck: &HelixHealthCheck{
 				Test:     []string{"CMD-SHELL", "pg_isready -U helix -d helix"},
@@ -300,7 +352,10 @@ func DefaultHelixServices() []HelixService {
 			Name:  "grafana",
 			Image: "grafana/grafana:10.4.0",
 			Ports: []PortMapping{{HostPort: 3000, ContainerPort: 3000, Protocol: "tcp"}},
-			Env:   map[string]string{"GF_SECURITY_ADMIN_USER": "admin", "GF_SECURITY_ADMIN_PASSWORD": "admin"},
+			Env: map[string]string{
+				"GF_SECURITY_ADMIN_USER":     envOrDefault("HELIX_COMPOSE_GRAFANA_ADMIN_USER", "admin"),
+				"GF_SECURITY_ADMIN_PASSWORD": envOrDefault("HELIX_COMPOSE_GRAFANA_ADMIN_PASSWORD", "admin"),
+			},
 			HealthCheck: &HelixHealthCheck{
 				Test:     []string{"CMD-SHELL", "wget -qO- http://localhost:3000/api/health"},
 				Interval: 10 * time.Second, Timeout: 5 * time.Second, Retries: 5,
@@ -320,7 +375,11 @@ func DefaultHelixServices() []HelixService {
 			Name:  "vault",
 			Image: "hashicorp/vault:1.16",
 			Ports: []PortMapping{{HostPort: 8200, ContainerPort: 8200, Protocol: "tcp"}},
-			Env:   map[string]string{"VAULT_DEV_ROOT_TOKEN_ID": "helix-root-token", "VAULT_DEV_LISTEN_ADDRESS": "0.0.0.0:8200"},
+			Env: map[string]string{
+				"VAULT_DEV_ROOT_TOKEN_ID": envOrDefault("HELIX_COMPOSE_VAULT_DEV_ROOT_TOKEN", "helix-root-token"),
+				// Bind address, not a secret -- no env override needed.
+				"VAULT_DEV_LISTEN_ADDRESS": "0.0.0.0:8200",
+			},
 			HealthCheck: &HelixHealthCheck{
 				Test:     []string{"CMD-SHELL", "vault status"},
 				Interval: 10 * time.Second, Timeout: 5 * time.Second, Retries: 5,
