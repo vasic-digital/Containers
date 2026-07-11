@@ -21,6 +21,12 @@ type Distributor interface {
 	// DistributeEndpoints distributes remote endpoints and returns
 	// the number of successfully deployed containers.
 	DistributeEndpoints(ctx context.Context, names []string) (int, error)
+	// Undistribute tears down all distributed remote endpoints
+	// (containers, tunnels, volumes). Called from Shutdown so remote
+	// state distributed during BootAll Phase 2.5 does not leak
+	// (BOOT-3). distribution.DefaultDistributor already implements
+	// this, so the real type satisfies the extended interface.
+	Undistribute(ctx context.Context) error
 }
 
 // BootManagerOption configures a BootManager during construction.
