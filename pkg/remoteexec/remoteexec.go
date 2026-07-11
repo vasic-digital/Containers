@@ -96,6 +96,16 @@ type Handle struct {
 	ScriptPath   string
 	LogPath      string
 	SentinelPath string
+
+	// LingerVerified is true ONLY when durable lingering was BOTH requested
+	// (Spec.linger()) AND confirmed active via LingerActive AFTER launch. It is
+	// false when linger was not requested, when the post-launch verification
+	// returned "no"/unknown, or when that verification could not be performed —
+	// Launch NEVER sets it true on the strength of enable-linger's best-effort
+	// (`|| true`) exit alone (§11.4.108: a command that RAN is not proof the
+	// runtime state actually took). A caller relying on the job surviving logout
+	// MUST consult this, not merely that Launch returned a nil error.
+	LingerVerified bool
 }
 
 // WithLinger returns a copy of the spec with EnableLinger explicitly set,
@@ -128,6 +138,16 @@ func unitName(unit string) string {
 // launch command and the local WriteFile.
 func resolveDir(ctx context.Context, r Runner, s Spec) (string, error) {
 	if s.Dir != "" {
+		// This function's contract (and every downstream path via handleForDir)
+		// requires an ABSOLUTE directory. A relative Dir would be resolved against
+		// the runner's ambient CWD, which is undefined for a durable job launched
+		// under systemd-run --user (it starts in the user manager's own working
+		// directory, NOT the launching shell's) — so the artifact paths would be
+		// ambiguous against the remote CWD. Reject it with a clear, deterministic
+		// error (§11.4.6) instead of silently returning it relative.
+		if !path.IsAbs(s.Dir) {
+			return "", fmt.Errorf("remoteexec: spec.Dir must be an absolute path, got %q", s.Dir)
+		}
 		return s.Dir, nil
 	}
 	res, err := r.Run(ctx, `printf %s "${XDG_CACHE_HOME:-$HOME/.cache}/remoteexec"`)
@@ -262,6 +282,20 @@ func Launch(ctx context.Context, r Runner, spec Spec) (Handle, error) {
 		return Handle{}, fmt.Errorf(
 			"remoteexec: systemd-run exited %d (stderr: %s)", res.ExitCode, strings.TrimSpace(res.Stderr))
 	}
+	// §11.4.108 runtime-signature honesty: buildLaunchCommand enabled linger
+	// best-effort (`loginctl enable-linger || true`), so a clean systemd-run exit
+	// does NOT prove the job will survive logout. When durability was requested,
+	// VERIFY linger actually took and record the honest verdict on the Handle —
+	// never claim durability that was not confirmed. A verdict that is not "yes"
+	// (or a verification the host could not answer) leaves LingerVerified=false
+	// WITHOUT failing the launch: the unit did register and may still be useful
+	// for the current session, but the caller is truthfully told it is not
+	// durable rather than handed a false durability guarantee.
+	if spec.linger() {
+		if active, verr := LingerActive(ctx, r); verr == nil {
+			h.LingerVerified = active
+		}
+	}
 	return h, nil
 }
 
@@ -296,6 +330,29 @@ func MainPID(ctx context.Context, r Runner, unit string) (int, error) {
 	var pid int
 	_, _ = fmt.Sscanf(strings.TrimSpace(res.Stdout), "%d", &pid)
 	return pid, nil
+}
+
+// LingerActive reports whether systemd user lingering is currently enabled for
+// the runner's target user — the honest runtime signal (§11.4.108) that a
+// durable `--user` unit will survive the launching login session ending.
+// buildLaunchCommand enables linger best-effort (`loginctl enable-linger || true`
+// — so an already-enabled or no-permission host never aborts the launch), which
+// means a SUCCESSFUL launch does NOT, by itself, prove linger actually took. It
+// queries `loginctl show-user <uid> --value -p Linger` through the Runner seam
+// and checks the verdict == "yes".
+//
+// A non-empty verdict ("yes"/"no") is a genuine answer and returns a nil error
+// even if the runner also surfaced a non-zero exit; an EMPTY verdict WITH an
+// error is a transport failure (host unreachable) and is surfaced — mirroring
+// IsActive/MainPID, since reporting linger "off" for a host we could not reach
+// would be a §11.4.144 availability-following bluff.
+func LingerActive(ctx context.Context, r Runner) (bool, error) {
+	res, err := r.Run(ctx,
+		`export XDG_RUNTIME_DIR=/run/user/$(id -u); loginctl show-user "$(id -u)" --value -p Linger 2>/dev/null`)
+	if err != nil && strings.TrimSpace(res.Stdout) == "" {
+		return false, fmt.Errorf("remoteexec: query linger: %w", err)
+	}
+	return strings.TrimSpace(res.Stdout) == "yes", nil
 }
 
 // WaitForSentinel polls until the job's sentinel file appears (completion) or
@@ -340,8 +397,20 @@ func WaitForSentinel(ctx context.Context, r Runner, h Handle, poll, timeout time
 // FetchLog returns the durable job's captured combined output.
 func FetchLog(ctx context.Context, r Runner, h Handle) (string, error) {
 	res, err := r.Run(ctx, fmt.Sprintf("cat %s 2>/dev/null", shQuote(h.LogPath)))
-	if err != nil && res.Stdout == "" {
-		return "", fmt.Errorf("remoteexec: fetch log %s: %w", h.LogPath, err)
+	if err != nil {
+		// Per the Runner contract a non-nil err means the `cat` could not be run
+		// to completion — so any bytes in res.Stdout are at best a PARTIAL,
+		// TRUNCATED prefix of the log, never a guaranteed-complete read. The prior
+		// guard (`err != nil && res.Stdout == ""`) swallowed the error whenever a
+		// partial prefix had already been read, handing the caller a truncated log
+		// indistinguishable from a complete one — a §11.4.1 / §11.4.107
+		// completeness bluff. Surface the error AND return whatever partial content
+		// was read, so the caller sees both the prefix and the fact that it is
+		// incomplete. A missing / not-yet-created log is NOT this case: `cat` of a
+		// missing file exits non-zero, which both runners report as a NIL error
+		// (SSHRunner swallows remote exits 1..254; LocalRunner maps *exec.ExitError
+		// to ExitCode) — so it still returns ("", nil).
+		return res.Stdout, fmt.Errorf("remoteexec: fetch log %s: %w", h.LogPath, err)
 	}
 	return res.Stdout, nil
 }
