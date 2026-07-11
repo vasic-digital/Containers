@@ -113,6 +113,21 @@ func buildContainerRunArgs(
 		"-p", fmt.Sprintf("%d:5554/tcp", hostPort-1),
 		"-e", "ANDROID_AVD_NAME="+avd.Name,
 		"-e", fmt.Sprintf("ANDROID_COLD_BOOT=%t", coldBoot),
+		// EMU2-1 (security, argv flag-injection): terminate `podman/docker
+		// run` option parsing with an explicit end-of-options "--" BEFORE
+		// the image positional. `image` flows unsanitized from
+		// ContainerizedConfig.Image (a consumer manifest / --image CLI
+		// value); a crafted or typo'd reference beginning with '-' (e.g.
+		// "--privileged", "--network=host", "-v/:/host") would otherwise be
+		// parsed by the container CLI as a RUNTIME FLAG rather than the
+		// image name — a privilege/mount/network-escalation vector. The
+		// "--" forces it to be a positional, so the worst outcome of a
+		// hostile ref is an honest "no such image", never an escalation.
+		// Direct mirror of pkg/crossbuild's XBUILD2-2 (container_runner.go /
+		// apple_container.go) and the module's OR-1/RM2/NET3 arg-injection
+		// hardenings, applied to the sibling emulator container path the
+		// crossbuild fix never touched.
+		"--",
 		image,
 	)
 	return args
