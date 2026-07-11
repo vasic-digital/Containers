@@ -148,7 +148,12 @@ func (o *RemoteComposeOrchestrator) Up(
 	// actually changed.
 	args = append(args, "up", "-d", "--build")
 	if project.Services != nil {
-		args = append(args, project.Services...)
+		// RM2-1: service names are caller-controlled and reach the remote
+		// login shell (see projectArgs) — escape each so a name like
+		// "svc; rm -rf /" cannot inject a second command.
+		for _, svc := range project.Services {
+			args = append(args, shellEscape(svc))
+		}
 	}
 
 	cmd := fmt.Sprintf("%s %s",
@@ -227,7 +232,7 @@ func (o *RemoteComposeOrchestrator) Status(
 		// Use podman ps with label filter for podman-compose projects
 		labelFilter := ""
 		if project.Name != "" {
-			labelFilter = fmt.Sprintf("--filter label=com.docker.compose.project=%s", project.Name)
+			labelFilter = fmt.Sprintf("--filter label=com.docker.compose.project=%s", shellEscape(project.Name))
 		}
 		cmdStr = fmt.Sprintf("podman ps -a %s --format '{{.Names}}|{{.State}}|{{.Status}}'", labelFilter)
 	} else if cmd.Binary == "docker-compose" || (cmd.Binary == "docker" && cmd.Subcommand == "compose") {
@@ -241,7 +246,7 @@ func (o *RemoteComposeOrchestrator) Status(
 		// podman compose might delegate to docker-compose, use podman ps directly
 		labelFilter := ""
 		if project.Name != "" {
-			labelFilter = fmt.Sprintf("--filter label=com.docker.compose.project=%s", project.Name)
+			labelFilter = fmt.Sprintf("--filter label=com.docker.compose.project=%s", shellEscape(project.Name))
 		}
 		cmdStr = fmt.Sprintf("podman ps -a %s --format '{{.Names}}|{{.State}}|{{.Status}}'", labelFilter)
 	} else {
@@ -275,7 +280,9 @@ func (o *RemoteComposeOrchestrator) Logs(
 	}
 
 	args := o.projectArgs(project)
-	args = append(args, "logs", "--no-color", service)
+	// RM2-1: the service name is caller-controlled and reaches the remote
+	// login shell (see projectArgs) — escape it to close the injection path.
+	args = append(args, "logs", "--no-color", shellEscape(service))
 
 	cmd := fmt.Sprintf("%s %s",
 		cmdStr, strings.Join(args, " "),
@@ -297,15 +304,23 @@ func (o *RemoteComposeOrchestrator) ComposeCommand(ctx context.Context) (*Compos
 func (o *RemoteComposeOrchestrator) projectArgs(
 	project compose.ComposeProject,
 ) []string {
+	// RM2-1: File/Name/Profile are caller-controlled and get spliced into
+	// the command STRING that Up/Down/Status/Logs hand to executor.Execute,
+	// which runs `ssh <host> <cmd>` — the REMOTE login shell then re-parses
+	// that string. A value with a shell metacharacter (space, `;`, `$()`,
+	// backtick, quote, newline) would inject a second command running with
+	// the SSH user's privileges. shellEscape (single-quote wrap, no-op for
+	// the common `[A-Za-z0-9_/.-]`-only paths/names) closes this the same
+	// way the sibling runtime.go escapes container ids + list filters.
 	var args []string
 	if project.File != "" {
-		args = append(args, "-f", project.File)
+		args = append(args, "-f", shellEscape(project.File))
 	}
 	if project.Name != "" {
-		args = append(args, "--project-name", project.Name)
+		args = append(args, "--project-name", shellEscape(project.Name))
 	}
 	if project.Profile != "" {
-		args = append(args, "--profile", project.Profile)
+		args = append(args, "--profile", shellEscape(project.Profile))
 	}
 	return args
 }

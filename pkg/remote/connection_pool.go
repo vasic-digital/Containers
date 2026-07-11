@@ -183,10 +183,7 @@ func (p *ConnectionPool) Acquire(
 	}
 	p.mu.Unlock()
 
-	socketPath := filepath.Join(
-		p.socketDir,
-		fmt.Sprintf("ctrl-%s-%d", host.Address, host.SSHPort()),
-	)
+	socketPath := p.controlSocketPath(host)
 
 	args := p.masterArgs(host, socketPath)
 	// Only impose a deadline when ConnectTimeout is positive. A zero
@@ -365,6 +362,24 @@ func (p *ConnectionPool) masterArgs(
 		fmt.Sprintf("%s@%s", host.User, host.Address),
 	)
 	return args
+}
+
+// controlSocketPath returns the on-disk ControlMaster socket path for
+// host. RM2-2: the pool KEY (hostKey) is user@address:port, but the
+// socket path historically included ONLY address+port — so two configured
+// hosts that share an address:port but differ in SSH user (e.g.
+// deploy@gpu1:22 and root@gpu1:22) mapped to distinct pool entries yet the
+// SAME socket file. The second host's `-fNM` master dial then collided
+// with the first's live socket (OpenSSH "ControlSocket already exists,
+// disabling multiplexing"), so it could never pool and thrashed on every
+// Acquire. The user is part of the identity, so it MUST be part of the
+// socket name — matching CLAUDE.md's documented "one socket per
+// (user@host:port)" contract.
+func (p *ConnectionPool) controlSocketPath(host RemoteHost) string {
+	return filepath.Join(
+		p.socketDir,
+		fmt.Sprintf("ctrl-%s-%s-%d", host.User, host.Address, host.SSHPort()),
+	)
 }
 
 func hostKey(host RemoteHost) string {

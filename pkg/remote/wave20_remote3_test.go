@@ -149,7 +149,9 @@ func TestCopyFile_ReusesControlMasterSocket(t *testing.T) {
 	require.NoError(t, exec.CopyFile(context.Background(), host, localFile, "/remote/f.txt"))
 
 	argv := readArgvFile(t, argvFile)
-	wantSocket := filepath.Join(socketDir, "ctrl-127.0.0.1-22")
+	// RM2-2 reconcile: the ControlMaster socket path now includes the SSH
+	// user (host.User == "u") so it matches the user@address:port pool key.
+	wantSocket := filepath.Join(socketDir, "ctrl-u-127.0.0.1-22")
 	if !containsSequence(argv, "-o", "ControlPath="+wantSocket) {
 		t.Fatalf("REMOTE-MED-2: CopyFile's scp invocation did not carry "+
 			"-o ControlPath=%s (a live pooled ControlMaster socket); "+
@@ -201,7 +203,9 @@ func TestCopyDir_MatchingBasename_ReusesControlMasterSocket(t *testing.T) {
 	require.NoError(t, exec.CopyDir(context.Background(), host, localDir, remoteDir))
 
 	argv := readArgvFile(t, argvFile)
-	wantSocket := filepath.Join(socketDir, "ctrl-127.0.0.1-22")
+	// RM2-2 reconcile: the ControlMaster socket path now includes the SSH
+	// user (host.User == "u") so it matches the user@address:port pool key.
+	wantSocket := filepath.Join(socketDir, "ctrl-u-127.0.0.1-22")
 	if !containsSequence(argv, "-o", "ControlPath="+wantSocket) {
 		t.Fatalf("REMOTE-MED-2: CopyDir's scp invocation did not carry "+
 			"-o ControlPath=%s (a live pooled ControlMaster socket); "+
