@@ -48,10 +48,44 @@ type FilesystemStore struct {
 // $XDG_CACHE_HOME/vasic-digital/containers-images/ is the production path;
 // tests pass t.TempDir() to isolate.
 func NewFilesystemStore(cacheRoot string) *FilesystemStore {
-	return &FilesystemStore{
+	s := &FilesystemStore{
 		root:       cacheRoot,
 		httpClient: http.DefaultClient,
 		keymus:     make(map[string]*sync.Mutex),
+	}
+	s.sweepStaleIncoming()
+	return s
+}
+
+// sweepStaleIncoming removes leftover "incoming-*" partial-download temp
+// files orphaned by a previous process that crashed (SIGKILL/OOM) between
+// os.CreateTemp and fetchToTemp's terminal rename-or-remove (CA-3, §11.4.14
+// durability). fetchToTemp ALWAYS either renames an "incoming-*" file into
+// place (fetchAndPlace) or os.Removes it on any failure path, so anything
+// still matching "incoming-*" in blobsDir at construction time is, by
+// construction, prior-run debris — never a live in-flight download — for
+// multi-GB qcow2/Android images an unswept orphan is an unbounded disk leak
+// across restarts.
+//
+// This runs exactly once, synchronously, INSIDE NewFilesystemStore, strictly
+// BEFORE the constructed *FilesystemStore is ever handed to a caller — so no
+// concurrent fetchToTemp using THIS store instance can possibly be creating a
+// NEW incoming-* file yet. Best-effort: blobsDir may not exist on a fresh
+// cache root, and a permission error here must not fail construction —
+// fetchAndPlace's own os.MkdirAll(s.blobsDir()) still runs on first fetch
+// either way.
+func (s *FilesystemStore) sweepStaleIncoming() {
+	entries, err := os.ReadDir(s.blobsDir())
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(e.Name(), "incoming-") {
+			_ = os.Remove(filepath.Join(s.blobsDir(), e.Name()))
+		}
 	}
 }
 
@@ -70,6 +104,27 @@ func (s *FilesystemStore) lockPath(sha string) string {
 	return filepath.Join(s.lockfilesDir(), prefix+".lock")
 }
 
+// quarantinePath returns a fresh, not-yet-used quarantine sidecar path for
+// path (CA-4, Wave-20): rename(2) silently OVERWRITES an existing file at its
+// target, so a fixed "path+\".corrupt\"" name would let a second
+// corruption/Verify cycle destroy the first forensic sample. This versions
+// the sidecar name with an incrementing suffix (".corrupt", ".corrupt.1",
+// ".corrupt.2", ...) so every quarantine event's sample survives
+// independently. Called with s's per-SHA flock already held (from Verify),
+// so no two callers can race to pick the same candidate name for this path.
+func (s *FilesystemStore) quarantinePath(path string) string {
+	base := path + ".corrupt"
+	if _, err := os.Stat(base); err != nil {
+		return base
+	}
+	for i := 1; ; i++ {
+		candidate := fmt.Sprintf("%s.%d", base, i)
+		if _, err := os.Stat(candidate); err != nil {
+			return candidate
+		}
+	}
+}
+
 // Durability seams (§11.4.115 structural guard for Wave-20 CACHE-HARD C-1).
 // The fsync/rename operations that make a fetched blob durable are indirected
 // through package-level vars so the crash-durability guard can record their
@@ -84,6 +139,16 @@ var (
 	renameFile = os.Rename
 	syncDir    = fsyncDir
 )
+
+// verifyPostHashHook is a test-only synchronization seam (default no-op),
+// invoked by Verify immediately after it has computed the on-disk hash of
+// the blob and decided drift-vs-match, but BEFORE it acts on that decision
+// (quarantine rename or plain return). Production never overrides this.
+// Wave-20 CA-1's regression guard uses it to hold Verify inside its locked
+// critical section for a controlled window, proving a concurrent Refresh for
+// the SAME content address genuinely blocks on the shared per-SHA flock
+// instead of racing Verify's read-decide-quarantine sequence to completion.
+var verifyPostHashHook = func() {}
 
 // fsyncDir opens dir and fsyncs it so a preceding os.Rename INTO that directory
 // becomes durable (the rename's directory-entry metadata is flushed to stable
@@ -136,6 +201,35 @@ func (s *FilesystemStore) keymu(id string) *sync.Mutex {
 		s.keymus[id] = mu
 	}
 	return mu
+}
+
+// acquireSHALock opens (creating if needed) the per-SHA cross-process lock
+// file at s.lockPath(sha) and takes an exclusive flock on it, returning a
+// release func the caller MUST invoke exactly once (typically via defer)
+// when done. This is the SAME lock fetchAndPlace (Get/Refresh) uses to
+// serialize a fetch/publish for a given content address against any other
+// process, or any other in-process imageID that happens to resolve to the
+// SAME sha256 — content-addressing means two different manifest entries can
+// share one blob path. Verify (CA-1, Wave-20) takes this same lock too, so
+// its read-decide-quarantine sequence can never straddle a concurrent
+// fetchAndPlace publishing a fresh blob for the identical content address.
+func (s *FilesystemStore) acquireSHALock(sha string) (release func(), err error) {
+	if err := os.MkdirAll(s.lockfilesDir(), 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir lockfiles: %w", err)
+	}
+	lockPath := s.lockPath(sha)
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open lock %s: %w", lockPath, err)
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		_ = lockFile.Close()
+		return nil, fmt.Errorf("flock %s: %w", lockPath, err)
+	}
+	return func() {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		_ = lockFile.Close()
+	}, nil
 }
 
 // Get returns the local path of the image's bytes. On cache miss, the
@@ -204,19 +298,11 @@ func (s *FilesystemStore) fetchAndPlace(ctx context.Context, entry *ImageEntry, 
 	if err := os.MkdirAll(s.blobsDir(), 0o755); err != nil {
 		return "", fmt.Errorf("mkdir blobs: %w", err)
 	}
-	if err := os.MkdirAll(s.lockfilesDir(), 0o755); err != nil {
-		return "", fmt.Errorf("mkdir lockfiles: %w", err)
-	}
-	lockPath := s.lockPath(sha)
-	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	release, err := s.acquireSHALock(sha)
 	if err != nil {
-		return "", fmt.Errorf("open lock %s: %w", lockPath, err)
+		return "", err
 	}
-	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		return "", fmt.Errorf("flock %s: %w", lockPath, err)
-	}
-	defer func() { _ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) }()
+	defer release()
 
 	// Re-check fast path AFTER acquiring flock — another process (or,
 	// in-process, a different imageID sharing this same SHA and thus a
@@ -320,6 +406,18 @@ func (s *FilesystemStore) fetchToTemp(ctx context.Context, entry *ImageEntry, sh
 // Verify recomputes the SHA-256 of the cached blob and compares to the
 // manifest. Returns nil iff the blob exists AND its bytes hash to the
 // declared SHA. Used by tooling that audits cache integrity.
+//
+// Concurrency (CA-1, Wave-20): Verify takes the SAME per-imageID in-process
+// mutex AND the SAME cross-process per-SHA flock that fetchAndPlace
+// (Get/Refresh) uses, acquired BEFORE the open→hash→(if drift)quarantine
+// sequence below and held across all of it. Without this, a concurrent
+// Get/Refresh could publish a fresh, verified blob for the identical content
+// address BETWEEN Verify's hash and Verify's quarantine rename — Verify's
+// quarantine acts on "whatever is currently at path", so the fresh good blob
+// could be quarantined based on Verify's stale (pre-replacement) read, or a
+// Get caller mid-use of the fast-path hit could have its file yanked out.
+// Holding both locks for the full sequence makes it atomic against any other
+// caller touching this exact content address.
 func (s *FilesystemStore) Verify(ctx context.Context, m *Manifest, imageID string) error {
 	entry, err := m.FindByID(imageID)
 	if err != nil {
@@ -329,6 +427,17 @@ func (s *FilesystemStore) Verify(ctx context.Context, m *Manifest, imageID strin
 	if err != nil {
 		return fmt.Errorf("verify %q: %w", entry.ID, err)
 	}
+
+	mu := s.keymu(imageID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	release, err := s.acquireSHALock(sha)
+	if err != nil {
+		return fmt.Errorf("verify %q: %w", entry.ID, err)
+	}
+	defer release()
+
 	path := s.blobPath(sha)
 	f, err := os.Open(path)
 	if err != nil {
@@ -343,20 +452,31 @@ func (s *FilesystemStore) Verify(ctx context.Context, m *Manifest, imageID strin
 		return fmt.Errorf("verify %q: %w", entry.ID, copyErr)
 	}
 	got := hex.EncodeToString(hasher.Sum(nil))
+	verifyPostHashHook()
 	if got != sha {
 		// SHA drift: the cached blob's bytes no longer hash to the declared
 		// SHA (on-disk corruption / bit-rot / partial write). Get's fast path
 		// never re-hashes a cached blob, so leaving the poisoned blob in place
 		// would serve it forever as "verified" (breaking the package's
-		// integrity property). Quarantine it aside to a .corrupt sidecar
-		// (matching pkg/serviceregistry's corrupt-file convention) so a
+		// integrity property). Quarantine it aside to a versioned .corrupt
+		// sidecar (CA-4: a fixed name would let rename(2) silently clobber an
+		// earlier forensic sample on a second corruption/Verify cycle) so a
 		// subsequent Get misses the fast path and re-fetches a good copy,
-		// while the corrupt bytes are preserved for forensic recovery. If the
-		// move-aside fails, fall back to removing the blob so a re-fetch can
-		// still recover. The drift error is returned either way.
-		quarantine := path + ".corrupt"
-		if renameErr := os.Rename(path, quarantine); renameErr != nil {
+		// while the corrupt bytes are preserved for forensic recovery. The
+		// rename goes through the same renameFile seam fetchAndPlace's
+		// publish uses, followed by a syncDir(blobsDir) fsync (CA-2:
+		// os.Rename gives atomicity, not durability — without the following
+		// dir-fsync a crash between the quarantine rename and the flush can
+		// leave the corrupt blob back at path on recovery, silently undoing
+		// the quarantine). If the move-aside fails, fall back to removing the
+		// blob so a re-fetch can still recover. The drift error is returned
+		// either way.
+		quarantine := s.quarantinePath(path)
+		if renameErr := renameFile(path, quarantine); renameErr != nil {
 			_ = os.Remove(path)
+		} else if syncErr := syncDir(s.blobsDir()); syncErr != nil {
+			return fmt.Errorf("verify %q: SHA256 drift (got %s, want %s); quarantine dir-fsync failed: %w",
+				entry.ID, got, sha, syncErr)
 		}
 		return fmt.Errorf("verify %q: SHA256 drift (got %s, want %s)",
 			entry.ID, got, sha)
