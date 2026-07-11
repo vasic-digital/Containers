@@ -302,3 +302,120 @@ func TestRTRace1_DirectAccessRacesWithSetRuntimePriority(t *testing.T) {
 
 	<-done
 }
+
+// --- RT-DOCKER-1 (fixed) -----------------------------------------------------
+//
+// parseDockerPSOutput decoded `docker`/`nerdctl` `ps --format json`'s
+// `CreatedAt` field into dockerPSJSON.Created but never assigned it to
+// ContainerInfo.Created — so DockerRuntime.List AND NerdctlRuntime.List (both
+// route through parseDockerPSOutput) reported the zero time for every listed
+// container, while the sibling Podman/CRI-O/LXD/Kubernetes List paths all
+// populate Created. Same defect class as the already-fixed RT-PODMAN-1, left
+// unfixed in the docker/nerdctl parser. Real CreatedAt shape captured in this
+// repo's own real-runtime fixtures (pkg/ctop/wave18_real_runtime_output_test.go
+// + pkg/ctop/ctop_test.go): "2024-01-01 00:00:00 +0000 UTC" — Go's
+// time.Time.String() layout, which is NOT RFC3339 and needs its own layout.
+
+// realDockerPSWithCreatedAt is a REAL `docker ps --format json` NDJSON record
+// (trimmed) whose CreatedAt uses the exact Go time.String() shape docker emits.
+const realDockerPSWithCreatedAt = `{"ID":"abc123def456","Names":"web-1","Image":"nginx:latest","State":"running","Status":"Up 2 hours","CreatedAt":"2024-01-01 00:00:00 +0000 UTC","Labels":"role=web","Ports":"0.0.0.0:8080->80/tcp"}`
+
+func TestWave20_RT_DockerList_CreatedFromRealCreatedAtField(t *testing.T) {
+	e := &mockExecutor{
+		executeFunc: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			return []byte(realDockerPSWithCreatedAt), nil
+		},
+	}
+	d := NewDockerRuntimeWithExecutor(e)
+
+	containers, err := d.List(context.Background(), ListFilter{All: true})
+	require.NoError(t, err)
+	require.Len(t, containers, 1)
+
+	assert.False(t, containers[0].Created.IsZero(),
+		"Created must be populated from the real docker CreatedAt wire field, "+
+			"not left at the zero value")
+	// 2024-01-01T00:00:00Z == unix 1704067200 (exact-instant proof, not just non-zero).
+	assert.Equal(t, int64(1704067200), containers[0].Created.Unix())
+}
+
+// TestWave20_RT_NerdctlList_CreatedPopulated proves the same fix reaches
+// NerdctlRuntime.List, which shares parseDockerPSOutput.
+func TestWave20_RT_NerdctlList_CreatedPopulated(t *testing.T) {
+	e := &mockExecutor{
+		executeFunc: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			return []byte(realDockerPSWithCreatedAt), nil
+		},
+	}
+	n := NewNerdctlRuntimeWithExecutor(e)
+
+	containers, err := n.List(context.Background(), ListFilter{})
+	require.NoError(t, err)
+	require.Len(t, containers, 1)
+	assert.Equal(t, int64(1704067200), containers[0].Created.Unix(),
+		"NerdctlRuntime.List must populate Created via the shared parser too")
+}
+
+func TestWave20_RT_ParseDockerCreatedAt_UnparseableYieldsZero(t *testing.T) {
+	// Empty, human-relative, and date-only (the existing test-fixture shape)
+	// values are all best-effort → zero time, never a parse-panic or error.
+	assert.True(t, parseDockerCreatedAt("").IsZero())
+	assert.True(t, parseDockerCreatedAt("5 days ago").IsZero())
+	assert.True(t, parseDockerCreatedAt("not-a-time").IsZero())
+	// RFC3339 variant is tolerated alongside the docker String() shape.
+	rfc := parseDockerCreatedAt("2024-01-01T00:00:00Z")
+	assert.Equal(t, int64(1704067200), rfc.Unix())
+}
+
+// --- RT-DOCKER-2 (fixed) -----------------------------------------------------
+//
+// parseDockerPSOutput decoded `docker`/`nerdctl` `ps --format json`'s `Ports`
+// field into dockerPSJSON.Ports but never assigned it to ContainerInfo.Ports —
+// so List always returned an empty Ports slice even though the container's
+// published-port data was present in the output. Real Ports shape captured in
+// pkg/ctop/wave18_real_runtime_output_test.go: "0.0.0.0:8080->80/tcp".
+
+func TestWave20_RT_DockerList_PortsFromRealPortsField(t *testing.T) {
+	e := &mockExecutor{
+		executeFunc: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			return []byte(realDockerPSWithCreatedAt), nil
+		},
+	}
+	d := NewDockerRuntimeWithExecutor(e)
+
+	containers, err := d.List(context.Background(), ListFilter{All: true})
+	require.NoError(t, err)
+	require.Len(t, containers, 1)
+
+	require.Len(t, containers[0].Ports, 1,
+		"the published port mapping decoded from the Ports field must reach "+
+			"ContainerInfo.Ports, not be dropped")
+	p := containers[0].Ports[0]
+	assert.Equal(t, "0.0.0.0", p.HostIP)
+	assert.Equal(t, "8080", p.HostPort)
+	assert.Equal(t, "80", p.ContainerPort)
+	assert.Equal(t, "tcp", p.Protocol)
+}
+
+// TestWave20_RT_ParseDockerPortsMapping_MultipleAndUnpublished proves the
+// parser reports every published (`->`) mapping and skips exposed-but-
+// unpublished ("80/tcp") entries rather than fabricating a host port.
+func TestWave20_RT_ParseDockerPortsMapping_MultipleAndUnpublished(t *testing.T) {
+	got := parseDockerPortsMapping("0.0.0.0:8080->80/tcp, :::8080->80/tcp, 9000/tcp")
+	require.Len(t, got, 2, "two published mappings; the bare 9000/tcp is skipped")
+
+	assert.Equal(t, "0.0.0.0", got[0].HostIP)
+	assert.Equal(t, "8080", got[0].HostPort)
+	assert.Equal(t, "80", got[0].ContainerPort)
+	assert.Equal(t, "tcp", got[0].Protocol)
+
+	// The IPv6 host side "::" ends in ':' before the last colon; the parser
+	// takes the segment after the LAST colon as the host port.
+	assert.Equal(t, "8080", got[1].HostPort)
+	assert.Equal(t, "80", got[1].ContainerPort)
+
+	assert.Nil(t, parseDockerPortsMapping(""),
+		"empty Ports string yields no mappings")
+	assert.Nil(t, parseDockerPortsMapping("80/tcp"),
+		"an exposed-but-unpublished port has no host binding to report")
+}
