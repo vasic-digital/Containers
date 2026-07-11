@@ -65,6 +65,19 @@ func NewCuttlefish(cfg Config) (*Cuttlefish, error) {
 	if len(cfg.Groups) == 0 {
 		cfg.Groups = DefaultGroups()
 	}
+	// CF2-1 (§11.4.108 documented-default-that-does-nothing): Config.NetworkHost
+	// is documented "default true" ("Cuttlefish requires it") yet was never
+	// defaulted anywhere — a caller that omits it (bool zero value = false)
+	// launched a container WITHOUT `--network host`, so cvd networking / the
+	// cvd-ebr bridge fails and the device never comes online, while Launch still
+	// reports Started=true (the SOURCE-says-default-true vs ARTIFACT-omits-the-
+	// flag gap). Default it to true here, alongside every other required default
+	// above and mirroring the Privileged reject-if-false precedent. A test that
+	// asserts the negative uses the pure buildContainerRunArgs builder directly,
+	// which still honours an explicit false.
+	if !cfg.NetworkHost {
+		cfg.NetworkHost = true
+	}
 	if cfg.ADBSerial == "" {
 		cfg.ADBSerial = DefaultADBSerial
 	}
@@ -316,6 +329,19 @@ func buildContainerRunArgs(
 	for _, g := range groups {
 		args = append(args, "--group-add", g)
 	}
+	// CF2-2 (security, argv flag-injection — direct mirror of pkg/emulator
+	// EMU2-1 (containerized.go) / pkg/crossbuild XBUILD2-2 (container_runner.go,
+	// apple_container.go) + the module OR-1/RM2/NET3 arg-injection hardenings,
+	// applied to the Cuttlefish container path those fixes never touched):
+	// terminate `podman/docker run` option parsing with an explicit
+	// end-of-options "--" BEFORE the image positional. `image` flows unsanitized
+	// from Config.Image; a crafted or typo'd reference beginning with '-' (e.g.
+	// "--privileged", "--network=host", "-v/:/host") would otherwise be parsed
+	// by the container CLI as a RUNTIME FLAG rather than the image name — a
+	// privilege/mount/network-escalation vector. The "--" forces it to be a
+	// positional, so the worst outcome of a hostile ref is an honest "no such
+	// image", never an escalation.
+	args = append(args, "--")
 	args = append(args, image)
 	return args
 }
