@@ -43,6 +43,7 @@ type Display struct {
 }
 
 func NewDisplay(collector *Collector, config DisplayConfig) *Display {
+	config.RefreshRate = sanitizeRefreshRate(config.RefreshRate)
 	return &Display{
 		collector: collector,
 		config:    config,
@@ -53,6 +54,7 @@ func NewDisplay(collector *Collector, config DisplayConfig) *Display {
 }
 
 func NewDisplayWithWriter(collector *Collector, config DisplayConfig, w io.Writer) *Display {
+	config.RefreshRate = sanitizeRefreshRate(config.RefreshRate)
 	return &Display{
 		collector: collector,
 		config:    config,
@@ -60,6 +62,18 @@ func NewDisplayWithWriter(collector *Collector, config DisplayConfig, w io.Write
 		sortBy:    config.SortBy,
 		sortOrder: config.SortOrder,
 	}
+}
+
+// sanitizeRefreshRate clamps a configured refresh rate (milliseconds) to a
+// usable positive value. CT2-4: `time.NewTicker` panics on a duration <= 0,
+// so a zero-value (or negative) `DisplayConfig.RefreshRate` — e.g. from a
+// partial `DisplayConfig{}` literal — must never reach `time.NewTicker`
+// directly; fall back to `DefaultDisplayConfig()`'s rate instead.
+func sanitizeRefreshRate(ms int) int {
+	if ms <= 0 {
+		return DefaultDisplayConfig().RefreshRate
+	}
+	return ms
 }
 
 func (d *Display) Run(ctx context.Context) error {
@@ -80,11 +94,20 @@ func (d *Display) Run(ctx context.Context) error {
 	}()
 
 	ctx, cancel := context.WithCancel(ctx)
+	// CT2-3: publish d.cancel under d.mu — Stop() reads it under d.mu, and an
+	// unsynchronized write here is a data race against a concurrent Stop()
+	// call in the canonical `go d.Run(ctx)` + `d.Stop()` pattern.
+	d.mu.Lock()
 	d.cancel = cancel
+	d.mu.Unlock()
 	defer cancel()
 
+	// CT2-2: SIGWINCH (terminal resize) MUST NOT be treated as a quit signal.
+	// It shares no channel with the quit signals below; `render()` already
+	// calls `d.updateSize()` on every refresh tick, so a resize is picked up
+	// at the next tick without any dedicated redraw plumbing.
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigChan)
 
 	d.hideCursor()
@@ -92,10 +115,13 @@ func (d *Display) Run(ctx context.Context) error {
 
 	d.updateSize()
 
-	ticker := time.NewTicker(time.Duration(d.config.RefreshRate) * time.Millisecond)
+	refreshRate := sanitizeRefreshRate(d.config.RefreshRate)
+	renderTimeout := boundedRenderTimeout(refreshRate)
+
+	ticker := time.NewTicker(time.Duration(refreshRate) * time.Millisecond)
 	defer ticker.Stop()
 
-	d.render(ctx)
+	d.renderBounded(ctx, renderTimeout)
 
 	for {
 		select {
@@ -104,9 +130,45 @@ func (d *Display) Run(ctx context.Context) error {
 		case <-sigChan:
 			return nil
 		case <-ticker.C:
-			d.render(ctx)
+			d.renderBounded(ctx, renderTimeout)
 		}
 	}
+}
+
+// renderBounded runs render() under a per-refresh timeout derived from the
+// display's refresh rate (CT2-1). Without this bound, `render()` calls
+// `collector.Collect(ctx)` synchronously, which can block on a wedged
+// subprocess (podman/docker ps|stats); while blocked, Run()'s single
+// goroutine is NOT in its `select`, so a SIGINT/SIGTERM sitting in the
+// (unread) `sigChan` cannot be translated into a `cancel()` call and the
+// whole TUI — including Ctrl+C — freezes. Bounding each refresh guarantees
+// Run() returns to its `select` (and can react to `sigChan`/`ctx.Done()`)
+// within `timeout` regardless of how long the underlying command wedges.
+// Cancelling the parent ctx (via Stop() or an already-cancelled caller
+// context) still unblocks it immediately, since renderCtx is a child of ctx.
+func (d *Display) renderBounded(ctx context.Context, timeout time.Duration) {
+	renderCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	d.render(renderCtx)
+}
+
+// boundedRenderTimeout derives a per-refresh Collect timeout from the
+// configured refresh rate, with a floor (a very fast refresh rate must not
+// starve a legitimately-slow but healthy collector call) and a ceiling (a
+// very slow refresh rate must not let a wedged call block the render loop —
+// and hence Ctrl+C — for an unreasonable duration).
+func boundedRenderTimeout(refreshRateMS int) time.Duration {
+	const floor = 500 * time.Millisecond
+	const ceiling = 10 * time.Second
+
+	timeout := time.Duration(refreshRateMS) * time.Millisecond
+	if timeout < floor {
+		timeout = floor
+	}
+	if timeout > ceiling {
+		timeout = ceiling
+	}
+	return timeout
 }
 
 func (d *Display) Stop() {

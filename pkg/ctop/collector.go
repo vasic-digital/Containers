@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -80,12 +81,17 @@ func (c *Collector) Collect(ctx context.Context) (*ContainerProcessList, error) 
 	}
 
 	if c.hostManager != nil {
-		remoteProcs, err := c.collectRemote(ctx)
+		remoteProcs, failedHosts, err := c.collectRemote(ctx)
 		if err != nil {
 			errors++
 		} else {
 			processes = append(processes, remoteProcs...)
 		}
+		// CT2-5: a per-host collection failure (host unreachable, SSH
+		// executor unavailable, remote command failure) must be visible in
+		// CollectorStats.Errors — silently dropping it made a total remote
+		// wipeout indistinguishable from a healthy zero-remote-hosts run.
+		errors += failedHosts
 	}
 
 	running, stopped := 0, 0
@@ -168,13 +174,20 @@ func (c *Collector) collectLocal(ctx context.Context) ([]ContainerProcess, error
 	return containers, nil
 }
 
-func (c *Collector) collectRemote(ctx context.Context) ([]ContainerProcess, error) {
+// collectRemote fans out container collection to every registered remote
+// host in parallel. It returns the aggregated processes AND the count of
+// hosts that failed (CT2-5) — a failed host is no longer silently dropped;
+// its failure is counted so the caller can surface it via
+// CollectorStats.Errors instead of a total remote wipeout looking identical
+// to a healthy zero-remote-hosts run.
+func (c *Collector) collectRemote(ctx context.Context) ([]ContainerProcess, int, error) {
 	if c.hostManager == nil {
-		return nil, nil
+		return nil, 0, nil
 	}
 
 	hosts := c.hostManager.ListHosts()
 	var allProcesses []ContainerProcess
+	var failed int
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -185,6 +198,10 @@ func (c *Collector) collectRemote(ctx context.Context) ([]ContainerProcess, erro
 
 			processes, err := c.collectFromHost(ctx, host)
 			if err != nil {
+				log.Printf("ctop: collectRemote: host %s: %v", host.Name, err)
+				mu.Lock()
+				failed++
+				mu.Unlock()
 				return
 			}
 
@@ -195,7 +212,7 @@ func (c *Collector) collectRemote(ctx context.Context) ([]ContainerProcess, erro
 	}
 
 	wg.Wait()
-	return allProcesses, nil
+	return allProcesses, failed, nil
 }
 
 func (c *Collector) collectFromHost(ctx context.Context, host remote.RemoteHost) ([]ContainerProcess, error) {
