@@ -18,6 +18,15 @@ type HealthStatus struct {
 	Message string
 }
 
+// defaultInfraCheckTimeout is the fallback per-attempt timeout applied by
+// checkOnce when a HelixServiceHealthChecker is constructed with an unset
+// (<=0) Timeout. It mirrors defaultTCPTimeout / defaultHTTPTimeout /
+// defaultGRPCTimeout in the sibling checkers so the whole pkg/health package
+// shares one "timeout <= 0 means use a default" convention. Without it,
+// context.WithTimeout(ctx, 0) is immediately-expired and every check against
+// a LIVE target fails with a false "deadline exceeded" (Wave-20 HEALTH2-1).
+const defaultInfraCheckTimeout = 5 * time.Second
+
 // HelixServiceHealthChecker implements HealthChecker for a Helix infrastructure service.
 type HelixServiceHealthChecker struct {
 	ServiceName string
@@ -141,7 +150,17 @@ func (h *HelixServiceHealthChecker) Check(ctx context.Context) (HealthStatus, er
 }
 
 func (h *HelixServiceHealthChecker) checkOnce(ctx context.Context) (HealthStatus, error) {
-	ctx, cancel := context.WithTimeout(ctx, h.Timeout)
+	// An unset (<=0) Timeout must fall back to a package default — every
+	// sibling checker (CheckTCP / CheckHTTP / DefaultChecker.Check) applies
+	// this convention. Without it, context.WithTimeout(ctx, 0) is
+	// immediately-expired, so the dial / HTTP request against a LIVE target
+	// fails with a false "deadline exceeded" and a genuinely-healthy service
+	// is reported UNHEALTHY — a §11.4.1 FAIL-bluff (Wave-20 HEALTH2-1).
+	timeout := h.Timeout
+	if timeout <= 0 {
+		timeout = defaultInfraCheckTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	addr := net.JoinHostPort(h.Host, fmt.Sprintf("%d", h.Port))
@@ -152,8 +171,8 @@ func (h *HelixServiceHealthChecker) checkOnce(ctx context.Context) (HealthStatus
 		// context and cannot observe cancellation) so the ctx above
 		// (already timeout-bounded, and cancellable by the caller) can
 		// abort the dial promptly instead of always blocking for the
-		// full h.Timeout (Wave-20 HE-1).
-		dialer := &net.Dialer{Timeout: h.Timeout}
+		// full timeout (Wave-20 HE-1).
+		dialer := &net.Dialer{Timeout: timeout}
 		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			return HealthStatus{Healthy: false, Message: err.Error()}, err
@@ -168,7 +187,7 @@ func (h *HelixServiceHealthChecker) checkOnce(ctx context.Context) (HealthStatus
 			return HealthStatus{Healthy: false, Message: err.Error()}, err
 		}
 		client := &http.Client{
-			Timeout: h.Timeout,
+			Timeout: timeout,
 			// Do not transparently follow redirects (HE-3): the message
 			// below reports the status as if it came from addr/url — a
 			// silently-followed redirect could hand back a DIFFERENT
