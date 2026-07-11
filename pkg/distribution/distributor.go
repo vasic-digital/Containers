@@ -760,28 +760,43 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// buildRemoteRemoveCommand renders the pre-deploy `rm -f` command. The
-// container Name is untrusted registry/requirement input, so it is shell
-// quoted before interpolation. Pure function so the built string is unit
-// testable without a live executor (§11.4.115).
+// buildRemoteRemoveCommand renders the pre-deploy `rm -f` command. BOTH the
+// runtime (rt = host.Runtime, an unvalidated CONTAINERS_REMOTE_HOST_N_RUNTIME
+// env-config value) and the container Name (untrusted registry/requirement
+// input) are interpolated into a string that ssh_executor.Execute hands to the
+// REMOTE login shell verbatim (`ssh host <cmd>` re-parses the string), so BOTH
+// MUST be shell quoted before interpolation. Leaving rt raw while quoting name
+// was the §11.4.108 injection inconsistency the ARGSWEEP audit flagged (RT3): a
+// host.Runtime like `docker;touch /pwn` would run the injected 2nd command on
+// the remote host. Quoting is non-breaking because the LOCAL path already
+// treats rt as a single executable token (exec.CommandContext(ctx, rt, ...)),
+// so 'docker'/'podman' resolve identically. Pure function so the built string
+// is unit testable without a live executor (§11.4.115).
 func buildRemoteRemoveCommand(rt, name string) string {
 	return fmt.Sprintf(
 		"%s rm -f %s 2>/dev/null || true",
-		rt, shellQuote(name),
+		shellQuote(rt), shellQuote(name),
 	)
 }
 
-// buildRemoteRunCommand renders the remote `run -d` command. Name and Image
-// are untrusted registry/requirement input and are shell quoted; the publish
-// flags are already allowlist-safe (buildPublishFlags); rt is host-config.
-// Pure function so the built string is unit testable without a live executor
-// (§11.4.115).
+// buildRemoteRunCommand renders the remote `run -d` command. rt (host.Runtime,
+// an unvalidated CONTAINERS_REMOTE_HOST_N_RUNTIME env-config value), Name, and
+// Image are ALL interpolated into a string ssh_executor.Execute hands to the
+// REMOTE login shell verbatim (`ssh host <cmd>` re-parses the string), so ALL
+// THREE MUST be shell quoted. Leaving rt raw while quoting name/image was the
+// §11.4.108 injection inconsistency the ARGSWEEP audit flagged (SITE 4b): a
+// host.Runtime like `docker;touch /pwn` would run the injected 2nd command on
+// the remote host. The publish flags are allowlist-safe (buildPublishFlags).
+// Quoting rt is non-breaking because the LOCAL path treats it as a single
+// executable token (exec.CommandContext(ctx, rt, ...)), so 'docker'/'podman'
+// resolve identically. Pure function so the built string is unit testable
+// without a live executor (§11.4.115).
 func buildRemoteRunCommand(
 	rt, name, image string, ports []scheduler.PortMapping,
 ) string {
 	return fmt.Sprintf(
 		"%s run -d --name %s%s %s",
-		rt, shellQuote(name),
+		shellQuote(rt), shellQuote(name),
 		buildPublishFlags(ports),
 		shellQuote(image),
 	)
