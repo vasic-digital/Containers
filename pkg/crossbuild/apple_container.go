@@ -170,7 +170,7 @@ func (a *AppleContainerBackend) Build(ctx context.Context, req BuildRequest) Bui
 	}
 
 	dst := filepath.Join(req.HostOutputDir, filepath.Base(produced))
-	if err := copyFile(produced, dst); err != nil {
+	if err := copyFile(req.SourceDir, req.OutputSubpath, dst); err != nil {
 		result.Error = fmt.Errorf("copying artifact to HostOutputDir: %w", err)
 		return result
 	}
@@ -289,6 +289,20 @@ func (realAppleContainerRunner) ImageExists(ctx context.Context, imageRef string
 	// `container image list` prints NAME/TAG columns. Match the
 	// repo+tag substring of the ref against the listing.
 	cmd := exec.CommandContext(ctx, appleContainerBinary, "image", "list")
+	// XB3-2: this method captures Stdout/Stderr into a bytes.Buffer, so
+	// cmd.Wait() blocks on pipe-EOF — which never arrives while ANY
+	// fd-inheriting descendant of "container image list" is still
+	// alive — until every such descendant exits, ignoring ctx entirely.
+	// This is called from EVERY Build() (before the actual build even
+	// starts), so a wedged "image list" hangs the whole backend past
+	// its declared Timeout, exactly the XB2-1 finding this sibling
+	// method had been left out of. WaitDelay bounds the pipe-drain
+	// wait; configureProcessGroup ensures ctx cancellation/WaitDelay
+	// expiry kills this command's WHOLE process group, not just the
+	// direct child, mirroring the identical guard already present on
+	// realAppleContainerRunner.Run below.
+	cmd.WaitDelay = subprocessWaitDelay
+	configureProcessGroup(cmd)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -358,6 +372,16 @@ func (r realAppleContainerRunner) Run(ctx context.Context, spec appleContainerRu
 
 	var lastExit int = -1
 	var lastErr error
+	// XB3-4 (§11.4.108 honesty): captured whenever a genuine mount-flag
+	// rejection triggers a fallback retry, BEFORE the shared spec.Stdout/
+	// spec.Stderr buffers are cleared for that retry. The caller
+	// (Build()) reads spec.Stdout/spec.Stderr AFTER Run returns to build
+	// BuildResult.StdoutTail/StderrTail — if the fallback attempt ALSO
+	// fails, those buffers must not silently contain ONLY the fallback's
+	// output with the first (real, potentially more informative)
+	// attempt's diagnostics destroyed by an unconditional Reset.
+	var firstAttemptStdout, firstAttemptStderr string
+	retried := false
 	for _, mode := range modes {
 		args := buildRunArgs(spec, mode)
 		cmd := exec.CommandContext(ctx, appleContainerBinary, args...)
@@ -367,8 +391,15 @@ func (r realAppleContainerRunner) Run(ctx context.Context, spec appleContainerRu
 		// realContainerRunner.Run.
 		cmd.WaitDelay = subprocessWaitDelay
 		configureProcessGroup(cmd)
-		cmd.Stdout = spec.Stdout
-		cmd.Stderr = spec.Stderr
+		// XB3-5: bound retained memory (see host_direct.go's
+		// boundedBufferWriter doc) rather than handing the in-container
+		// build command a direct, uncapped pointer into spec.Stdout/
+		// Stderr for the full 30-45 min run. mountFlagRejected(spec.
+		// Stderr) below still reads the SAME underlying *bytes.Buffer
+		// this wrapper writes into, so the mount-flag-rejection check
+		// keeps seeing everything captured.
+		cmd.Stdout = &boundedBufferWriter{buf: spec.Stdout, budget: maxCapturedOutputBytes}
+		cmd.Stderr = &boundedBufferWriter{buf: spec.Stderr, budget: maxCapturedOutputBytes}
 		err := cmd.Run()
 		exitCode := 0
 		if cmd.ProcessState != nil {
@@ -387,11 +418,46 @@ func (r realAppleContainerRunner) Run(ctx context.Context, spec appleContainerRu
 		if !mountFlagRejected(spec.Stderr) {
 			break
 		}
-		// Reset buffers before retrying with the fallback mount form.
+		// Preserve this attempt's diagnostics BEFORE clearing the
+		// buffers for the fallback mount-mode retry (XB3-4) — a blind
+		// Reset here, with nothing recorded, would silently destroy
+		// the first attempt's real diagnostics if the fallback also
+		// fails below.
+		retried = true
+		firstAttemptStdout = spec.Stdout.String()
+		firstAttemptStderr = spec.Stderr.String()
 		spec.Stdout.Reset()
 		spec.Stderr.Reset()
 	}
+	if retried && lastErr != nil {
+		// The fallback attempt ALSO failed: restore the first attempt's
+		// diagnostics ahead of the fallback's own (still-buffered)
+		// output rather than leaving the caller with only the last
+		// attempt's tail — the caller must be able to see BOTH what the
+		// rejected --mount attempt reported AND what the fallback
+		// attempt reported, never silently just the latter.
+		restoreDiagnostics(spec.Stdout, firstAttemptStdout)
+		restoreDiagnostics(spec.Stderr, firstAttemptStderr)
+	}
 	return lastExit, lastErr
+}
+
+// restoreDiagnostics prepends `first` (a prior attempt's captured
+// output) ahead of buf's CURRENT content (the most recent attempt's
+// output), labelling the boundary so a human or log-scraper can tell
+// the two attempts apart. If `first` is empty (the first attempt
+// produced no output on this stream) buf is left untouched.
+func restoreDiagnostics(buf *bytes.Buffer, first string) {
+	if first == "" {
+		return
+	}
+	rest := buf.String()
+	buf.Reset()
+	buf.WriteString(first)
+	if rest != "" {
+		buf.WriteString("\n--- retry (fallback mount mode) ---\n")
+		buf.WriteString(rest)
+	}
 }
 
 // mountFlagRejected heuristically detects that the installed
@@ -399,15 +465,38 @@ func (r realAppleContainerRunner) Run(ctx context.Context, spec appleContainerRu
 // runner should retry with the short -v form. Per §11.4.6 this is the
 // ONLY fallback trigger — a genuine in-container command failure must
 // not be masked by a retry.
+//
+// XB3-4 (§11.4.108 honesty): the predicate scans LINE BY LINE, not the
+// whole buffer, and requires "mount" and a rejection word to co-occur on
+// the SAME line. Scanning the entire combined stderr for co-occurrence
+// anywhere false-positives on ordinary, UNRELATED log noise landing on
+// separate lines — e.g. a benign "mount namespace setup complete" line
+// followed much later by an unrelated "invalid configuration" line from
+// the in-container command itself: neither line alone says "the --mount
+// flag was rejected", but the old whole-buffer scan saw "mount" and
+// "invalid" BOTH present somewhere and (wrongly) triggered a retry,
+// which threw away the first attempt's REAL diagnostics (see Run's
+// diagnostics-preservation comment below) for no reason. A genuine
+// mount-flag rejection message (e.g. "Error: unknown flag --mount",
+// "unsupported mount type") always states the flag name/kind and the
+// rejection reason TOGETHER on one line — that is exactly what this
+// tightened predicate still catches.
 func mountFlagRejected(stderr *bytes.Buffer) bool {
 	if stderr == nil {
 		return false
 	}
-	s := strings.ToLower(stderr.String())
-	return strings.Contains(s, "mount") &&
-		(strings.Contains(s, "unknown") ||
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		s := strings.ToLower(line)
+		if !strings.Contains(s, "mount") {
+			continue
+		}
+		if strings.Contains(s, "unknown") ||
 			strings.Contains(s, "unsupported") ||
 			strings.Contains(s, "invalid") ||
 			strings.Contains(s, "unrecognized") ||
-			strings.Contains(s, "unexpected"))
+			strings.Contains(s, "unexpected") {
+			return true
+		}
+	}
+	return false
 }

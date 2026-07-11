@@ -117,6 +117,16 @@ func (realContainerRunner) ImageExists(ctx context.Context, imageRef string) boo
 		return false
 	}
 	cmd := exec.CommandContext(ctx, binary, "image", "exists", imageRef)
+	// XB3-3 (§11.4.14 no-leak): without configureProcessGroup, ctx
+	// cancellation only signals cmd.Process (the direct "podman"/
+	// "docker" child) — any descendant it spawned that outlives the
+	// direct child (e.g. a backgrounded helper process) is orphaned
+	// rather than killed. WaitDelay is added for consistency with every
+	// other real*Runner in this package (Run() below, realRunner.Run,
+	// realAppleContainerRunner.Run/ImageExists) even though this call
+	// does not itself capture Stdout/Stderr into a buffer.
+	cmd.WaitDelay = subprocessWaitDelay
+	configureProcessGroup(cmd)
 	return cmd.Run() == nil
 }
 
@@ -146,8 +156,12 @@ func (realContainerRunner) Run(ctx context.Context, spec containerRunSpec) (int,
 	// are still holding the stdout/stderr pipes open.
 	cmd.WaitDelay = subprocessWaitDelay
 	configureProcessGroup(cmd)
-	cmd.Stdout = spec.Stdout
-	cmd.Stderr = spec.Stderr
+	// XB3-5: bound retained memory (see host_direct.go's
+	// boundedBufferWriter doc) rather than handing the in-container
+	// build command a direct, uncapped pointer into spec.Stdout/Stderr
+	// for the full 30-45 min run.
+	cmd.Stdout = &boundedBufferWriter{buf: spec.Stdout, budget: maxCapturedOutputBytes}
+	cmd.Stderr = &boundedBufferWriter{buf: spec.Stderr, budget: maxCapturedOutputBytes}
 	err := cmd.Run()
 	exitCode := 0
 	if cmd.ProcessState != nil {

@@ -158,7 +158,7 @@ func (l *LinuxContainerBackend) Build(ctx context.Context, req BuildRequest) Bui
 	}
 
 	dst := filepath.Join(req.HostOutputDir, filepath.Base(produced))
-	if err := copyFile(produced, dst); err != nil {
+	if err := copyFile(req.SourceDir, req.OutputSubpath, dst); err != nil {
 		result.Error = fmt.Errorf("copying artifact to HostOutputDir: %w", err)
 		return result
 	}

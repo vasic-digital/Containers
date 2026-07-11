@@ -95,7 +95,7 @@ func (h *HostDirectBackend) Build(ctx context.Context, req BuildRequest) BuildRe
 
 	// Copy from SourceDir/OutputSubpath to HostOutputDir/<basename>.
 	dst := filepath.Join(req.HostOutputDir, filepath.Base(produced))
-	if err := copyFile(produced, dst); err != nil {
+	if err := copyFile(req.SourceDir, req.OutputSubpath, dst); err != nil {
 		result.Error = fmt.Errorf("copying artifact to HostOutputDir: %w", err)
 		return result
 	}
@@ -124,6 +124,60 @@ type processRunner interface {
 // pkg/runtime/docker.go's defaultExecutor.
 const subprocessWaitDelay = 2 * time.Second
 
+// maxCapturedOutputBytes bounds how many bytes of a build command's
+// stdout/stderr are RETAINED in memory at once by boundedBufferWriter
+// (XB3-5, §11.4.85 stress mandate). A build can run for 30-45 minutes;
+// attaching a plain, uncapped bytes.Buffer as Cmd.Stdout/Stderr means a
+// flooding or misbehaving build tool (an infinite log loop, a runaway
+// verbose flag, a fork-bombing test harness echoing to its own stdout)
+// can grow that buffer without bound for the ENTIRE run — exhausting
+// host memory long before the existing tailString(…, 4096) truncation
+// ever gets a chance to run, because that truncation happens exactly
+// ONCE, at the very end, after the full uncapped buffer has already
+// been allocated. 1 MiB comfortably exceeds the 4 KiB tail that
+// BuildResult.StdoutTail/StderrTail actually surface, while remaining a
+// small, fixed ceiling regardless of how much output the command
+// produces.
+const maxCapturedOutputBytes = 1 << 20 // 1 MiB
+
+// boundedBufferWriter wraps a *bytes.Buffer and caps its RETAINED
+// content to budget bytes, always keeping the TAIL (most recently
+// written bytes) — the same "only the tail matters" principle
+// tailString already applies once at the end of a build — instead of
+// letting the underlying bytes.Buffer grow without bound for the whole
+// lifetime of a long-running build (XB3-5). Every real subprocess
+// runner in this package (realRunner, realContainerRunner,
+// realAppleContainerRunner) attaches this wrapper — never the raw
+// *bytes.Buffer — as Cmd.Stdout/Cmd.Stderr, so the caller-owned
+// *bytes.Buffer keeps working exactly as before (.String(), .Reset(),
+// .Len() all still read/mutate the SAME underlying buffer) while the
+// amount of memory it can grow to is bounded.
+//
+// bytes.Buffer.Next(extra) advances the buffer's internal read offset
+// past the oldest `extra` bytes rather than copying/reallocating the
+// retained tail; bytes.Buffer's own Write path opportunistically slides
+// the remaining unread bytes down to the front of the backing array
+// when it needs more room, so the backing array does not grow linearly
+// with total bytes ever written — capacity stays bounded to a small
+// multiple of budget across an arbitrarily long-running, flooding
+// command (verified empirically: 2 MiB written in 4 KiB chunks against
+// a 1000-byte budget peaked at under 10 KiB of backing capacity).
+type boundedBufferWriter struct {
+	buf    *bytes.Buffer
+	budget int
+}
+
+func (w *boundedBufferWriter) Write(p []byte) (int, error) {
+	n, err := w.buf.Write(p)
+	if err != nil {
+		return n, err
+	}
+	if extra := w.buf.Len() - w.budget; extra > 0 {
+		_ = w.buf.Next(extra)
+	}
+	return n, nil
+}
+
 type realRunner struct{}
 
 func (realRunner) Run(ctx context.Context, dir, command string, env map[string]string,
@@ -139,8 +193,11 @@ func (realRunner) Run(ctx context.Context, dir, command string, env map[string]s
 		}
 		cmd.Env = envSlice
 	}
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
+	// XB3-5: bound retained memory via boundedBufferWriter rather than
+	// handing the command's own process a direct, uncapped pointer into
+	// stdout/stderr.
+	cmd.Stdout = &boundedBufferWriter{buf: stdout, budget: maxCapturedOutputBytes}
+	cmd.Stderr = &boundedBufferWriter{buf: stderr, budget: maxCapturedOutputBytes}
 	err := cmd.Run()
 	exitCode := 0
 	if cmd.ProcessState != nil {
@@ -196,10 +253,13 @@ func validateRequest(req BuildRequest) error {
 // cleans ".." segments syntactically, so this is a pure string/prefix
 // check via filepath.Rel — no filesystem access, no symlink resolution
 // (SourceDir's existence is already verified by the caller). A
-// symlink-based escape — the build dropping a symlink AT an in-SourceDir
-// OutputSubpath that points outside — is a separate vector handled at the
-// artifact-copy choke-point (copyFile refuses to follow a top-level
-// symlink artifact), not here.
+// symlink-based escape — the build dropping a symlink AT (or beneath, at
+// any INTERMEDIATE path segment of) an in-SourceDir OutputSubpath that
+// points outside — is a separate vector handled at the artifact-copy
+// choke-point: copyFile resolves OutputSubpath against SourceDir via
+// os.Root (XB3-1), which refuses to follow ANY path segment — final OR
+// intermediate — whose symlink target would resolve outside SourceDir.
+// Not here — this function never touches the filesystem.
 func isWithinDir(root, target string) bool {
 	rel, err := filepath.Rel(root, target)
 	if err != nil {
@@ -285,28 +345,67 @@ func tailString(s string, n int) string {
 	return "…" + s[len(s)-n:]
 }
 
-// copyFile copies a produced artifact to its host-output destination.
-// Regular files are copied byte-for-byte. Directory artifacts (e.g. a
-// jpackage app-image / runtime image — see each backend's
-// Capabilities().ArtifactNotes) are copied recursively: a real, non-empty
-// directory app-image is a valid artifact and MUST NOT be reported as a
-// build failure (§11.4.1 — a successful build with a directory artifact
-// reported as FAIL is a FAIL-bluff).
-func copyFile(src, dst string) error {
-	info, err := os.Lstat(src)
+// copyFile copies a produced artifact (SourceDir/OutputSubpath) to its
+// host-output destination. Regular files are copied byte-for-byte.
+// Directory artifacts (e.g. a jpackage app-image / runtime image — see
+// each backend's Capabilities().ArtifactNotes) are copied recursively: a
+// real, non-empty directory app-image is a valid artifact and MUST NOT be
+// reported as a build failure (§11.4.1 — a successful build with a
+// directory artifact reported as FAIL is a FAIL-bluff).
+//
+// Security (XB3-1, artifact-fetch boundary): sourceDir + outputSubpath —
+// not a pre-joined path — are taken deliberately so this function can
+// resolve the produced artifact via os.OpenRoot(sourceDir) +
+// Root.Lstat(outputSubpath). validateRequest's isWithinDir only proves
+// OutputSubpath does not escape SourceDir by STRING math (no filesystem
+// access); it cannot see a build that drops a FRESH symlink at an
+// INTERMEDIATE path segment beneath SourceDir (e.g.
+// "desktopApp/build/linked" -> /outside/dir) whose target resolves
+// outside SourceDir — a plain os.Lstat/os.Open on the joined path
+// transparently follows that intermediate symlink and would exfiltrate
+// an arbitrary host file (e.g. an SSH key or "/outside/dir/secret.txt")
+// into HostOutputDir even though the FINAL path component is an
+// ordinary, non-symlink file. os.Root refuses to resolve ANY path
+// segment — intermediate or final — whose symlink target would land
+// outside the root, so Root.Lstat is the single choke-point that closes
+// both the pre-existing top-level-symlink-artifact vector (XBUILD-F1,
+// final component IS the symlink) AND the intermediate-segment vector
+// (XB3-1) in one mechanism.
+func copyFile(sourceDir, outputSubpath, dst string) error {
+	src := filepath.Join(sourceDir, outputSubpath)
+
+	root, err := os.OpenRoot(sourceDir)
 	if err != nil {
-		return err
+		return fmt.Errorf("crossbuild: opening SourceDir %q as a root: %w", sourceDir, err)
+	}
+	defer root.Close()
+
+	// Root.Lstat resolves every INTERMEDIATE path segment (following an
+	// internal symlink only if its target stays within sourceDir) but —
+	// matching plain os.Lstat semantics — does NOT follow the FINAL
+	// component if it is itself a symlink; it reports that symlink's own
+	// FileInfo instead, preserving the existing top-level-symlink check
+	// below. Any segment (intermediate or final resolution) that would
+	// escape sourceDir makes Lstat return an error instead of silently
+	// following it.
+	info, err := root.Lstat(outputSubpath)
+	if err != nil {
+		return fmt.Errorf(
+			"crossbuild: refusing to copy artifact %q: OutputSubpath %q could not be resolved "+
+				"safely within SourceDir %q: %w (anti-bluff/security XB3-1: a path segment — "+
+				"intermediate or final — that is a symlink escaping SourceDir must not be "+
+				"followed; the artifact-fetch step MUST NOT read files outside the project root)",
+			src, outputSubpath, sourceDir, err)
 	}
 	// Security (artifact-fetch boundary): refuse to follow a TOP-LEVEL
-	// artifact that is itself a symlink. validateRequest keeps OutputSubpath
-	// within SourceDir by string math (isWithinDir), but the file the build
-	// drops AT that path can be a freshly-created symlink pointing OUTSIDE
-	// SourceDir — copyRegularFile's os.Open would follow it and exfiltrate an
-	// arbitrary host file (e.g. an SSH key) into HostOutputDir. copyDir
-	// already refuses to follow symlinks INSIDE a directory artifact; this
-	// gives the top-level produced path the same no-follow treatment. Fail
-	// closed — a build whose declared artifact is a symlink is refused, not
-	// silently dereferenced.
+	// artifact that is itself a symlink. The file the build drops AT
+	// OutputSubpath can be a freshly-created symlink pointing OUTSIDE
+	// SourceDir — following it would exfiltrate an arbitrary host file
+	// (e.g. an SSH key) into HostOutputDir. copyDir already refuses to
+	// follow symlinks INSIDE a directory artifact; this gives the
+	// top-level produced path the same no-follow treatment. Fail
+	// closed — a build whose declared artifact is a symlink is refused,
+	// not silently dereferenced.
 	if info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf(
 			"crossbuild: refusing to copy artifact %q: it is a symlink "+
@@ -315,9 +414,15 @@ func copyFile(src, dst string) error {
 	}
 	var copyErr error
 	if info.IsDir() {
+		// The top-level directory itself was just proven reachable
+		// without crossing an escaping symlink (Root.Lstat succeeded
+		// above); the recursive walk below independently re-validates
+		// every NESTED symlink target against the same root (see
+		// copyDir's own isWithinDir check), so using the plain absolute
+		// path from here on is safe.
 		copyErr = copyDir(src, src, dst)
 	} else {
-		copyErr = copyRegularFile(src, dst, info.Mode())
+		copyErr = copyRegularFileFromRoot(root, outputSubpath, dst, info.Mode())
 	}
 	if copyErr != nil {
 		// XB2-3: a failure partway through the copy (a nested entry
@@ -338,6 +443,31 @@ func copyFile(src, dst string) error {
 
 func copyRegularFile(src, dst string, mode os.FileMode) error {
 	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+	dstFile, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode.Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := dstFile.ReadFrom(srcFile); err != nil {
+		dstFile.Close()
+		return err
+	}
+	return dstFile.Close()
+}
+
+// copyRegularFileFromRoot is copyRegularFile's XB3-1 counterpart for the
+// TOP-LEVEL produced artifact: it opens the source file THROUGH the
+// os.Root (root.Open) that already proved outputSubpath resolves inside
+// sourceDir without crossing an escaping symlink, rather than re-deriving
+// the path and calling plain os.Open — this keeps the whole
+// resolve-then-read step mediated by the same root handle end to end,
+// minimising the TOCTOU window between the Root.Lstat check in copyFile
+// and the actual read.
+func copyRegularFileFromRoot(root *os.Root, outputSubpath, dst string, mode os.FileMode) error {
+	srcFile, err := root.Open(outputSubpath)
 	if err != nil {
 		return err
 	}
