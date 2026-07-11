@@ -128,7 +128,12 @@ func TestWave20_DIST1_Undistribute_IssuesRemoteRemove(t *testing.T) {
 
 	found := false
 	for _, c := range issued {
-		if strings.Contains(c, "podman rm -f 'svc-a'") {
+		// §11.4.120 reconcile: Wave-20 DI3-SITE4 (ARGSWEEP) now shell-quotes the
+		// runtime token, so the issued command is `'podman' rm -f 'svc-a' ...`.
+		// Assert the security-hardened quoted form (the remote login shell strips
+		// the single quotes → resolves to `podman` identically). This still
+		// catches the DIST-1 mutation (Undistribute issuing NO remote rm -f).
+		if strings.Contains(c, "'podman' rm -f 'svc-a'") {
 			found = true
 		}
 	}
