@@ -1,10 +1,12 @@
 package vm
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,16 +20,54 @@ type processRunner interface {
 
 type osProcessRunner struct{}
 
+// livenessCheckWindow bounds how long StartDetached waits after a
+// successful Start() before deciding the process is "alive" (returns
+// nil — normal detached success) vs "dead on arrival" (returns a
+// diagnostic error citing captured stderr).
+//
+// VM2-2: Boot (see Boot below) previously returned BootResult{Started:
+// true} from cmd.Start() alone, with Stdout/Stderr both discarded
+// (=nil). A dead-on-arrival qemu-system (bad QCowPath, monitor/ssh port
+// already bound, -enable-kvm permission denied) throws away every
+// diagnostic in that world, and WaitForReady only fails after burning
+// the ENTIRE BootTimeout with a generic "did not become ready" message
+// — the real cause is invisible. Capturing stderr AND giving the
+// process a short window to crash-and-report closes that gap while
+// staying proportionate: a genuinely-booting QEMU is unaffected (it is
+// still running past the window, so StartDetached returns nil exactly
+// as before, merely livenessCheckWindow later — negligible next to a
+// multi-second VM boot).
+var livenessCheckWindow = 300 * time.Millisecond
+
 func (osProcessRunner) StartDetached(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
+	var stderrBuf bytes.Buffer
 	cmd.Stdout = nil
-	cmd.Stderr = nil
+	cmd.Stderr = &stderrBuf
 	cmd.Stdin = nil
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	go func() { _ = cmd.Wait() }()
-	return nil
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	select {
+	case waitErr := <-waitDone:
+		// Dead on arrival: the process exited within the liveness
+		// window. Surface whatever it wrote to stderr as the real
+		// diagnostic instead of letting the caller burn the entire
+		// BootTimeout on an uninformative "did not become ready".
+		stderrOut := strings.TrimSpace(stderrBuf.String())
+		if stderrOut != "" {
+			return fmt.Errorf("%s exited immediately (%v); stderr: %s", name, waitErr, truncate(stderrOut, 4096))
+		}
+		return fmt.Errorf("%s exited immediately (%v); no stderr captured", name, waitErr)
+	case <-time.After(livenessCheckWindow):
+		// Still running past the liveness window — detach as before.
+		// Keep draining Wait() in the background so the child never
+		// becomes a zombie.
+		go func() { <-waitDone }()
+		return nil
+	}
 }
 
 // sshClient abstracts SSH session + SCP operations.
@@ -100,9 +140,22 @@ func newQEMUVMWithDeps(p processRunner, s sshClient, q qmpClient, kvm bool) *QEM
 	return v
 }
 
+// kvmAvailable reports whether /dev/kvm is genuinely usable — not merely
+// present. A stat-only check (the pre-fix implementation) can report
+// "available" when /dev/kvm exists but the current user lacks
+// read/write permission on it (a common host-config gap), which then
+// leads Boot to pass -enable-kvm to a qemu-system that immediately
+// fails with a permission error — one of the VM2-2 dead-on-arrival
+// scenarios. Actually opening (and immediately closing) the device is
+// the low-risk fix: it fails exactly when qemu-system's own
+// KVM_CREATE_VM open would fail, and succeeds exactly when it would.
 func kvmAvailable() bool {
-	_, err := os.Stat("/dev/kvm")
-	return err == nil
+	f, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return true
 }
 
 func qemuBinary(arch string) string {

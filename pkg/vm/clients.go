@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -30,6 +31,12 @@ import (
 // falsifiability rehearsals recorded in the commit body. No silent
 // no-op, no "pretend to work" — every error path is wrapped with the
 // site name + the underlying cause so failures are diagnosable.
+
+// maxSCPDownloadSize is a sanity ceiling on the size field the SCP sink
+// protocol header declares (VM2-5). It is intentionally generous — real
+// captured-evidence artifacts (screenshots, logs) are tiny — this exists
+// only to reject a garbled/overflowed header, not to constrain real use.
+const maxSCPDownloadSize = 1 << 40 // 1 TiB
 
 // defaultSSHClient returns a production sshClient that uses
 // golang.org/x/crypto/ssh. The fake injection seam in qemu_test.go
@@ -263,6 +270,19 @@ func (r *realSSHClient) Download(ctx context.Context, vmPath, hostPath string) e
 	if _, err := fmt.Sscanf(header, "C%o %d %s", &mode, &size, &name); err != nil {
 		return fmt.Errorf("realSSHClient.Download: parse header %q: %w", header, err)
 	}
+	// VM2-5: a negative (or implausibly large) size in the SCP header is a
+	// garbled/corrupted response. Without this guard, io.CopyN(out, reader,
+	// size) with a negative size returns (0, nil) immediately — a "clean"
+	// 0-byte file that matrix.go's captor (Download err == nil) records as
+	// genuine captured evidence. Reject BEFORE ack'ing the header or
+	// creating the destination file, so a garbled header can never produce
+	// a false "success" artifact.
+	if size < 0 {
+		return fmt.Errorf("realSSHClient.Download: header %q declares negative size %d", strings.TrimSpace(header), size)
+	}
+	if size > maxSCPDownloadSize {
+		return fmt.Errorf("realSSHClient.Download: header %q declares implausible size %d (max %d)", strings.TrimSpace(header), size, maxSCPDownloadSize)
+	}
 	if _, err := fmt.Fprint(stdin, "\x00"); err != nil {
 		return fmt.Errorf("realSSHClient.Download: ack header: %w", err)
 	}
@@ -302,10 +322,40 @@ type realQMPClient struct {
 	reader *bufio.Reader
 }
 
+// qmpDefaultOpTimeout bounds a QMP conn read/write when ctx carries no
+// deadline of its own (VM2-1). Chosen to comfortably exceed QEMU's
+// normal command turnaround (milliseconds) while still failing fast
+// against a genuinely wedged monitor socket.
+const qmpDefaultOpTimeout = 10 * time.Second
+
+// qmpDeadline derives an absolute deadline for one QMP conn operation:
+// ctx's own deadline when it carries one, else now+qmpDefaultOpTimeout.
+//
+// VM2-1: realQMPClient previously used ctx for nothing beyond Dial's
+// initial net.DialTimeout — every post-connect handshake read
+// (ReadString('\n') for the greeting + the qmp_capabilities reply) and
+// every SystemPowerdown/Screendump write+read had no conn deadline and
+// no ctx cancellation. A QEMU that accepts the TCP connect but stalls
+// before speaking (crashed mid-init, wedged monitor thread) blocks the
+// call FOREVER. Because Dial is invoked while QEMUVM.guestMu is held
+// (Teardown Stage 1 in teardown.go, CaptureScreenshotVM in
+// screenshot.go), one wedged VM's monitor socket would permanently
+// block Upload/Run/Download/ApplyNetworkConditions/CaptureScreenshot/
+// Teardown for EVERY concurrent target sharing that *QEMUVM.
+func qmpDeadline(ctx context.Context) time.Time {
+	if dl, ok := ctx.Deadline(); ok {
+		return dl
+	}
+	return time.Now().Add(qmpDefaultOpTimeout)
+}
+
 // Dial connects to QEMU's monitor TCP socket and runs the standard
 // QMP capability negotiation: read greeting → send qmp_capabilities →
 // read response. After Dial returns nil the connection is ready for
-// command execution (e.g. system_powerdown).
+// command execution (e.g. system_powerdown). The whole post-connect
+// handshake is bounded by a conn deadline (VM2-1) — see qmpDeadline's
+// doc comment for why an unbounded handshake is unsafe under
+// concurrent targets sharing one *QEMUVM.
 func (r *realQMPClient) Dial(ctx context.Context, port int, timeout time.Duration) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	conn, err := net.DialTimeout("tcp", addr, timeout)
@@ -314,6 +364,12 @@ func (r *realQMPClient) Dial(ctx context.Context, port int, timeout time.Duratio
 	}
 	r.conn = conn
 	r.reader = bufio.NewReader(conn)
+	if err := conn.SetDeadline(qmpDeadline(ctx)); err != nil {
+		_ = conn.Close()
+		r.conn = nil
+		r.reader = nil
+		return fmt.Errorf("realQMPClient.Dial: set deadline: %w", err)
+	}
 	if _, err := r.reader.ReadString('\n'); err != nil {
 		_ = conn.Close()
 		r.conn = nil
@@ -338,10 +394,15 @@ func (r *realQMPClient) Dial(ctx context.Context, port int, timeout time.Duratio
 // SystemPowerdown sends the QMP `system_powerdown` command to QEMU.
 // The signal is fire-and-forget — the matrix-runner Teardown observes
 // the actual shutdown via subsequent SSH-listener-down probes, not via
-// a QMP response wait, so we don't block here.
+// a QMP response wait, so we don't block here. The write itself is
+// still bounded by a conn deadline (VM2-1): a wedged monitor socket
+// must not hang the write indefinitely under guestMu.
 func (r *realQMPClient) SystemPowerdown(ctx context.Context) error {
 	if r.conn == nil {
 		return fmt.Errorf("realQMPClient.SystemPowerdown: not dialed; call Dial first")
+	}
+	if err := r.conn.SetWriteDeadline(qmpDeadline(ctx)); err != nil {
+		return fmt.Errorf("realQMPClient.SystemPowerdown: set write deadline: %w", err)
 	}
 	if _, err := fmt.Fprintln(r.conn, `{"execute":"system_powerdown"}`); err != nil {
 		return fmt.Errorf("realQMPClient.SystemPowerdown: send: %w", err)
@@ -349,31 +410,89 @@ func (r *realQMPClient) SystemPowerdown(ctx context.Context) error {
 	return nil
 }
 
+// qmpEnvelope is the line-delimited JSON envelope every QMP line uses —
+// either the actual command response (`{"return":...}` / `{"error":...}`)
+// or an asynchronous `{"event":...}` notification that QEMU can emit at
+// any time, including in the window between a command and its own
+// response (VM2-3).
+type qmpEnvelope struct {
+	Event  string          `json:"event,omitempty"`
+	Return json.RawMessage `json:"return,omitempty"`
+	Error  json.RawMessage `json:"error,omitempty"`
+}
+
+// qmpMaxAsyncEventsSkipped bounds how many async {"event":...} lines
+// readCommandResponse will skip before giving up. Defence in depth
+// alongside the conn deadline (VM2-1), which is the primary bound on
+// wall-clock time; this bounds iteration count independent of timing.
+const qmpMaxAsyncEventsSkipped = 32
+
+// readCommandResponse reads QMP lines, skipping any asynchronous
+// {"event":...} notification, until it finds the actual command
+// response ({"return":...} or {"error":...}) or hits an error/limit.
+//
+// VM2-3: the pre-fix Screendump decided success/failure via
+// strings.Contains(resp, `"error"`) on a SINGLE ReadString('\n') line,
+// with no JSON discrimination of {"return":...} vs {"error":...} vs an
+// async {"event":...}. A QMP async event landing between the command
+// and its real response was mis-read: a false PASS when the event line
+// itself had no "error" key, or a false FAIL if an unrelated event's
+// payload happened to contain the substring "error". Parsing each line
+// as JSON and skipping event lines removes both false-PASS and
+// false-FAIL vectors.
+func (r *realQMPClient) readCommandResponse() (qmpEnvelope, error) {
+	for i := 0; i < qmpMaxAsyncEventsSkipped; i++ {
+		line, err := r.reader.ReadString('\n')
+		if err != nil {
+			return qmpEnvelope{}, err
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		var env qmpEnvelope
+		if jerr := json.Unmarshal([]byte(trimmed), &env); jerr != nil {
+			return qmpEnvelope{}, fmt.Errorf("parse QMP line %q: %w", trimmed, jerr)
+		}
+		if env.Event != "" {
+			continue // async event landed between our command and its response; skip it
+		}
+		return env, nil
+	}
+	return qmpEnvelope{}, fmt.Errorf("no command response after skipping %d async event(s)", qmpMaxAsyncEventsSkipped)
+}
+
 // Screendump asks QEMU to write a PPM-format screenshot of the guest
 // framebuffer to hostPath (interpreted on the host — qemu-system is a
 // host process). Returns when QEMU's response arrives (success or
 // error JSON).
 //
-// Anti-bluff posture (clauses 6.J/6.L): the function reads the QMP
-// response and treats `{"error":...}` as an honest failure rather
-// than fire-and-forget. A silent screendump that "succeeded" without
-// producing a file would be a clause-6.J bluff vector — an operator
-// looking at a "passing" matrix run with no screenshot evidence
-// would have no way to know the screendump silently failed.
+// Anti-bluff posture (clauses 6.J/6.L): the function reads QMP lines
+// via readCommandResponse (VM2-3), discriminating the real command
+// response from any async {"event":...} line, and treats a genuine
+// {"error":...} response as an honest failure rather than fire-and-
+// forget. A silent screendump that "succeeded" without producing a
+// file would be a clause-6.J bluff vector — an operator looking at a
+// "passing" matrix run with no screenshot evidence would have no way
+// to know the screendump silently failed. The write+read are bounded
+// by a conn deadline (VM2-1).
 func (r *realQMPClient) Screendump(ctx context.Context, hostPath string) error {
 	if r.conn == nil {
 		return fmt.Errorf("realQMPClient.Screendump: not dialed; call Dial first")
 	}
 	cmd := fmt.Sprintf(`{"execute":"screendump","arguments":{"filename":"%s"}}`, escapeJSONString(hostPath))
+	if err := r.conn.SetDeadline(qmpDeadline(ctx)); err != nil {
+		return fmt.Errorf("realQMPClient.Screendump: set deadline: %w", err)
+	}
 	if _, err := fmt.Fprintln(r.conn, cmd); err != nil {
 		return fmt.Errorf("realQMPClient.Screendump: send: %w", err)
 	}
-	resp, err := r.reader.ReadString('\n')
+	env, err := r.readCommandResponse()
 	if err != nil {
 		return fmt.Errorf("realQMPClient.Screendump: read response: %w", err)
 	}
-	if strings.Contains(resp, `"error"`) {
-		return fmt.Errorf("realQMPClient.Screendump: qemu rejected: %s", strings.TrimSpace(resp))
+	if env.Error != nil {
+		return fmt.Errorf("realQMPClient.Screendump: qemu rejected: %s", string(env.Error))
 	}
 	return nil
 }
