@@ -117,6 +117,18 @@ func (c *DefaultSystemCollector) collectCPULinuxFromFile(path string) float64 {
 	}
 	idleDelta := float64(idle - c.prevIdle)
 	totalDelta := float64(total - c.prevTotal)
+	// idle is one of the summands of total, so on monotonic counters
+	// idleDelta <= totalDelta ALWAYS. The MON-1 guard above rejects the
+	// read-error sentinel, total-not-advancing, and idle-running-backwards, but
+	// NOT a PARTIAL rollback where the non-idle sub-counters roll back while
+	// idle and the net total still advance (CPU hotplug / cgroup / namespace
+	// view change) — there idleDelta > totalDelta, and (1 - idleDelta/totalDelta)
+	// goes NEGATIVE, yielding an out-of-[0,100] CPU%. Reject that sample here,
+	// returning 0 WITHOUT clobbering prev so the last-good baseline is preserved
+	// (same philosophy as the MON-1 guard) (CT-HARDEN-MON2HARD MON2-1).
+	if idleDelta > totalDelta {
+		return 0
+	}
 	c.prevIdle = idle
 	c.prevTotal = total
 	return (1.0 - idleDelta/totalDelta) * 100

@@ -96,11 +96,22 @@ func NewClusterSnapshot(
 	local *ResourceSnapshot,
 	remoteHosts map[string]*remote.HostResources,
 ) *ClusterSnapshot {
+	// Count the local host ONLY when a local snapshot is actually present. The
+	// `if local != nil` guard below proves nil-local is an anticipated input,
+	// and the sibling nil-REMOTE path (`if hr == nil { continue }`, CT-HARDEN-MON-2)
+	// established the intent "a host with no resource data is NOT counted". A nil
+	// local is exactly such a host, so seeding HostCount=1 unconditionally
+	// over-reported the cluster size and skewed per-host averages when the local
+	// probe was absent (CT-HARDEN-MON2HARD MON2-2).
+	localHostCount := 0
+	if local != nil {
+		localHostCount = 1
+	}
 	cs := &ClusterSnapshot{
 		Timestamp:   time.Now(),
 		Local:       local,
 		RemoteHosts: remoteHosts,
-		HostCount:   1, // local host
+		HostCount:   localHostCount,
 	}
 	if local != nil {
 		cs.TotalMemoryMB = local.System.MemoryTotal / (1024 * 1024)
