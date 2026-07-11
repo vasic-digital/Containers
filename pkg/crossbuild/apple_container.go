@@ -241,6 +241,17 @@ func buildRunArgs(spec appleContainerRunSpec, mode string) []string {
 	for _, kv := range sortedEnv(spec.Environment) {
 		args = append(args, "-e", kv)
 	}
+	// XBUILD2-2 (security, argv-injection): terminate `container run`
+	// option parsing with an explicit end-of-options "--" BEFORE the image
+	// positional. spec.Image flows from a backend imageRef OR, via
+	// RunInLinuxContainer, straight from a caller-supplied req.Image; a
+	// crafted reference beginning with '-' (e.g. "--privileged",
+	// "--network=host", "-v/:/host") would otherwise be parsed by the CLI
+	// as a RUNTIME FLAG rather than the image name. The "--" forces it to
+	// be a positional, so the worst outcome of a hostile ref is an honest
+	// "no such image" — never a privilege/mount/network escalation. Mirror
+	// of the module's OR-1/RM2/VOL2/EG2 arg-injection hardenings.
+	args = append(args, "--")
 	args = append(args, spec.Image, "sh", "-c", spec.Command)
 	return args
 }

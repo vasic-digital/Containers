@@ -76,6 +76,7 @@ func TestAppleContainer_BuildRunArgs_VirtiofsMount(t *testing.T) {
 		"--name", "cb-job",
 		"--mount", "type=virtiofs,source=/Users/dev/src,target=/work/src",
 		"-w", "/work/src",
+		"--", // XBUILD2-2: end-of-options guard before the image positional
 		"docker.io/library/alpine:latest", "sh", "-c", "uname -s -m",
 	}, args)
 }
@@ -95,6 +96,7 @@ func TestAppleContainer_BuildRunArgs_VolumeFallback(t *testing.T) {
 		"run", "--rm",
 		"-v", "/host/dir:/work/src",
 		"-w", "/work/src",
+		"--", // XBUILD2-2: end-of-options guard before the image positional
 		"alpine", "sh", "-c", "ls",
 	}, args)
 }
@@ -119,6 +121,7 @@ func TestAppleContainer_BuildRunArgs_EnvDeterministic(t *testing.T) {
 		"-e", "ALPHA=2",
 		"-e", "MID=3",
 		"-e", "ZED=1",
+		"--", // XBUILD2-2: end-of-options guard before the image positional
 		"alpine", "sh", "-c", "env",
 	}, args)
 }

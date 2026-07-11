@@ -143,6 +143,14 @@ func (realContainerRunner) Run(ctx context.Context, spec containerRunSpec) (int,
 	for k, v := range spec.Environment {
 		args = append(args, "-e", k+"="+v)
 	}
+	// XBUILD2-2 (security, argv-injection): terminate podman/docker option
+	// parsing with an explicit end-of-options "--" BEFORE the image
+	// positional so a crafted image reference beginning with '-' (e.g.
+	// "--privileged", "--network=host", "-v/:/host") is forced to be the
+	// image positional and can never be parsed as a runtime flag. Mirror of
+	// the module's OR-1/RM2/VOL2/EG2 arg-injection hardenings; same guard
+	// applied to Apple `container run` in apple_container.go's buildRunArgs.
+	args = append(args, "--")
 	args = append(args, spec.Image, "sh", "-c", spec.Command)
 	cmd := exec.CommandContext(ctx, binary, args...)
 	// XB2-1: bound Wait()'s pipe-drain and kill the whole process

@@ -327,6 +327,27 @@ func verifyFreshArtifact(produced string, pre os.FileInfo) (os.FileInfo, error) 
 			"build produced a zero-byte artifact at %s "+
 				"(anti-bluff: empty artifact == bluff)", produced)
 	}
+	// XBUILD2-1 (§11.4.108/§11.4.1): the stat.Size()==0 check above is
+	// meaningful only for a SINGLE-FILE artifact. For a DIRECTORY artifact
+	// (a jpackage app-image / runtime image), os.Stat reports the
+	// directory INODE's own size — non-zero whenever the directory holds
+	// any entries at all (empirically 40-80 bytes here even for an empty
+	// dir), so the zero-byte check silently PASSES a build that reported
+	// success but dropped an EMPTY directory, or one whose only entries
+	// are zero-byte files / empty subdirectories — i.e. produced NOTHING
+	// usable. That is the exact "BUILD SUCCESSFUL but nothing really
+	// built" bluff this file's anti-bluff posture exists to catch, just
+	// shifted from the single-file shape to the directory shape. Walking
+	// the tree and requiring at least one byte of REAL regular-file
+	// content closes the hole deterministically, independent of the
+	// filesystem's directory-inode size accounting.
+	if stat.IsDir() && !directoryArtifactHasContent(produced) {
+		return nil, fmt.Errorf(
+			"build produced a directory artifact at %s holding zero bytes of real file content "+
+				"(empty directory, or only zero-byte/special-file entries) — reporting an empty "+
+				"directory as this build's fresh artifact is a bluff (anti-bluff §11.4.108)",
+			produced)
+	}
 	if pre != nil && stat.ModTime().Equal(pre.ModTime()) && stat.Size() == pre.Size() {
 		return nil, fmt.Errorf(
 			"build command succeeded but artifact at %s was NOT modified by this build "+
@@ -336,6 +357,32 @@ func verifyFreshArtifact(produced string, pre os.FileInfo) (os.FileInfo, error) 
 			produced, stat.ModTime().Format(time.RFC3339Nano), stat.Size())
 	}
 	return stat, nil
+}
+
+// directoryArtifactHasContent reports whether a DIRECTORY artifact holds
+// at least one byte of real regular-file content anywhere in its tree.
+// It is the directory-shaped counterpart of verifyFreshArtifact's
+// single-file `stat.Size()==0` anti-bluff check (XBUILD2-1,
+// §11.4.108/§11.4.1): only real regular-file bytes count — a symlink,
+// FIFO, socket, device, or empty subdirectory is NOT artifact "content",
+// so a directory whose only entries are those (or zero-byte files) is a
+// bluff even though its own inode size is non-zero.
+func directoryArtifactHasContent(dir string) bool {
+	var total int64
+	_ = filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+		if err != nil || d == nil || d.IsDir() {
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			return nil
+		}
+		if info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total > 0
 }
 
 func tailString(s string, n int) string {
@@ -543,6 +590,26 @@ func copyDir(root, src, dst string) error {
 				return err
 			}
 		default:
+			// XBUILD2-3 (security/DoS): a directory-artifact entry that is
+			// neither a symlink (handled above), a directory (handled
+			// above), nor a REGULAR file — i.e. a FIFO/named-pipe, unix
+			// socket, or char/block device special file — must be REFUSED,
+			// never opened. copyRegularFile's os.Open on a named pipe with
+			// no writer BLOCKS FOREVER (the artifact-copy step is not
+			// ctx-bounded, so req.Timeout does not save it), wedging the
+			// whole build past its declared deadline; a device/socket would
+			// copy garbage or error. Only real regular files are valid
+			// artifact content here. Fail closed, matching copyFile's
+			// top-level symlink-refusal and copyDir's escaping-symlink
+			// refusal policy.
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf(
+					"crossbuild: refusing to copy directory-artifact entry %q: it is a %v special file "+
+						"(FIFO/socket/device), not a regular file (anti-bluff/security: the artifact-copy "+
+						"step MUST NOT open a special file — a named pipe with no writer blocks the copy "+
+						"indefinitely)",
+					srcPath, info.Mode().Type())
+			}
 			if err := copyRegularFile(srcPath, dstPath, info.Mode()); err != nil {
 				return err
 			}
