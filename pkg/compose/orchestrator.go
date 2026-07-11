@@ -234,6 +234,14 @@ func (o *DefaultOrchestrator) waitForServices(
 	}
 
 	deadline := time.Now().Add(timeout)
+	// COMP-2: derive a deadline-bounded context so a SINGLE hung Status/ps
+	// exec is bounded by `timeout`. Without this the deadline is only checked
+	// BETWEEN poll iterations; if the caller's ctx has no deadline and one
+	// `ps` probe hangs, waitForServices blocks indefinitely, silently
+	// ignoring `timeout`. WithDeadline never extends an earlier parent
+	// deadline (it takes the min), so the caller's own timeout is preserved.
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	ticker := time.NewTicker(waitPollInterval)
 	defer ticker.Stop()
 
@@ -346,6 +354,9 @@ func (o *DefaultOrchestrator) Down(
 const (
 	defaultWaitTimeout = 120 * time.Second
 	waitPollInterval   = 1 * time.Second
+	// composeProbeTimeout bounds each `<cmd> version` detection probe so a
+	// wedged client binary cannot block detection (COMP-3).
+	composeProbeTimeout = 5 * time.Second
 )
 
 // Status returns the status of all services in the project. For docker
@@ -407,7 +418,13 @@ func (o *DefaultOrchestrator) Logs(
 	args := o.projectArgs(project)
 	args = append(args, "logs", "--no-color", service)
 
-	allArgs := append(o.composeArgs, args...)
+	// COMP-1: defensive copy — o.composeArgs is a shared, caller-supplied
+	// immutable field. `append(o.composeArgs, args...)` would write INTO its
+	// backing array when cap>len (reachable via NewOrchestrator*), aliasing
+	// concurrent callers and corrupting argv. Copy into a fresh backing array.
+	allArgs := make([]string, 0, len(o.composeArgs)+len(args))
+	allArgs = append(allArgs, o.composeArgs...)
+	allArgs = append(allArgs, args...)
 	cmd := o.cmdFactory.CommandContext(ctx, o.composeCmd, allArgs...)
 	cmd.SetDir(o.workDir)
 
@@ -479,7 +496,11 @@ func (o *DefaultOrchestrator) projectArgs(
 func (o *DefaultOrchestrator) run(
 	ctx context.Context, args []string,
 ) error {
-	allArgs := append(o.composeArgs, args...)
+	// COMP-1: defensive copy (see Logs) — avoid aliasing the shared
+	// o.composeArgs backing array under concurrent run/output calls.
+	allArgs := make([]string, 0, len(o.composeArgs)+len(args))
+	allArgs = append(allArgs, o.composeArgs...)
+	allArgs = append(allArgs, args...)
 	cmd := exec.CommandContext(ctx, o.composeCmd, allArgs...)
 	cmd.Dir = o.workDir
 
@@ -504,7 +525,11 @@ func (o *DefaultOrchestrator) run(
 func (o *DefaultOrchestrator) output(
 	ctx context.Context, args []string,
 ) (string, error) {
-	allArgs := append(o.composeArgs, args...)
+	// COMP-1: defensive copy (see Logs) — avoid aliasing the shared
+	// o.composeArgs backing array under concurrent run/output calls.
+	allArgs := make([]string, 0, len(o.composeArgs)+len(args))
+	allArgs = append(allArgs, o.composeArgs...)
+	allArgs = append(allArgs, args...)
 	cmd := exec.CommandContext(ctx, o.composeCmd, allArgs...)
 	cmd.Dir = o.workDir
 
@@ -692,9 +717,7 @@ func detectComposeCmd() (string, []string, error) {
 	}
 
 	for _, c := range candidates {
-		checkArgs := append(c.args, "version")
-		cmd := exec.Command(c.cmd, checkArgs...)
-		if err := cmd.Run(); err == nil {
+		if composeCmdWorks(c.cmd, c.args, composeProbeTimeout) {
 			return c.cmd, c.args, nil
 		}
 	}
@@ -703,4 +726,24 @@ func detectComposeCmd() (string, []string, error) {
 		"no compose command found: tried docker compose, " +
 			"docker-compose, podman-compose, podman compose",
 	)
+}
+
+// composeCmdWorks reports whether `<name> [args...] version` runs successfully
+// within the given timeout. COMP-3: the probe is bounded by an internal
+// deadline-derived context (exec.CommandContext) so a wedged client binary
+// cannot block detection (and NewDefaultOrchestrator) indefinitely. A zero
+// timeout means "no bound". The args are copied before appending "version" so
+// the caller's slice is never aliased (COMP-1 discipline).
+func composeCmdWorks(name string, args []string, timeout time.Duration) bool {
+	checkArgs := make([]string, 0, len(args)+1)
+	checkArgs = append(checkArgs, args...)
+	checkArgs = append(checkArgs, "version")
+
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	return exec.CommandContext(ctx, name, checkArgs...).Run() == nil
 }
