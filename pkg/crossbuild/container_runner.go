@@ -135,6 +135,17 @@ func (realContainerRunner) Run(ctx context.Context, spec containerRunSpec) (int,
 	}
 	args = append(args, spec.Image, "sh", "-c", spec.Command)
 	cmd := exec.CommandContext(ctx, binary, args...)
+	// XB2-1: bound Wait()'s pipe-drain and kill the whole process
+	// group (not just this "docker"/"podman" CLI invocation) on ctx
+	// cancellation, matching pkg/runtime/docker.go's identical guard.
+	// This is belt-and-braces alongside "--rm": "--rm" only removes
+	// THIS container on ITS OWN exit — it does nothing for a
+	// detached/backgrounded process the in-container command itself
+	// launched, and does nothing to unblock a wedged host-side
+	// `docker`/`podman run` CLI process whose own descendants (if any)
+	// are still holding the stdout/stderr pipes open.
+	cmd.WaitDelay = subprocessWaitDelay
+	configureProcessGroup(cmd)
 	cmd.Stdout = spec.Stdout
 	cmd.Stderr = spec.Stderr
 	err := cmd.Run()

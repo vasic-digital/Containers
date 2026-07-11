@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"runtime"
 	"sort"
+	"sync"
 )
 
 // Selector picks a Backend for a given BuildRequest by matching the
@@ -12,9 +13,16 @@ import (
 // It is the single decision point consumers go through; the routing
 // rules are documented + testable rather than buried in ad-hoc shell
 // scripts.
+//
+// XB2-4: backends is guarded by mu — Register (append) can race with
+// Choose/SupportedTargets (range) when a caller registers backends
+// from one goroutine while another concurrently builds/queries. The
+// mutex makes every access to backends a genuine happens-before edge
+// so `go test -race` stays clean under concurrent use.
 type Selector struct {
 	hostOS   string
 	hostArch string
+	mu       sync.RWMutex
 	backends []Backend
 }
 
@@ -37,6 +45,8 @@ func NewSelectorForHost(hostOS, hostArch string) *Selector {
 // lets host-direct take precedence over container/QEMU paths when
 // the target is host-native.
 func (s *Selector) Register(b Backend) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.backends = append(s.backends, b)
 }
 
@@ -48,6 +58,8 @@ func (s *Selector) Choose(req BuildRequest) (Backend, error) {
 		return nil, fmt.Errorf("crossbuild: BuildRequest.Target.OS + .Arch are required")
 	}
 
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, b := range s.backends {
 		caps := b.Capabilities()
 		if !backendSupportsTarget(caps, req.Target) {
@@ -82,6 +94,8 @@ func (s *Selector) Build(ctx context.Context, req BuildRequest) BuildResult {
 // can build" diagnostics + for the Challenge script that drives
 // real-stack verification.
 func (s *Selector) SupportedTargets() []Target {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	seen := make(map[Target]struct{})
 	for _, b := range s.backends {
 		for _, t := range b.Capabilities().SupportsTargets {

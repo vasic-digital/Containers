@@ -361,6 +361,12 @@ func (r realAppleContainerRunner) Run(ctx context.Context, spec appleContainerRu
 	for _, mode := range modes {
 		args := buildRunArgs(spec, mode)
 		cmd := exec.CommandContext(ctx, appleContainerBinary, args...)
+		// XB2-1: bound Wait()'s pipe-drain and kill the whole process
+		// group (not just this `container run` invocation) on ctx
+		// cancellation — identical rationale to container_runner.go's
+		// realContainerRunner.Run.
+		cmd.WaitDelay = subprocessWaitDelay
+		configureProcessGroup(cmd)
 		cmd.Stdout = spec.Stdout
 		cmd.Stderr = spec.Stderr
 		err := cmd.Run()

@@ -110,12 +110,28 @@ type processRunner interface {
 		stdout, stderr *bytes.Buffer) (exitCode int, err error)
 }
 
+// subprocessWaitDelay bounds how long Cmd.Wait() spends waiting for a
+// command's stdout/stderr pipes to reach EOF after the process has
+// exited (or after ctx cancellation/Cancel has fired), before giving
+// up on pipe forwarding and returning anyway (XB2-1). Without this
+// (WaitDelay's zero value means "wait forever"), Run() can hang PAST
+// the caller's declared ctx deadline whenever a backgrounded/detached
+// descendant of the build command (a Gradle daemon, Wine, a `cmd &
+// disown` shell job) inherited the same stdout/stderr file
+// descriptors: those descriptors stay open — and pipe EOF never
+// arrives — until every process holding them exits, which may be
+// never. Mirrors the identical guard already present in
+// pkg/runtime/docker.go's defaultExecutor.
+const subprocessWaitDelay = 2 * time.Second
+
 type realRunner struct{}
 
 func (realRunner) Run(ctx context.Context, dir, command string, env map[string]string,
 	stdout, stderr *bytes.Buffer) (int, error) {
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = dir
+	cmd.WaitDelay = subprocessWaitDelay
+	configureProcessGroup(cmd)
 	if env != nil {
 		envSlice := os.Environ()
 		for k, v := range env {
@@ -297,10 +313,27 @@ func copyFile(src, dst string) error {
 				"(anti-bluff/security: the artifact-fetch step MUST NOT follow a link "+
 				"that may resolve outside the project root)", src)
 	}
+	var copyErr error
 	if info.IsDir() {
-		return copyDir(src, dst)
+		copyErr = copyDir(src, src, dst)
+	} else {
+		copyErr = copyRegularFile(src, dst, info.Mode())
 	}
-	return copyRegularFile(src, dst, info.Mode())
+	if copyErr != nil {
+		// XB2-3: a failure partway through the copy (a nested entry
+		// that cannot be written, a rejected escaping symlink, a
+		// permission error, …) MUST NOT leave partial/truncated debris
+		// under HostOutputDir — a downstream glob of HostOutputDir/*
+		// could otherwise pick up a corrupt leftover from a FAILED
+		// build and mistake it for a real artifact. Best-effort: the
+		// removal's own error is deliberately swallowed — the
+		// ORIGINAL copy error is what the caller needs to see, and a
+		// failure to clean up debris does not change the fact that
+		// the copy itself failed.
+		_ = os.RemoveAll(dst)
+		return copyErr
+	}
+	return nil
 }
 
 func copyRegularFile(src, dst string, mode os.FileMode) error {
@@ -324,7 +357,18 @@ func copyRegularFile(src, dst string, mode os.FileMode) error {
 // the relative structure. Symlinks are copied as symlinks (not followed)
 // so a malicious or accidental link inside the artifact cannot make the
 // orchestrator read outside the tree.
-func copyDir(src, dst string) error {
+//
+// root is the TOP-LEVEL artifact directory (the same value across the
+// whole recursion — only src/dst change on nested calls). XB2-2: a
+// nested symlink's TARGET is validated to stay within root before it is
+// recreated. Without this, a build that drops a symlink deep inside a
+// directory artifact pointing at an absolute host path (or a
+// "../../.."-escaping relative path) would have that escaping/dangling
+// link recreated VERBATIM in HostOutputDir — shipping a link that
+// resolves outside the project root to whatever consumes the artifact
+// next. Escaping targets are refused outright (fail closed), matching
+// the existing top-level-symlink-artifact policy in copyFile.
+func copyDir(root, src, dst string) error {
 	srcInfo, err := os.Stat(src)
 	if err != nil {
 		return err
@@ -349,11 +393,23 @@ func copyDir(src, dst string) error {
 			if err != nil {
 				return err
 			}
+			resolved := target
+			if !filepath.IsAbs(resolved) {
+				resolved = filepath.Join(filepath.Dir(srcPath), resolved)
+			}
+			if !isWithinDir(root, resolved) {
+				return fmt.Errorf(
+					"crossbuild: refusing to copy directory-artifact symlink %q: its target %q "+
+						"escapes the artifact root %q "+
+						"(anti-bluff/security: a nested symlink inside a directory artifact "+
+						"MUST NOT resolve outside the artifact tree)",
+					srcPath, target, root)
+			}
 			if err := os.Symlink(target, dstPath); err != nil {
 				return err
 			}
 		case info.IsDir():
-			if err := copyDir(srcPath, dstPath); err != nil {
+			if err := copyDir(root, srcPath, dstPath); err != nil {
 				return err
 			}
 		default:
