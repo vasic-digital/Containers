@@ -158,6 +158,23 @@ func resolveDir(ctx context.Context, r Runner, s Spec) (string, error) {
 	if d == "" {
 		return "", fmt.Errorf("remoteexec: resolved default dir is empty")
 	}
+	// The RESOLVED default dir MUST be absolute for the SAME reason the explicit
+	// Spec.Dir branch above enforces it (RX-2 guarded ONLY that branch, leaving
+	// this — the common empty-Dir production path — unchecked). handleForDir
+	// derives the runner-script/log/sentinel paths from this dir, and the durable
+	// job runs under systemd-run --user whose CWD is the user manager's OWN
+	// directory, NOT the launching shell's. A RELATIVE default — produced when the
+	// runner's environment sets a relative XDG_CACHE_HOME (invalid per the XDG
+	// base-dir spec, but honoured verbatim by the shell's ${XDG_CACHE_HOME:-…}
+	// expansion) — would make the job write its log+sentinel relative to the
+	// user-manager CWD while mkdir/WaitForSentinel/FetchLog resolve the same
+	// relative paths against the login-shell CWD (a DIFFERENT directory), so the
+	// completed job's sentinel is never seen and WaitForSentinel hangs to timeout
+	// on a job that in fact finished — a §11.4.108 durability bluff. Enforce the
+	// identical ABSOLUTE contract on the resolved default too (§11.4.6).
+	if !path.IsAbs(d) {
+		return "", fmt.Errorf("remoteexec: resolved default dir is not absolute: %q (set XDG_CACHE_HOME or HOME to an absolute path)", d)
+	}
 	return d, nil
 }
 
