@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -114,6 +115,15 @@ func yesNo(b bool) string {
 	return "no"
 }
 
+// tunnelDestination renders the ssh destination positional ("<user>@<address>")
+// for a tunnel host. It is BOTH the final positional argv element tunnelArgs
+// appends AND the exact string CreateTunnel's §NET3 leading-dash guard inspects,
+// so the guarded value and the spawned value are provably identical (single
+// source of truth — a divergent guard would let a rejected form still spawn).
+func tunnelDestination(host remote.RemoteHost) string {
+	return fmt.Sprintf("%s@%s", host.User, host.Address)
+}
+
 // NewTunnelManager creates a DefaultTunnelManager.
 func NewTunnelManager(
 	hostManager remote.HostManager,
@@ -147,6 +157,26 @@ func (m *DefaultTunnelManager) CreateTunnel(
 	}
 	if host == nil {
 		return nil, fmt.Errorf("host %s not found", hostName)
+	}
+
+	// §NET3: the tunnel ssh child is spawned as a bare argv (exec.CommandContext(
+	// "ssh", args...), no shell), so shell metacharacters in the destination are
+	// inert — but the destination is appended as the FINAL positional argv
+	// element (tunnelArgs → tunnelDestination, "<user>@<address>") with no "--"
+	// guard, so a destination that BEGINS WITH '-' is parsed by ssh's OWN getopt
+	// as an OPTION, not a host. e.g. a host.User of "-oProxyCommand=<cmd>" injects
+	// ssh's ProxyCommand (arbitrary command execution). Refuse it BEFORE any port
+	// allocation or spawn (ssh has no reliable "--" end-of-options for the host,
+	// so rejection is the safe, deterministic fix). Mirrors pkg/egress §EG2-1.
+	// Checking the composed destination covers a leading '-' in host.User (the
+	// leading token); an empty User yields "@<address>", which begins with '@'
+	// and is inert to getopt.
+	dest := tunnelDestination(*host)
+	if strings.HasPrefix(dest, "-") {
+		return nil, fmt.Errorf(
+			"refusing ssh tunnel destination %q that begins with '-' "+
+				"(would be parsed as an ssh option — argument injection)", dest,
+		)
 	}
 
 	// Auto-allocate local port if not specified.
@@ -511,7 +541,7 @@ func (m *DefaultTunnelManager) tunnelArgs(
 	}
 
 	args = append(args,
-		fmt.Sprintf("%s@%s", host.User, host.Address),
+		tunnelDestination(host),
 	)
 	return args
 }
