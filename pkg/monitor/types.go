@@ -16,6 +16,21 @@ type ResourceSnapshot struct {
 	// Containers holds per-container resource metrics keyed by
 	// container name.
 	Containers map[string]ContainerResources
+	// ListError is true when the container runtime's List call failed
+	// during this collection. When set, Containers is NOT authoritative:
+	// a runtime outage must not read as "0 containers, all healthy". A
+	// consumer distinguishes a genuinely empty host (ListError=false,
+	// len(Containers)==0) from a probe failure (ListError=true) via this
+	// flag (CT-HARDEN-MON-HARD MON-3). It does not change that a listed
+	// container whose Stats probe fails is still dropped from Containers.
+	ListError bool
+	// StatsFailures counts containers that WERE listed but whose
+	// per-container Stats probe failed and were therefore dropped from
+	// Containers. A non-zero value means Containers under-reports the
+	// running set — the drop itself is preserved (existing intended
+	// behavior); this only surfaces that it happened
+	// (CT-HARDEN-MON-HARD MON-3).
+	StatsFailures int
 }
 
 // SystemResources holds host-level CPU, memory, and disk metrics.

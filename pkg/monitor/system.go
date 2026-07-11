@@ -89,14 +89,30 @@ func (c *DefaultSystemCollector) Collect() SystemResources {
 // collectCPULinux reads /proc/stat and computes CPU usage since the
 // previous sample.
 func (c *DefaultSystemCollector) collectCPULinux() float64 {
+	return c.collectCPULinuxFromFile("/proc/stat")
+}
+
+// collectCPULinuxFromFile reads the CPU sample from the given path and computes
+// CPU usage since the previous sample. Separated for testability (mirrors
+// collectMemoryLinuxFromFile) so the counter-guard is exercisable with an
+// injected fixture (CT-HARDEN-MON-HARD MON-1).
+func (c *DefaultSystemCollector) collectCPULinuxFromFile(path string) float64 {
 	// Hold mu across the whole read-sample → delta → update-prev sequence so
 	// it is atomic against concurrent Collect() callers (CT-HARDEN-MON-1). The
 	// /proc/stat read is a small local file, so serialising it here does not
 	// stall an unrelated hot path.
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	idle, total := readCPUSample()
-	if total == c.prevTotal {
+	idle, total, ok := readCPUSampleOKFromFile(path)
+	// Guard against (a) the read-error / malformed-line sentinel (!ok) and
+	// (b) a counter that did not advance or ran BACKWARDS (total <= prevTotal
+	// or idle < prevIdle). Without this, a (0,0) sentinel with a large primed
+	// prevTotal underflows the uint64 delta (float64(0-prevTotal) ≈ 1.8e19),
+	// yielding an out-of-[0,100] CPU%, AND clobbers prev to 0 so the NEXT good
+	// sample computes a second bogus since-boot delta. On any guard hit return
+	// 0 WITHOUT clobbering prev, preserving the last-good baseline
+	// (CT-HARDEN-MON-HARD MON-1).
+	if !ok || total <= c.prevTotal || idle < c.prevIdle {
 		return 0
 	}
 	idleDelta := float64(idle - c.prevIdle)
@@ -112,12 +128,26 @@ func readCPUSample() (idle, total uint64) {
 	return readCPUSampleFromFile("/proc/stat")
 }
 
-// readCPUSampleFromFile reads CPU sample from the specified file path.
-// Separated for testability.
+// readCPUSampleFromFile reads a CPU sample from the specified file path,
+// dropping the ok flag. Preserved for existing callers/tests that only need
+// the (idle, total) pair; here the sentinel (0, 0) is indistinguishable from a
+// genuine reading — callers needing that distinction MUST use
+// readCPUSampleOKFromFile. Separated for testability.
 func readCPUSampleFromFile(path string) (idle, total uint64) {
+	idle, total, _ = readCPUSampleOKFromFile(path)
+	return idle, total
+}
+
+// readCPUSampleOKFromFile reads a CPU sample from the specified file path and
+// returns ok=false when the file cannot be opened OR the cpu line is
+// malformed/short (len(fields) < 5). This lets collectCPULinuxFromFile
+// distinguish a real (0-tick) reading from the read-error sentinel and refuse
+// to poison prevIdle/prevTotal (CT-HARDEN-MON-HARD MON-1). Separated for
+// testability.
+func readCPUSampleOKFromFile(path string) (idle, total uint64, ok bool) {
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, 0
+		return 0, 0, false
 	}
 	defer f.Close()
 
@@ -129,7 +159,7 @@ func readCPUSampleFromFile(path string) (idle, total uint64) {
 		}
 		fields := strings.Fields(line)
 		if len(fields) < 5 {
-			return 0, 0
+			return 0, 0, false
 		}
 		var vals [10]uint64
 		for i := 1; i < len(fields) && i <= 10; i++ {
@@ -139,9 +169,9 @@ func readCPUSampleFromFile(path string) (idle, total uint64) {
 		}
 		// idle is the 4th value (index 3).
 		idle = vals[3]
-		return idle, total
+		return idle, total, true
 	}
-	return 0, 0
+	return 0, 0, false
 }
 
 // collectMemoryLinux reads /proc/meminfo for total and available
@@ -164,21 +194,50 @@ func (c *DefaultSystemCollector) collectMemoryLinuxFromFile(
 	}
 	defer f.Close()
 
-	var memTotal, memAvailable uint64
+	var memTotal, memAvailable, memFree, buffers, cached uint64
+	var sawAvailable, sawFree bool
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.HasPrefix(line, "MemTotal:") {
+		switch {
+		case strings.HasPrefix(line, "MemTotal:"):
 			memTotal = parseMemInfoKB(line)
-		} else if strings.HasPrefix(line, "MemAvailable:") {
+		case strings.HasPrefix(line, "MemAvailable:"):
 			memAvailable = parseMemInfoKB(line)
+			sawAvailable = true
+		case strings.HasPrefix(line, "MemFree:"):
+			memFree = parseMemInfoKB(line)
+			sawFree = true
+		case strings.HasPrefix(line, "Buffers:"):
+			buffers = parseMemInfoKB(line)
+		case strings.HasPrefix(line, "Cached:"):
+			cached = parseMemInfoKB(line)
 		}
 	}
 
 	res.MemoryTotal = memTotal * 1024 // convert KB to bytes
-	if memTotal > 0 && memAvailable <= memTotal {
-		res.MemoryUsed = (memTotal - memAvailable) * 1024
-		res.MemoryPercent = float64(memTotal-memAvailable) /
+
+	// Determine available memory WITHOUT ever assuming 0-available. A meminfo
+	// with MemTotal but NO MemAvailable line (pre-3.14 kernels / some container
+	// views) previously left memAvailable=0, so the `memAvailable <= memTotal`
+	// guard passed and reported MemoryUsed=memTotal / MemoryPercent=100 on an
+	// idle host. Prefer MemAvailable; else approximate with
+	// MemFree+Buffers+Cached (the classic pre-3.14 formula); else leave
+	// MemoryUsed/MemoryPercent at 0 (genuinely unknown), never a false 100%
+	// (CT-HARDEN-MON-HARD MON-2).
+	var available uint64
+	switch {
+	case sawAvailable:
+		available = memAvailable
+	case sawFree:
+		available = memFree + buffers + cached
+	default:
+		return // available unknown — leave MemoryUsed/MemoryPercent at 0
+	}
+
+	if memTotal > 0 && available <= memTotal {
+		res.MemoryUsed = (memTotal - available) * 1024
+		res.MemoryPercent = float64(memTotal-available) /
 			float64(memTotal) * 100
 	}
 }
