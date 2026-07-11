@@ -83,6 +83,13 @@ func (bm *BootManager) BootAll(
 	// order) before returning — no partial-boot leak.
 	var bootedProjects []compose.ComposeProject
 
+	// BOOT2-1: track whether the distributor was invoked this run so a
+	// later-phase failure/cancel rollback also tears down the live remote
+	// state it created (containers/tunnels/volumes), not just compose
+	// groups. Without this, BOOT-2 rollback leaked every distributed remote
+	// endpoint on a failed/cancelled boot.
+	var distributed bool
+
 	if bm.eventBus != nil {
 		bm.eventBus.Publish(ctx, event.NewEvent(
 			event.EventBootStarted, "boot", "all",
@@ -129,7 +136,7 @@ func (bm *BootManager) BootAll(
 
 	// BOOT-2: honor cancellation between phases.
 	if err := ctx.Err(); err != nil {
-		bm.rollback(ctx, bootedProjects)
+		bm.rollback(ctx, bootedProjects, distributed)
 		return summary, err
 	}
 
@@ -197,7 +204,7 @@ func (bm *BootManager) BootAll(
 
 	// BOOT-2: honor cancellation between phases.
 	if err := ctx.Err(); err != nil {
-		bm.rollback(ctx, bootedProjects)
+		bm.rollback(ctx, bootedProjects, distributed)
 		return summary, err
 	}
 
@@ -220,6 +227,13 @@ func (bm *BootManager) BootAll(
 			deployed, distErr := bm.distributor.DistributeEndpoints(
 				ctx, remoteNames,
 			)
+			// BOOT2-1: the distributor ran — any state it created this run
+			// (containers/tunnels/volumes, including partial artifacts left by
+			// a shortfall) is live and MUST be torn down if a later-phase
+			// failure/cancel triggers rollback. Undistribute is idempotent, so
+			// flagging on invocation (not on deployed>0) safely reaps partial
+			// state a 0-deploy total failure may still have created.
+			distributed = true
 			// BOOT-1: the distributor reports only an aggregate count of
 			// successfully-deployed containers, not which names. Attribute
 			// by count: mark exactly `deployed` endpoints distributed and
@@ -297,7 +311,7 @@ func (bm *BootManager) BootAll(
 
 	// BOOT-2: honor cancellation between phases.
 	if err := ctx.Err(); err != nil {
-		bm.rollback(ctx, bootedProjects)
+		bm.rollback(ctx, bootedProjects, distributed)
 		return summary, err
 	}
 
@@ -363,7 +377,7 @@ func (bm *BootManager) BootAll(
 		// BOOT-2: a required service failed — tear down the compose groups
 		// already booted this run so BootAll never returns an error while
 		// leaving a partial boot running.
-		bm.rollback(ctx, bootedProjects)
+		bm.rollback(ctx, bootedProjects, distributed)
 		return summary, fmt.Errorf(
 			"boot: %d service(s) failed", summary.Failed,
 		)
@@ -371,18 +385,37 @@ func (bm *BootManager) BootAll(
 	return summary, nil
 }
 
-// rollback tears down the given compose groups (already Up'd this boot)
-// in reverse order. It is best-effort cleanup on an already-failing or
+// rollback tears down the resources this boot created — distributed remote
+// endpoints (BOOT2-1) and then the given compose groups (already Up'd this
+// boot) in reverse order. It is best-effort cleanup on an already-failing or
 // cancelled boot path (§11.4.14 quiescent-state): errors are logged, not
 // returned. A detached context is used so teardown still runs even when
 // the boot ctx was cancelled.
 func (bm *BootManager) rollback(
-	ctx context.Context, booted []compose.ComposeProject,
+	ctx context.Context, booted []compose.ComposeProject, distributed bool,
 ) {
+	downCtx := context.WithoutCancel(ctx)
+	// BOOT2-1: distributed remote endpoints (containers/tunnels/volumes) are
+	// live state Phase 2.5 created via the distributor. The prior rollback
+	// tore down ONLY compose groups, so a required-service / distribution-
+	// shortfall / ctx-cancel failure left every successfully distributed
+	// remote endpoint RUNNING while BootAll returned an error — the BOOT-2
+	// partial-boot-leak class extended to the distribution path (§11.4.69 no
+	// sink-side leak). Undistribute tears down all distributed remote state;
+	// it is idempotent + best-effort (logged, not returned) on this already-
+	// failing path, and runs on the detached ctx so teardown still fires when
+	// the boot ctx was cancelled. Not gated by the orchestrator/booted guard
+	// below — a distributor-only boot has no compose groups to down.
+	if distributed && bm.distributor != nil {
+		if err := bm.distributor.Undistribute(downCtx); err != nil {
+			bm.logger.Warn(
+				"boot: rollback Undistribute failed: %v", err,
+			)
+		}
+	}
 	if bm.orchestrator == nil || len(booted) == 0 {
 		return
 	}
-	downCtx := context.WithoutCancel(ctx)
 	for i := len(booted) - 1; i >= 0; i-- {
 		bm.logger.Info(
 			"boot: rollback ComposeDown %s", booted[i].File,
