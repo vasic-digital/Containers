@@ -14,14 +14,21 @@ import (
 // TestWave20_Network_CreateTunnel_DeadOnArrivalIsQueryableAsFailed proves the
 // dead-tunnel-failure fix (Wave-20 NET-HARD N-1).
 //
-// CreateTunnel returns success with State=TunnelActive the instant ssh's
-// cmd.Start() succeeds — i.e. once the ssh PROCESS forks — WITHOUT confirming the
-// forward was actually established. Because ssh runs with
-// ExitOnForwardFailure=yes, it exits NON-ZERO on its own an instant later when a
-// forward cannot be set up (remote port already bound, auth / host-key
-// mismatch). A dead-on-arrival tunnel MUST NOT silently vanish from ListTunnels:
-// the reaper must capture that non-zero exit, mark the tunnel State=TunnelFailed,
-// and KEEP it queryable so a caller can detect the failure. This closes the
+// Historically CreateTunnel returned success with State=TunnelActive the
+// instant ssh's cmd.Start() succeeded — i.e. once the ssh PROCESS forked —
+// WITHOUT confirming the forward was actually established. NET2-2 (Wave-20
+// NET2-HARD) closed that specific gap for TunnelLocal specs with a short,
+// bounded local-bind confirmation immediately after Start(): this fake ssh
+// (`exit 1`) never binds anything, so CreateTunnel itself now reports
+// State=TunnelFailed synchronously, before reapTunnel's independent exit
+// capture ever gets a chance to run. Because ssh (for real usage) also runs
+// with ExitOnForwardFailure=yes, it exits NON-ZERO on its own an instant
+// later when a forward genuinely cannot be set up (remote port already bound,
+// auth / host-key mismatch) — that later, asynchronous death is what
+// reapTunnel's waitErr-capture handles. A dead-on-arrival tunnel MUST NOT
+// silently vanish from ListTunnels either way: the reaper must capture the
+// non-zero exit, mark (or confirm) the tunnel State=TunnelFailed, and KEEP it
+// queryable so a caller can detect the failure. This closes the
 // "absence-of-error masks a dead tunnel" anti-bluff pattern.
 //
 // GREEN-polarity guard (§11.4.115): PASSes on the fixed tree; a surgical revert
@@ -50,8 +57,9 @@ func TestWave20_Network_CreateTunnel_DeadOnArrivalIsQueryableAsFailed(t *testing
 	})
 	require.NoError(t, err)
 	require.NotNil(t, info)
-	require.Equal(t, TunnelActive, info.State,
-		"CreateTunnel reports Active on cmd.Start() success — before the forward is confirmed")
+	require.Equal(t, TunnelFailed, info.State,
+		"NET2-2: a local port this ssh double never binds must NOT be reported "+
+			"Active, even synchronously from CreateTunnel's own return value")
 
 	port, err := strconv.Atoi(info.Spec.LocalPort)
 	require.NoError(t, err)

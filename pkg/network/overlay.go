@@ -108,7 +108,11 @@ func (o *TunnelOverlay) Delete(
 	return nil
 }
 
-// Connect adds a container to the overlay network.
+// Connect adds a container to the overlay network. It is idempotent: calling
+// it again for a containerID already recorded as a member is a no-op (NET2-5)
+// rather than appending a duplicate entry — a caller that retries a Connect
+// (e.g. after an ambiguous timeout) must not corrupt List()'s membership
+// count with repeats of the same container.
 func (o *TunnelOverlay) Connect(
 	ctx context.Context, network, containerID string,
 ) error {
@@ -120,6 +124,15 @@ func (o *TunnelOverlay) Connect(
 		return fmt.Errorf(
 			"overlay network %q not found", network,
 		)
+	}
+
+	for _, c := range containers {
+		if c == containerID {
+			o.logger.Info("container %s already connected to network %s",
+				containerID, network,
+			)
+			return nil
+		}
 	}
 
 	o.networks[network] = append(containers, containerID)

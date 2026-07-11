@@ -9,6 +9,23 @@ type Options struct {
 	// PortRangeEnd is the end of the local port range.
 	PortRangeEnd int
 
+	// KeepAlive is the interval for SSH keep-alive messages on tunnel
+	// sessions (maps to ssh -o ServerAliveInterval). Mirrors
+	// pkg/remote.Options.KeepAlive (NET2-3): tunnelArgs previously hardcoded
+	// this as a literal (ServerAliveInterval=30) with no Option to override
+	// it. Set to 0 (together with KeepAliveCountMax <= 0) to disable
+	// keep-alive probing on the ssh tunnel command.
+	KeepAlive time.Duration
+	// KeepAliveCountMax is the maximum number of missed keep-alive probes
+	// before ssh terminates the tunnel session (maps to ssh -o
+	// ServerAliveCountMax). Mirrors pkg/remote.Options.KeepAliveCountMax
+	// (NET2-3).
+	KeepAliveCountMax int
+	// StrictHostKeyCheck enables SSH strict host key checking for tunnel
+	// sessions (maps to ssh -o StrictHostKeyChecking). Mirrors
+	// pkg/remote.Options.StrictHostKeyCheck (NET2-3).
+	StrictHostKeyCheck bool
+
 	// AutoReconnect, ReconnectInterval, and MaxReconnectAttempts are NOT YET
 	// IMPLEMENTED. They are config-only stubs — DefaultOptions() defaults
 	// AutoReconnect to true and the With* setters store all three, but NOTHING
@@ -33,10 +50,18 @@ type Options struct {
 }
 
 // DefaultOptions returns sensible defaults.
+//
+// KeepAlive / KeepAliveCountMax / StrictHostKeyCheck default to the EXACT
+// values tunnelArgs hardcoded before NET2-3 (30s / 3 / false ⇒
+// "StrictHostKeyChecking=no") so an unconfigured caller's built ssh args are
+// byte-for-byte unchanged.
 func DefaultOptions() Options {
 	return Options{
 		PortRangeStart:       20000,
 		PortRangeEnd:         30000,
+		KeepAlive:            30 * time.Second,
+		KeepAliveCountMax:    3,
+		StrictHostKeyCheck:   false,
 		AutoReconnect:        true,
 		ReconnectInterval:    5 * time.Second,
 		MaxReconnectAttempts: 10,
@@ -61,6 +86,27 @@ func WithPortRange(start, end int) Option {
 		o.PortRangeStart = start
 		o.PortRangeEnd = end
 	}
+}
+
+// WithKeepAlive sets the SSH keep-alive interval (ServerAliveInterval) used
+// by tunnel sessions. Set to 0 to disable keep-alive probing. Mirrors
+// pkg/remote.WithKeepAlive (NET2-3).
+func WithKeepAlive(d time.Duration) Option {
+	return func(o *Options) { o.KeepAlive = d }
+}
+
+// WithKeepAliveCountMax sets the maximum number of missed SSH keep-alive
+// probes tolerated on a tunnel session before ssh terminates it
+// (ServerAliveCountMax). Mirrors pkg/remote.WithKeepAliveCountMax (NET2-3).
+func WithKeepAliveCountMax(n int) Option {
+	return func(o *Options) { o.KeepAliveCountMax = n }
+}
+
+// WithStrictHostKeyCheck enables or disables SSH strict host key checking
+// for tunnel sessions (StrictHostKeyChecking). Mirrors
+// pkg/remote.WithStrictHostKeyCheck (NET2-3).
+func WithStrictHostKeyCheck(enabled bool) Option {
+	return func(o *Options) { o.StrictHostKeyCheck = enabled }
 }
 
 // WithAutoReconnect enables or disables automatic reconnection.

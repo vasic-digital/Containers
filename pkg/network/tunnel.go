@@ -72,6 +72,48 @@ func (e *tunnelEntry) wait() error {
 	return e.waitErr
 }
 
+// tunnelBindPollInterval and tunnelBindPollWindow bound the cheap local-bind
+// confirmation CreateTunnel performs for TunnelLocal specs immediately after
+// cmd.Start() succeeds (NET2-2). Short and bounded so CreateTunnel never
+// hangs waiting on a slow or dead ssh process: a real ssh -L forward binds
+// its local listener within milliseconds of forking — long before the SSH
+// handshake, let alone the remote side of the forward, completes — so this
+// window is enough to catch a fork that silently never binds (a malformed
+// forward spec, an immediate ssh crash) without materially slowing down the
+// common (successful) case.
+const (
+	tunnelBindPollInterval = 10 * time.Millisecond
+	tunnelBindPollWindow   = 200 * time.Millisecond
+)
+
+// confirmLocalBind polls isPortAvailable(port) for up to tunnelBindPollWindow,
+// returning true the moment something binds the port (isPortAvailable reports
+// false — the socket is no longer free) and false if the window elapses with
+// the port still free. It never blocks longer than the window: this is a
+// cheap local readiness check, NOT proof the remote side of the ssh forward
+// is fully established (that remains an honest gap — see the CreateTunnel
+// call site).
+func confirmLocalBind(port int) bool {
+	deadline := time.Now().Add(tunnelBindPollWindow)
+	for {
+		if !isPortAvailable(port) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(tunnelBindPollInterval)
+	}
+}
+
+// yesNo renders an SSH -o boolean option value ("yes"/"no").
+func yesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
 // NewTunnelManager creates a DefaultTunnelManager.
 func NewTunnelManager(
 	hostManager remote.HostManager,
@@ -136,10 +178,38 @@ func (m *DefaultTunnelManager) CreateTunnel(
 		)
 	}
 
+	// NET2-2: cmd.Start() only proves the ssh process forked — it says
+	// nothing about whether the forward was actually established. For local
+	// forwards (TunnelLocal), ssh binds its local listener within
+	// milliseconds of forking, so a short, bounded poll for "something now
+	// owns the local socket" is a cheap, honest readiness signal: report
+	// TunnelActive only once confirmed, TunnelFailed if the window elapses
+	// with nothing bound — never silently claim success, never hang. This is
+	// deliberately narrow (a positive local bind is necessary, not
+	// sufficient, proof the remote side of the forward works) and
+	// complements, never replaces, reapTunnel's exit-capture below, which
+	// keeps catching a later ssh death regardless of what state we report
+	// here. TunnelRemote is out of scope: its LocalPort is not necessarily
+	// bound by our own ssh process, so isPortAvailable would not be a
+	// meaningful signal for it.
+	state := TunnelActive
+	if spec.Direction == TunnelLocal {
+		if localPortNum, perr := strconv.Atoi(spec.LocalPort); perr == nil {
+			if !confirmLocalBind(localPortNum) {
+				state = TunnelFailed
+				m.logger.Info(
+					"tunnel local bind not confirmed within %s: "+
+						"local port %s via %s",
+					tunnelBindPollWindow, spec.LocalPort, hostName,
+				)
+			}
+		}
+	}
+
 	info := TunnelInfo{
 		Spec:      spec,
 		HostName:  hostName,
-		State:     TunnelActive,
+		State:     state,
 		CreatedAt: time.Now(),
 		PID:       cmd.Process.Pid,
 	}
@@ -169,19 +239,31 @@ func (m *DefaultTunnelManager) CreateTunnel(
 	m.tunnels[spec.LocalPort] = entry
 	m.mu.Unlock()
 
+	// NET2-4: an explicit LocalPort was never recorded in the allocator's own
+	// bookkeeping, so IsAllocated / AllocatedCount / ListAllocations
+	// under-reported reality for it — only auto-allocated ports were ever
+	// visible there, so a caller probing the allocator for a free port could
+	// get a false "not allocated" for a live explicit-port tunnel (a wasted
+	// spawn-then-reject). Register it now that this tunnel has won the map
+	// race above and is the sole owner of this port. CloseTunnel's existing
+	// unconditional m.allocator.Release(port) and reapTunnel's clean-exit
+	// release (below) already handle releasing it correctly for both
+	// origins — m.tunnels remains the real collision guard either way.
+	if autoAllocatedPort < 0 {
+		if explicitPortNum, perr := strconv.Atoi(spec.LocalPort); perr == nil {
+			m.allocator.MarkAllocated(explicitPortNum, spec.Description)
+		}
+	}
+
 	// Reap the ssh process when it exits, so a tunnel that dies (crashes, is
 	// killed out from under us, or the SSH server drops it) is removed from the
 	// active set and its port released — instead of lingering forever in
-	// State=Active with a zombie child and a permanently-leaked port.
-	// autoAllocatedPort (>=0 only when we auto-allocated the port) is passed so
-	// the reaper releases ONLY a reservation this tunnel owns. An explicit port
-	// was never allocator-managed, so releasing it here could free a *different*
-	// live auto-tunnel that happens to hold that same integer. ctx is passed so
-	// the reaper can tell an intentional teardown (ctx cancelled →
+	// State=Active with a zombie child and a permanently-leaked port. ctx is
+	// passed so the reaper can tell an intentional teardown (ctx cancelled →
 	// exec.CommandContext killed ssh — a normal close) from a tunnel that died on
 	// its own (a forward-failure death, which must be surfaced as
 	// State=TunnelFailed rather than silently deleted).
-	go m.reapTunnel(ctx, spec.LocalPort, entry, autoAllocatedPort)
+	go m.reapTunnel(ctx, spec.LocalPort, entry)
 
 	m.logger.Info(
 		"tunnel created: %s %s:%s <-> local:%s via %s",
@@ -235,15 +317,24 @@ func (m *DefaultTunnelManager) CloseTunnel(
 //     "absence-of-error masks a dead tunnel" bluff. Instead mark it
 //     State=TunnelFailed and KEEP it queryable so a caller polling ListTunnels
 //     can detect the failure and CloseTunnel it (which releases the port). The
-//     auto-allocated port is deliberately NOT released here, preserving the
-//     invariant "an entry in m.tunnels ⟺ its auto port is still allocated".
+//     port is deliberately NOT released here, preserving the invariant "an
+//     entry in m.tunnels ⟺ its port is still allocated" — this now holds for
+//     BOTH auto-allocated AND explicit ports (NET2-4: CreateTunnel registers
+//     an explicit LocalPort in the allocator too, right after it wins the map
+//     race above).
 //
 //   - Clean exit (waitErr == nil) OR intentional teardown (ctx cancelled →
-//     exec.CommandContext killed ssh — a normal close, not a failure): remove the
-//     entry and release its auto-allocated port, exactly as before.
+//     exec.CommandContext killed ssh — a normal close, not a failure): remove
+//     the entry and release its allocator reservation, exactly as before.
+//     NET2-4: this release is now unconditional (parsed straight from
+//     localPort) because CreateTunnel registers EVERY successfully-created
+//     tunnel's port in the allocator, auto-allocated or explicit — previously
+//     only auto-allocated ports were released here, silently leaking the
+//     allocator's bookkeeping for an explicit-port tunnel that exited cleanly
+//     without ever being closed by the caller.
 func (m *DefaultTunnelManager) reapTunnel(
 	ctx context.Context,
-	localPort string, entry *tunnelEntry, autoAllocatedPort int,
+	localPort string, entry *tunnelEntry,
 ) {
 	waitErr := entry.wait()
 
@@ -271,8 +362,8 @@ func (m *DefaultTunnelManager) reapTunnel(
 	delete(m.tunnels, localPort)
 	m.mu.Unlock()
 
-	if autoAllocatedPort >= 0 {
-		m.allocator.Release(autoAllocatedPort)
+	if port, perr := strconv.Atoi(localPort); perr == nil {
+		m.allocator.Release(port)
 	}
 	m.logger.Info(
 		"tunnel reaped: local port %s (ssh process exited)", localPort,
@@ -342,7 +433,7 @@ func (m *DefaultTunnelManager) CloseAll() error {
 func (m *DefaultTunnelManager) tunnelArgs(
 	host remote.RemoteHost, spec TunnelSpec,
 ) []string {
-	var fwdArg string
+	var fwdFlag, fwdSpec string
 	remoteTarget := spec.RemoteHost
 	if remoteTarget == "" {
 		remoteTarget = "localhost"
@@ -350,24 +441,52 @@ func (m *DefaultTunnelManager) tunnelArgs(
 
 	switch spec.Direction {
 	case TunnelRemote:
-		fwdArg = fmt.Sprintf("-R %s:%s:%s",
+		fwdFlag = "-R"
+		fwdSpec = fmt.Sprintf("%s:%s:%s",
 			spec.RemotePort, remoteTarget, spec.LocalPort,
 		)
 	default: // TunnelLocal
-		fwdArg = fmt.Sprintf("-L %s:%s:%s",
+		fwdFlag = "-L"
+		fwdSpec = fmt.Sprintf("%s:%s:%s",
 			spec.LocalPort, remoteTarget, spec.RemotePort,
 		)
 	}
 
+	// NET2-1: the forward flag and its spec are passed as TWO independent
+	// argv elements (matching pkg/egress.buildDynamicForwardArgs' -D form),
+	// not one combined "-L host:port:port" string relying on a getopt
+	// whitespace-tolerance quirk of the local OpenSSH build. Every test
+	// double in this package (writeFakeSSH's shell-script fakes) ignores
+	// argv entirely, so a broken single-string forward spec would never be
+	// caught without a real argv-dumping double — see
+	// TestNET2_1_ForwardSpec_TwoTokenArgv.
 	args := []string{
 		"-N",
-		fwdArg,
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "ServerAliveInterval=30",
-		"-o", "ServerAliveCountMax=3",
+		fwdFlag, fwdSpec,
+		"-o", "StrictHostKeyChecking=" + yesNo(m.opts.StrictHostKeyCheck),
+	}
+
+	// NET2-3: keep-alive is now Option-driven (mirrors pkg/remote.Options),
+	// defaulting to the SAME literals this function hardcoded before
+	// (ServerAliveInterval=30, ServerAliveCountMax=3) so an unconfigured
+	// caller's built args are byte-for-byte unchanged.
+	if m.opts.KeepAlive > 0 && m.opts.KeepAliveCountMax > 0 {
+		args = append(args,
+			"-o", fmt.Sprintf(
+				"ServerAliveInterval=%d",
+				int(m.opts.KeepAlive.Seconds()),
+			),
+			"-o", fmt.Sprintf(
+				"ServerAliveCountMax=%d",
+				m.opts.KeepAliveCountMax,
+			),
+		)
+	}
+
+	args = append(args,
 		"-o", "ExitOnForwardFailure=yes",
 		"-p", strconv.Itoa(host.SSHPort()),
-	}
+	)
 
 	if host.KeyPath != "" {
 		args = append(args, "-i", host.KeyPath)
