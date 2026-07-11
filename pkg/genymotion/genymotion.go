@@ -33,6 +33,12 @@ import (
 // any OS-appropriate candidate path or on PATH.
 var ErrNotInstalled = errors.New("genymotion: gmtool not found (Genymotion Desktop not installed or not on PATH)")
 
+// ErrUnsafeName is returned by [Tool.Start] / [Tool.Stop] / [Tool.StartAndWait]
+// when a caller-supplied device Name/UUID BEGINS WITH '-' and would therefore be
+// parsed by gmtool's own option parser as a FLAG rather than a positional device
+// argument (argument injection). See [ensureSafeName].
+var ErrUnsafeName = errors.New("genymotion: refusing device name that begins with '-' (gmtool would parse it as an option — argument injection)")
+
 // Device is one row of `gmtool admin list` — a Genymotion virtual device.
 type Device struct {
 	// State is "On" (running) or "Off" (stopped) as reported by gmtool.
@@ -169,9 +175,32 @@ func (t *Tool) Running(ctx context.Context) ([]Device, error) {
 	return on, nil
 }
 
+// ensureSafeName rejects a device Name/UUID that BEGINS WITH '-'. gmtool
+// subcommands are spawned as a bare argv (exec.CommandContext(path, "admin",
+// "start"/"stop", name), no shell), so shell metacharacters in name are inert —
+// but name is appended as the FINAL positional argv element with no "--" guard,
+// so a name that begins with '-' is parsed by gmtool's OWN option parser as a
+// FLAG, not a device (e.g. "-v"/"--help"/"--config=<path>" reaches gmtool's
+// getopt instead of naming a device). gmtool has no documented, reliable "--"
+// end-of-options for the device positional (§11.4.6 no-guessing — do NOT assume
+// one exists), so refusal BEFORE any exec is the safe, deterministic fix. The
+// checked value is byte-identical to the spawned argv element (single source of
+// truth — a leading space yields " -x", which begins with ' ' and is inert to
+// getopt, so it is correctly NOT rejected). Mirrors pkg/network §NET3 +
+// pkg/egress §EG2-1 (ssh has the same no-reliable-"--" property).
+func ensureSafeName(name string) error {
+	if strings.HasPrefix(name, "-") {
+		return fmt.Errorf("%w: %q", ErrUnsafeName, name)
+	}
+	return nil
+}
+
 // Start boots the named virtual device (`gmtool admin start <name>`). It is a
 // no-op-safe call: gmtool returns success if the device is already running.
 func (t *Tool) Start(ctx context.Context, name string) error {
+	if err := ensureSafeName(name); err != nil {
+		return err
+	}
 	out, err := t.exec(ctx, t.Path, "admin", "start", name)
 	if err != nil {
 		return fmt.Errorf("genymotion: gmtool admin start %q failed: %w (%s)", name, err, strings.TrimSpace(out))
@@ -181,6 +210,9 @@ func (t *Tool) Start(ctx context.Context, name string) error {
 
 // Stop shuts the named virtual device down (`gmtool admin stop <name>`).
 func (t *Tool) Stop(ctx context.Context, name string) error {
+	if err := ensureSafeName(name); err != nil {
+		return err
+	}
 	out, err := t.exec(ctx, t.Path, "admin", "stop", name)
 	if err != nil {
 		return fmt.Errorf("genymotion: gmtool admin stop %q failed: %w (%s)", name, err, strings.TrimSpace(out))
