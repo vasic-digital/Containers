@@ -45,6 +45,22 @@ var interruptSignal os.Signal = os.Interrupt
 // fails (Simulator subsystem unavailable — e.g. non-macOS host).
 var ErrNotInstalled = errors.New("applesim: xcrun simctl not available (Xcode command-line tools not installed, or not a macOS host)")
 
+// ErrUnsafeArg (SIM2-1, SECURITY argv flag-injection §11.4.174-adjacent) is
+// returned when a caller-supplied identifier or path that is handed to simctl
+// as a POSITIONAL argument begins with '-'. simctl (like every getopt-style
+// CLI) parses a leading-'-' token as an OPTION/FLAG, not a positional, so a
+// crafted or typo'd UDID / bundle id / .app path / output path beginning with
+// '-' is an argv flag-injection vector (e.g. a "--foo" reaching `simctl io
+// <udid> screenshot <outPath>` selects an option instead of the file). A
+// legitimate CoreSimulator UDID (a UUID), bundle id (reverse-DNS), or absolute
+// filesystem path never begins with '-'; a caller needing a relative path may
+// prefix "./". This mirrors the reject-before-exec discipline the sibling
+// pkg/genymotion (GENY2-1) + pkg/network (NET3) + pkg/egress (EG2-1) packages
+// apply where the downstream CLI has no reliable end-of-options "--" terminator
+// — simctl's positional grammar is not documented to honour "--", so the guard
+// refuses the value rather than GUESS that "--" would neutralise it (§11.4.6).
+var ErrUnsafeArg = errors.New("applesim: argument begins with '-' (would be parsed as a simctl flag; refusing to inject)")
+
 // Device is one simulator device as reported by `xcrun simctl list devices -j`.
 type Device struct {
 	// UDID is the simulator's stable unique identifier (the canonical handle
@@ -86,6 +102,21 @@ func realExec(ctx context.Context, path string, args ...string) (string, error) 
 	cmd := exec.CommandContext(ctx, path, args...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// checkArgs (SIM2-1) rejects — BEFORE any process is spawned — any positional
+// argument that begins with '-', which simctl would parse as a flag rather than
+// a value. An empty string is permitted: `simctl <cmd> ""` yields a clear
+// "invalid device/path" from simctl itself (not an injection), so the guard
+// stays narrow to the actual flag-injection shape and never over-rejects a
+// legitimate value (the anti-tautology negative control proves this).
+func checkArgs(args ...string) error {
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			return fmt.Errorf("%w: %q", ErrUnsafeArg, a)
+		}
+	}
+	return nil
 }
 
 // Detect locates the `xcrun` binary on PATH and verifies the simctl subsystem
@@ -201,6 +232,9 @@ func (t *Tool) Resolve(ctx context.Context, idOrName string) (Device, error) {
 // no-op-safe: simctl returns a "current state: Booted" error if already booted,
 // which Boot treats as success.
 func (t *Tool) Boot(ctx context.Context, udid string) error {
+	if err := checkArgs(udid); err != nil {
+		return err
+	}
 	out, err := t.exec(ctx, t.Path, "simctl", "boot", udid)
 	if err != nil {
 		// "Unable to boot device in current state: Booted" is benign. SIM-5: the
@@ -233,12 +267,30 @@ func (t *Tool) BootAndWait(ctx context.Context, udid string, timeout time.Durati
 	if out, err := t.exec(bctx, t.Path, "simctl", "bootstatus", udid, "-b"); err != nil {
 		return Device{}, fmt.Errorf("applesim: bootstatus %q did not complete within %s: %w (%s)", udid, timeout, err, strings.TrimSpace(out))
 	}
-	return t.Resolve(bctx, udid)
+	dev, rerr := t.Resolve(bctx, udid)
+	if rerr != nil {
+		return Device{}, rerr
+	}
+	// SIM2-2 (§11.4.108 runtime-signature — reported-ready-while-not): a 0 exit
+	// from bootstatus is the boot signal, but BootAndWait's contract is "returns
+	// the device once it is fully booted" — so CONFIRM the freshly-resolved
+	// device is ACTUALLY in the Booted state before handing it back. Without this
+	// the method returned whatever state Resolve read (e.g. a device still
+	// "Booting", or one that shut down again in the race between bootstatus
+	// exiting and the list snapshot) paired with a nil error, so a caller trusted
+	// a NOT-booted Device as booted. Report the discrepancy instead of bluffing.
+	if !dev.IsBooted() {
+		return Device{}, fmt.Errorf("applesim: BootAndWait %q: bootstatus completed but device state is %q, not Booted", udid, dev.State)
+	}
+	return dev, nil
 }
 
 // Install installs an .app bundle onto the device
 // (`xcrun simctl install <udid> <appPath>`).
 func (t *Tool) Install(ctx context.Context, udid, appPath string) error {
+	if err := checkArgs(udid, appPath); err != nil {
+		return err
+	}
 	out, err := t.exec(ctx, t.Path, "simctl", "install", udid, appPath)
 	if err != nil {
 		return fmt.Errorf("applesim: xcrun simctl install %q %q failed: %w (%s)", udid, appPath, err, strings.TrimSpace(out))
@@ -250,6 +302,9 @@ func (t *Tool) Install(ctx context.Context, udid, appPath string) error {
 // (`xcrun simctl launch <udid> <bundleID>`) and returns the launched PID line
 // simctl prints (e.g. "com.example.app: 38941").
 func (t *Tool) Launch(ctx context.Context, udid, bundleID string) (string, error) {
+	if err := checkArgs(udid, bundleID); err != nil {
+		return "", err
+	}
 	out, err := t.exec(ctx, t.Path, "simctl", "launch", udid, bundleID)
 	if err != nil {
 		return "", fmt.Errorf("applesim: xcrun simctl launch %q %q failed: %w (%s)", udid, bundleID, err, strings.TrimSpace(out))
@@ -260,6 +315,9 @@ func (t *Tool) Launch(ctx context.Context, udid, bundleID string) (string, error
 // Terminate stops a running app by bundle id
 // (`xcrun simctl terminate <udid> <bundleID>`).
 func (t *Tool) Terminate(ctx context.Context, udid, bundleID string) error {
+	if err := checkArgs(udid, bundleID); err != nil {
+		return err
+	}
 	out, err := t.exec(ctx, t.Path, "simctl", "terminate", udid, bundleID)
 	if err != nil {
 		return fmt.Errorf("applesim: xcrun simctl terminate %q %q failed: %w (%s)", udid, bundleID, err, strings.TrimSpace(out))
@@ -270,6 +328,9 @@ func (t *Tool) Terminate(ctx context.Context, udid, bundleID string) error {
 // Screenshot captures a still image of the device screen to outPath
 // (`xcrun simctl io <udid> screenshot <outPath>`).
 func (t *Tool) Screenshot(ctx context.Context, udid, outPath string) error {
+	if err := checkArgs(udid, outPath); err != nil {
+		return err
+	}
 	out, err := t.exec(ctx, t.Path, "simctl", "io", udid, "screenshot", outPath)
 	if err != nil {
 		return fmt.Errorf("applesim: xcrun simctl io %q screenshot %q failed: %w (%s)", udid, outPath, err, strings.TrimSpace(out))
@@ -337,6 +398,9 @@ func (r *Recording) Stop() error {
 // that need a hard cap can wrap Stop() in their own deadline.
 func (t *Tool) RecordVideo(ctx context.Context, udid, outPath string, codec string) (*Recording, error) {
 	_ = ctx // see doc comment: the recorder is deliberately detached from the per-call ctx.
+	if err := checkArgs(udid, outPath); err != nil {
+		return nil, err
+	}
 	args := []string{"simctl", "io", udid, "recordVideo"}
 	if codec != "" {
 		args = append(args, "--codec="+codec)
@@ -354,6 +418,9 @@ func (t *Tool) RecordVideo(ctx context.Context, udid, outPath string, codec stri
 // Shutdown shuts the device down (`xcrun simctl shutdown <udid>`). It is
 // no-op-safe: a "current state: Shutdown" error is treated as success.
 func (t *Tool) Shutdown(ctx context.Context, udid string) error {
+	if err := checkArgs(udid); err != nil {
+		return err
+	}
 	out, err := t.exec(ctx, t.Path, "simctl", "shutdown", udid)
 	if err != nil {
 		// SIM-5: "current state: Shutdown" is subsumed by "state: Shutdown" — one
