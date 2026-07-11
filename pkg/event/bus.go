@@ -139,10 +139,27 @@ func (b *DefaultEventBus) Publish(
 // shutdown) would insert a map entry that Close() has already run and
 // will never come back to reclaim: an unbounded leak, plus a normal-
 // looking SubscriptionID with no signal the bus is actually shut down.
+//
+// A nil handler is likewise rejected with the empty SubscriptionID
+// sentinel BEFORE any map entry or goroutine is created (CT-HARDEN-EV2-1,
+// Wave-20 DEEPER). Without this guard a nil handler was accepted: a live
+// map entry + a delivery goroutine were created, and EVERY matching
+// Publish then invoked handler==nil, which panics (invalid memory
+// address / nil-pointer dereference). dispatch's recover() contains that
+// panic so the process survives, but the result is an unbounded stream of
+// recovered-nil-deref panics with a full debug.Stack() dump logged on
+// every matching event, for a "zombie" subscription that can never do
+// useful work — a programming error silently swallowed into permanent log
+// spam. Failing fast (same empty-sentinel contract as a closed bus) means
+// the zombie subscription is never created in the first place.
 func (b *DefaultEventBus) Subscribe(
 	filter EventFilter,
 	handler EventHandler,
 ) SubscriptionID {
+	if handler == nil {
+		return SubscriptionID("")
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 

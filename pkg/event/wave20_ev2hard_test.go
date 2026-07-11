@@ -348,3 +348,111 @@ func TestDefaultEventBus_SubscribeAfterClose_NoMapEntryLeak(t *testing.T) {
 			"(CT-HARDEN-EV-3 regression)", n)
 	}
 }
+
+// =====================================================================
+// Wave-20 DEEPER (§11.4.118 loop-until-dry) — SECOND-PASS findings.
+// Named TestWave20_EV2_<Desc>. Each is a §11.4.115 GREEN-polarity guard
+// proven genuine by a SURGICAL single-line REVERT of its fix (the RED
+// polarity is the source-level revert, deterministic — not a timing
+// gamble), captured in this stream's anti-tautology run.
+// =====================================================================
+
+// TestWave20_EV2_NilHandlerRejected is the permanent regression guard for
+// CT-HARDEN-EV2-1 (Wave-20 DEEPER): a nil handler passed to Subscribe()
+// must be rejected up front with the empty SubscriptionID sentinel — never
+// accepted into a live map entry with a spawned delivery goroutine.
+//
+// Root cause (pre-fix): Subscribe() validated only b.closed, never the
+// handler. A nil handler was accepted: it inserted a map entry and spawned
+// go sub.run(...). Then EVERY matching Publish() reached
+// subscription.dispatch, which called s.handler(...) == nil(...) and
+// panicked (invalid memory address / nil-pointer dereference). dispatch's
+// recover() contained the panic so the process did not crash — but that is
+// precisely why it was insidious: an unbounded stream of recovered
+// nil-deref panics, each with a full debug.Stack() dump, was logged on
+// every matching event, for a "zombie" subscription that could never do
+// useful work. A programming error (nil handler) was silently swallowed
+// into permanent log spam + a wasted goroutine instead of failing fast.
+//
+// Fix: Subscribe() rejects handler == nil with the same empty-sentinel
+// contract it already uses for a closed bus, BEFORE inserting a map entry
+// or spawning a goroutine — so the zombie subscription is never created.
+//
+// This is an in-package unit guard: it reads bus.subs (unexported) purely
+// to OBSERVE that no map entry leaked, never to bypass the public API.
+func TestWave20_EV2_NilHandlerRejected(t *testing.T) {
+	bus := NewEventBus(8)
+	defer bus.Close()
+
+	// A healthy subscriber alongside the nil one — used below to prove the
+	// bus is still fully usable (the nil rejection is inert, not corrupting).
+	var healthy sync.WaitGroup
+	healthy.Add(1)
+	var healthyOnce sync.Once
+	var healthyHits atomic.Int32
+	healthyID := bus.Subscribe(EventFilter{}, func(_ context.Context, _ Event) {
+		healthyHits.Add(1)
+		healthyOnce.Do(healthy.Done)
+	})
+	if healthyID == SubscriptionID("") {
+		t.Fatal("setup: a non-nil handler was unexpectedly rejected")
+	}
+
+	// The subject under test: a nil handler.
+	nilID := bus.Subscribe(EventFilter{}, nil)
+
+	// (1) A nil handler MUST be rejected with the empty sentinel — the same
+	// signal a closed bus gives — never a normal-looking id.
+	if nilID != SubscriptionID("") {
+		t.Fatalf("Subscribe(_, nil) returned %q — a nil handler must be "+
+			"rejected with the empty SubscriptionID sentinel, not accepted "+
+			"as a live subscription whose every matching Publish() invokes "+
+			"nil() and panics (recovered into unbounded log spam) "+
+			"(CT-HARDEN-EV2-1 regression)", nilID)
+	}
+
+	// (2) No zombie map entry / delivery goroutine may have been created for
+	// the nil handler: only the one healthy subscriber must be present.
+	bus.mu.RLock()
+	n := len(bus.subs)
+	_, nilPresent := bus.subs[nilID]
+	bus.mu.RUnlock()
+	if n != 1 || nilPresent {
+		t.Fatalf("Subscribe(_, nil) left the subscription map at size %d "+
+			"(nil entry present=%v) — expected exactly the 1 healthy "+
+			"subscriber and NO entry for the rejected nil handler; a "+
+			"zombie nil-handler subscription leaks a goroutine and panics "+
+			"on every matching Publish (CT-HARDEN-EV2-1 regression)",
+			n, nilPresent)
+	}
+
+	// (3) Anti-bluff: the bus is still fully functional after the rejection —
+	// a matching Publish reaches the healthy subscriber, and the rejected
+	// nil handler contributes nothing (no panic, no spam, no delivery).
+	bus.Publish(context.Background(),
+		NewEvent(EventContainerStarted, "ev2-nil", "probe"))
+
+	select {
+	case <-waitGroupCh(&healthy):
+	case <-time.After(2 * time.Second):
+		t.Fatal("healthy subscriber never fired after a nil handler was " +
+			"rejected — the rejection must be inert, leaving the bus fully " +
+			"usable (CT-HARDEN-EV2-1 regression)")
+	}
+	if got := healthyHits.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 delivery to the healthy subscriber, "+
+			"got %d", got)
+	}
+}
+
+// waitGroupCh returns a channel closed when wg is Done. Small local helper
+// so the nil-handler guard can select on the WaitGroup with a timeout
+// without importing anything new.
+func waitGroupCh(wg *sync.WaitGroup) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return done
+}
