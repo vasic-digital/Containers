@@ -295,7 +295,32 @@ func (m *DefaultManager) Start(
 		}
 	}
 
+	// LIFE2-1 (constitution/Constitution.md §11.4.108 dead-service-reported-
+	// running audit — a Stop-vs-in-flight-boot resurrection the first LIFE pass
+	// missed): the boot sequence above (dependency recursion, orchestrator.Up,
+	// health check) ran with m.mu RELEASED, so a concurrent Stop() could have
+	// transitioned this service out of the "starting" boot THIS leader owns —
+	// setting state to "stopping"/"stopped" AND running compose Down() to tear
+	// the containers down. Committing "running" unconditionally here would then
+	// overwrite that "stopped" back to "running", reporting a service whose
+	// containers were already torn down as running (§11.4.108) and — on the
+	// coalescing path — publishing op.err=nil so every blocked follower wakes
+	// with a fabricated success (§11.4.1). Only commit "running" if this leader
+	// STILL owns the in-flight boot (state=="starting" AND startOp==op). If a
+	// concurrent Stop cancelled our own boot, honor the stop (settle to
+	// "stopped", drop stale health) and fail this start; if a newer boot
+	// superseded ours, do not touch the shared state the new leader owns.
 	m.mu.Lock()
+	if entry.startOp != op || entry.state != "starting" {
+		if entry.startOp == op {
+			entry.state = "stopped"
+			entry.healthy = false
+		}
+		m.mu.Unlock()
+		return fmt.Errorf(
+			"lifecycle: start %q cancelled by concurrent stop", name,
+		)
+	}
 	entry.state = "running"
 	entry.lastStart = time.Now()
 	m.mu.Unlock()
