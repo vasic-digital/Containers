@@ -29,9 +29,12 @@ import (
 	"digital.vasic.containers/pkg/runtime"
 )
 
-// natsImage is the pinned NATS image used for the ephemeral broker. A pinned
-// minor tag keeps test runs reproducible and the alpine variant keeps the pull
-// and memory footprint tiny.
+// natsImage is the default NATS image used for the ephemeral broker. The alpine
+// variant keeps the pull and memory footprint tiny. NOTE (BROK-5): a moving tag
+// like "2.10-alpine" is NOT byte-for-byte reproducible — the registry can
+// re-point it at a new digest at any time; only an immutable "@sha256:<digest>"
+// reference is truly reproducible. Callers that need pinned reproducibility can
+// pass WithImage("docker.io/library/nats@sha256:...").
 const natsImage = "docker.io/library/nats:2.10-alpine"
 
 // natsClientPort is the in-container port NATS listens on for clients.
@@ -154,8 +157,10 @@ func StartNATS(ctx context.Context, opts ...Option) (endpoint string, stop func(
 	}
 
 	// The one capability pkg/runtime's interface lacks: run a NEW container from
-	// an image with published ports. Done via the detected runtime's CLI.
-	runOut, runErr := exec.CommandContext(ctx, binary, args...).CombinedOutput()
+	// an image with published ports. Done via the detected runtime's CLI. On a
+	// run failure runNewContainer best-effort removes any container the failed
+	// run may have created before returning the error (BROK-2).
+	runOut, runErr := runNewContainer(ctx, rt, execRun, binary, name, args)
 	if runErr != nil {
 		return "", noopStop, fmt.Errorf(
 			"brokertest: %s run failed: %w: %s", binary, runErr, strings.TrimSpace(string(runOut)))
@@ -166,14 +171,20 @@ func StartNATS(ctx context.Context, opts ...Option) (endpoint string, stop func(
 	// failure path can still clean up.
 	stop = makeStop(rt, name)
 
-	hostPort, err := resolveHostPort(ctx, rt, name, cfg.hostPort)
+	// Bound the resolve + readiness phase so a container that starts but never
+	// serves fails with a clear timeout instead of hanging on a deadline-less
+	// ctx (BROK-1, §11.4.108). A caller-supplied deadline is respected as-is.
+	phaseCtx, cancelPhase := startupContext(ctx, defaultStartupTimeout)
+	defer cancelPhase()
+
+	hostPort, err := resolveHostPort(phaseCtx, rt, name, cfg.hostPort)
 	if err != nil {
 		stop()
 		return "", noopStop, fmt.Errorf("brokertest: resolve host port: %w", err)
 	}
 
 	endpoint = fmt.Sprintf("nats://127.0.0.1:%s", hostPort)
-	if err := waitReady(ctx, hostPort); err != nil {
+	if err := waitReady(phaseCtx, hostPort); err != nil {
 		stop()
 		return "", noopStop, fmt.Errorf("brokertest: nats not ready at %s: %w", endpoint, err)
 	}
@@ -196,19 +207,91 @@ func hostPortSpec(hostPort string) string {
 func noopStop() {}
 
 // makeStop returns an idempotent teardown closure that removes the container
-// via pkg/runtime. It uses a fresh, bounded context so cleanup still runs even
-// if the caller's ctx is already cancelled/expired.
+// via pkg/runtime.
 func makeStop(rt runtime.ContainerRuntime, name string) func() {
 	var once sync.Once
 	return func() {
-		once.Do(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			// Force-remove handles both running and stopped containers in one
-			// call and is what guarantees no leak per host-session safety.
-			_ = rt.Remove(ctx, name, runtime.WithForceRemove(true), runtime.WithRemoveVolumes(true))
-		})
+		once.Do(func() { removeContainer(rt, name) })
 	}
+}
+
+// removeContainer force-removes a container by name via pkg/runtime, using a
+// fresh, bounded context so cleanup still runs even if the caller's ctx is
+// already cancelled/expired. Force-remove handles both running and stopped
+// containers in one call and is what guarantees no leak per host-session safety.
+// It is shared by the teardown closure (makeStop) and the BROK-2 run-error
+// cleanup path (runNewContainer).
+func removeContainer(rt runtime.ContainerRuntime, name string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = rt.Remove(ctx, name, runtime.WithForceRemove(true), runtime.WithRemoveVolumes(true))
+}
+
+// defaultStartupTimeout bounds the resolve-host-port + readiness phase when the
+// caller's context carries no deadline of its own. Without this bound (BROK-1,
+// §11.4.108), a container that is created but never serves — crash-looping,
+// wrong entrypoint, or a host port bound by the runtime forwarder with nothing
+// listening behind it — would make the resolve or readiness loop spin until the
+// process exits. With it, a wedged container fails with a clear "not ready"
+// error instead of hanging forever. 90s comfortably covers a cold image pull +
+// first-boot of the supported single-node brokers.
+const defaultStartupTimeout = 90 * time.Second
+
+// startupContext returns the context under which the resolve-host-port +
+// readiness phase runs. If parent already carries its own deadline the caller's
+// bound wins and parent is returned unchanged (with a no-op cancel). Otherwise a
+// bounded child is derived so a deadline-less caller (e.g. context.Background())
+// cannot hang forever on a container that never becomes ready (BROK-1).
+func startupContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if _, ok := parent.Deadline(); ok {
+		return parent, func() {}
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+// exitedState reports whether a container status indicates the container has
+// already exited or died and will therefore never become ready — so the
+// resolve/readiness loop should fail fast (BROK-4) instead of spinning until the
+// startup timeout. pkg/runtime models an exited/dead container as StateStopped
+// or StateDead (its ContainerState enum has no "exited" member).
+func exitedState(st *runtime.ContainerStatus) bool {
+	if st == nil {
+		return false
+	}
+	return st.State == runtime.StateStopped || st.State == runtime.StateDead
+}
+
+// containerRunner runs a brand-new detached container from an image with
+// published ports — the single capability pkg/runtime's ContainerRuntime
+// interface does not expose (it only start/stop/removes EXISTING containers).
+// execRun is the production implementation (shells the detected runtime CLI);
+// the hardening guard suite substitutes a fake so the run-error cleanup path
+// (BROK-2) is exercised without a real container (§11.4.27).
+type containerRunner func(ctx context.Context, binary string, args []string) ([]byte, error)
+
+// execRun is the production containerRunner: it shells the detected runtime CLI.
+func execRun(ctx context.Context, binary string, args []string) ([]byte, error) {
+	return exec.CommandContext(ctx, binary, args...).CombinedOutput()
+}
+
+// runNewContainer runs a one-off detached container and, on failure, best-effort
+// removes the container by its (deterministic, already-known) name before
+// returning the error. This closes the BROK-2 leak: `run -d` can CREATE the
+// container and THEN exit non-zero (host-port bind conflict, OCI reject,
+// entrypoint dies immediately), and a ctx cancellation can kill the CLI after
+// the daemon already created the container — both leave a created/exited
+// container behind unless it is removed (§11.4.14). The removal goes back
+// through pkg/runtime so the shared abstraction still owns teardown.
+func runNewContainer(
+	ctx context.Context, rt runtime.ContainerRuntime, run containerRunner,
+	binary, name string, args []string,
+) ([]byte, error) {
+	out, err := run(ctx, binary, args)
+	if err != nil {
+		removeContainer(rt, name)
+		return out, err
+	}
+	return out, nil
 }
 
 // resolveHostPort returns the host port mapped to the container's client port.
@@ -225,6 +308,14 @@ func resolveHostPort(
 	for {
 		st, err := rt.Status(ctx, name)
 		if err == nil {
+			// Fail fast if the container has already exited/died (BROK-4): it
+			// will never publish a working port, so spinning until the startup
+			// timeout only delays a certain failure.
+			if exitedState(st) {
+				return "", fmt.Errorf(
+					"container %s exited before becoming ready (state=%s, exit_code=%d)",
+					name, st.State, st.ExitCode)
+			}
 			if p := clientHostPort(st); p != "" {
 				return p, nil
 			}

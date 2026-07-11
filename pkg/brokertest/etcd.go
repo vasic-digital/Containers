@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -15,9 +14,12 @@ import (
 	"digital.vasic.containers/pkg/runtime"
 )
 
-// etcdImage is the pinned single-node etcd image. A pinned patch tag keeps test
-// runs reproducible; v3.5.17 verified to pull and serve GET /health on its
-// client port.
+// etcdImage is the default single-node etcd image; v3.5.17 verified to pull and
+// serve GET /health on its client port. NOTE (BROK-5): a patch tag like
+// "v3.5.17" is stable at the registry today but is NOT a cryptographic guarantee
+// of byte-for-byte reproducibility — only an immutable "@sha256:<digest>"
+// reference is. Callers needing pinned reproducibility can pass
+// WithImage("quay.io/coreos/etcd@sha256:...").
 const etcdImage = "quay.io/coreos/etcd:v3.5.17"
 
 // etcdClientPort is the in-container port etcd listens on for clients.
@@ -132,8 +134,9 @@ func StartEtcd(ctx context.Context, opts ...Option) (endpoint string, stop func(
 
 	// The one capability pkg/runtime's interface lacks: run a NEW container from
 	// an image with published ports. Done via the detected runtime's CLI,
-	// mirroring StartNATS.
-	runOut, runErr := exec.CommandContext(ctx, binary, args...).CombinedOutput()
+	// mirroring StartNATS. On a run failure runNewContainer best-effort removes
+	// any container the failed run may have created before returning (BROK-2).
+	runOut, runErr := runNewContainer(ctx, rt, execRun, binary, name, args)
 	if runErr != nil {
 		return "", noopStop, fmt.Errorf(
 			"brokertest: %s run failed: %w: %s", binary, runErr, strings.TrimSpace(string(runOut)))
@@ -144,14 +147,20 @@ func StartEtcd(ctx context.Context, opts ...Option) (endpoint string, stop func(
 	// failure path can still clean up.
 	stop = makeStop(rt, name)
 
-	hostPort, err := resolveEtcdHostPort(ctx, rt, name, cfg.hostPort)
+	// Bound the resolve + readiness phase so a container that starts but never
+	// serves fails with a clear timeout instead of hanging on a deadline-less
+	// ctx (BROK-1, §11.4.108). A caller-supplied deadline is respected as-is.
+	phaseCtx, cancelPhase := startupContext(ctx, defaultStartupTimeout)
+	defer cancelPhase()
+
+	hostPort, err := resolveEtcdHostPort(phaseCtx, rt, name, cfg.hostPort)
 	if err != nil {
 		stop()
 		return "", noopStop, fmt.Errorf("brokertest: resolve host port: %w", err)
 	}
 
 	endpoint = fmt.Sprintf("http://127.0.0.1:%s", hostPort)
-	if err := waitEtcdReady(ctx, hostPort); err != nil {
+	if err := waitEtcdReady(phaseCtx, hostPort); err != nil {
 		stop()
 		return "", noopStop, fmt.Errorf("brokertest: etcd not ready at %s: %w", endpoint, err)
 	}
@@ -172,6 +181,12 @@ func resolveEtcdHostPort(
 	for {
 		st, err := rt.Status(ctx, name)
 		if err == nil {
+			// Fail fast if the container has already exited/died (BROK-4).
+			if exitedState(st) {
+				return "", fmt.Errorf(
+					"container %s exited before becoming ready (state=%s, exit_code=%d)",
+					name, st.State, st.ExitCode)
+			}
 			if p := etcdClientHostPort(st); p != "" {
 				return p, nil
 			}

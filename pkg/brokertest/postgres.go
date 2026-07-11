@@ -2,6 +2,7 @@ package brokertest
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
@@ -13,8 +14,12 @@ import (
 	"digital.vasic.containers/pkg/runtime"
 )
 
-// postgresImage is the pinned single-node PostgreSQL image. The alpine variant
+// postgresImage is the default single-node PostgreSQL image. The alpine variant
 // keeps the pull and memory footprint tiny while still serving real SQL.
+// NOTE (BROK-5): a moving tag like "16-alpine" is NOT byte-for-byte reproducible
+// — the registry can re-point it at a new digest at any time; only an immutable
+// "@sha256:<digest>" reference is. Callers needing pinned reproducibility can
+// pass WithImage("docker.io/library/postgres@sha256:...").
 const postgresImage = "docker.io/library/postgres:16-alpine"
 
 // postgresPort is the in-container port PostgreSQL listens on for clients.
@@ -137,8 +142,9 @@ func StartPostgres(ctx context.Context, opts ...Option) (dsn string, stop func()
 
 	// The one capability pkg/runtime's interface lacks: run a NEW container from
 	// an image with published ports. Done via the detected runtime's CLI,
-	// mirroring StartNATS / StartEtcd.
-	runOut, runErr := exec.CommandContext(ctx, binary, args...).CombinedOutput()
+	// mirroring StartNATS / StartEtcd. On a run failure runNewContainer
+	// best-effort removes any container the failed run may have created (BROK-2).
+	runOut, runErr := runNewContainer(ctx, rt, execRun, binary, name, args)
 	if runErr != nil {
 		return "", noopStop, fmt.Errorf(
 			"brokertest: %s run failed: %w: %s", binary, runErr, strings.TrimSpace(string(runOut)))
@@ -149,7 +155,13 @@ func StartPostgres(ctx context.Context, opts ...Option) (dsn string, stop func()
 	// failure path can still clean up.
 	stop = makeStop(rt, name)
 
-	hostPort, err := resolvePostgresHostPort(ctx, rt, name, cfg.hostPort)
+	// Bound the resolve + readiness phase so a container that starts but never
+	// serves fails with a clear timeout instead of hanging on a deadline-less
+	// ctx (BROK-1, §11.4.108). A caller-supplied deadline is respected as-is.
+	phaseCtx, cancelPhase := startupContext(ctx, defaultStartupTimeout)
+	defer cancelPhase()
+
+	hostPort, err := resolvePostgresHostPort(phaseCtx, rt, name, cfg.hostPort)
 	if err != nil {
 		stop()
 		return "", noopStop, fmt.Errorf("brokertest: resolve host port: %w", err)
@@ -158,7 +170,7 @@ func StartPostgres(ctx context.Context, opts ...Option) (dsn string, stop func()
 	dsn = fmt.Sprintf("postgres://%s:%s@127.0.0.1:%s/%s?sslmode=disable",
 		postgresUser, postgresPassword, hostPort, postgresDB)
 
-	if err := waitPostgresReady(ctx, binary, name, hostPort); err != nil {
+	if err := waitPostgresReady(phaseCtx, binary, name, hostPort); err != nil {
 		stop()
 		return "", noopStop, fmt.Errorf("brokertest: postgres not ready (%s): %w", dsn, err)
 	}
@@ -179,6 +191,12 @@ func resolvePostgresHostPort(
 	for {
 		st, err := rt.Status(ctx, name)
 		if err == nil {
+			// Fail fast if the container has already exited/died (BROK-4).
+			if exitedState(st) {
+				return "", fmt.Errorf(
+					"container %s exited before becoming ready (state=%s, exit_code=%d)",
+					name, st.State, st.ExitCode)
+			}
 			if p := postgresClientHostPort(st); p != "" {
 				return p, nil
 			}
@@ -242,18 +260,15 @@ func waitPostgresReady(ctx context.Context, binary, name, hostPort string) error
 		}
 
 		if !execAvailable {
-			if ok, err := tcpReachable(ctx, hostPort); ok {
-				// TCP is up; give the server a grace window to finish init so the
-				// DSN we return is usable for queries, then accept.
-				select {
-				case <-ctx.Done():
-					return fmt.Errorf("%w (last error: %v)", ctx.Err(), lastErr)
-				case <-time.After(2 * time.Second):
-				}
-				return nil
-			} else {
-				lastErr = err
-			}
+			// BROK-3: exec is unavailable, so prove PostgreSQL answers at the
+			// PROTOCOL layer (a StartupMessage handshake) rather than trusting a
+			// bare TCP accept + a fixed sleep. The host port is bound by the
+			// runtime's forwarder at container START (before PostgreSQL serves —
+			// the image's first-init temp server does not listen on TCP), so a
+			// TCP accept alone is NOT evidence the server can answer. Delegate to
+			// the protocol-probe fallback loop, which re-probes until the server
+			// responds or ctx expires — never a fixed-sleep unconditional success.
+			return waitPostgresProtocolReady(ctx, hostPort)
 		}
 
 		select {
@@ -314,8 +329,8 @@ func isExecUnsupported(out string) bool {
 }
 
 // tcpReachable reports whether a TCP connection to the published host port
-// succeeds. It is the fallback reachability probe used only when in-container
-// exec is unavailable.
+// succeeds. It is a bare reachability probe (retained for the real-container
+// integration test's sink-side signal); readiness itself uses pgStartupProbe.
 func tcpReachable(ctx context.Context, hostPort string) (bool, error) {
 	addr := net.JoinHostPort("127.0.0.1", hostPort)
 	d := net.Dialer{Timeout: 2 * time.Second}
@@ -325,4 +340,89 @@ func tcpReachable(ctx context.Context, hostPort string) (bool, error) {
 	}
 	_ = conn.Close()
 	return true, nil
+}
+
+// waitPostgresProtocolReady loops a PostgreSQL StartupMessage protocol probe
+// against the published host port until the server answers at the protocol layer
+// or ctx expires. It is the exec-unsupported readiness fallback (BROK-3): it
+// replaces the previous "TCP accept + fixed 2s sleep + return nil", which
+// declared readiness the moment the runtime forwarder bound the port — before
+// PostgreSQL could actually serve. Here every acceptance is a real protocol
+// response, and a not-yet-serving endpoint is re-probed rather than slept past.
+func waitPostgresProtocolReady(ctx context.Context, hostPort string) error {
+	var lastErr error
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%w (last error: %v)", err, lastErr)
+		}
+		if ok, err := pgStartupProbe(ctx, hostPort); ok {
+			return nil
+		} else {
+			lastErr = err
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w (last error: %v)", ctx.Err(), lastErr)
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+// pgProtocolVersion is the PostgreSQL v3.0 frontend/backend protocol version
+// number (major 3 << 16 | minor 0) carried in a StartupMessage.
+const pgProtocolVersion = 196608
+
+// pgStartupProbe opens a TCP connection to the published host port, sends a
+// PostgreSQL v3 StartupMessage, and reads the FIRST response byte. A serving
+// PostgreSQL answers with 'R' (an Authentication* message) or 'E' (an
+// ErrorResponse) — either proves the server is answering at the PROTOCOL layer,
+// not merely that the runtime's port-forwarder accepted a TCP connection (which
+// it does from container start, before PostgreSQL can serve). It is the BROK-3
+// re-verification that replaces a bare TCP dial + fixed sleep in the
+// exec-unsupported readiness fallback. No third-party driver is used — the
+// handshake is framed with the standard library, mirroring the raw-protocol
+// readiness probes for NATS (INFO) and Redis (PING/PONG).
+func pgStartupProbe(ctx context.Context, hostPort string) (bool, error) {
+	addr := net.JoinHostPort("127.0.0.1", hostPort)
+	d := net.Dialer{Timeout: 2 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+	_ = conn.SetDeadline(deadline)
+
+	if _, err := conn.Write(pgStartupMessage(postgresUser, postgresDB)); err != nil {
+		return false, err
+	}
+
+	buf := make([]byte, 1)
+	n, err := conn.Read(buf)
+	if err != nil && n == 0 {
+		return false, err
+	}
+	switch buf[0] {
+	case 'R', 'E':
+		return true, nil
+	default:
+		return false, fmt.Errorf("unexpected first response byte %q from %s", buf[0], addr)
+	}
+}
+
+// pgStartupMessage builds a PostgreSQL v3 StartupMessage for the given user and
+// database. Layout: Int32 total-length (including itself), Int32 protocol
+// version, then NUL-terminated key/value parameter pairs, terminated by a final
+// NUL byte.
+func pgStartupMessage(user, db string) []byte {
+	params := []byte("user\x00" + user + "\x00database\x00" + db + "\x00\x00")
+	total := 4 + 4 + len(params) // length field + version field + params
+	buf := make([]byte, 0, total)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(total))
+	buf = binary.BigEndian.AppendUint32(buf, uint32(pgProtocolVersion))
+	return append(buf, params...)
 }

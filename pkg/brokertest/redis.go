@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -13,9 +12,12 @@ import (
 	"digital.vasic.containers/pkg/runtime"
 )
 
-// redisImage is the pinned single-node Redis image. The alpine variant keeps the
-// pull and memory footprint tiny while still serving real RESP traffic. A pinned
-// minor tag keeps test runs reproducible.
+// redisImage is the default single-node Redis image. The alpine variant keeps
+// the pull and memory footprint tiny while still serving real RESP traffic.
+// NOTE (BROK-5): a moving tag like "7-alpine" is NOT byte-for-byte reproducible
+// — the registry can re-point it at a new digest at any time; only an immutable
+// "@sha256:<digest>" reference is. Callers needing pinned reproducibility can
+// pass WithImage("docker.io/library/redis@sha256:...").
 const redisImage = "docker.io/library/redis:7-alpine"
 
 // redisPort is the in-container port Redis listens on for clients.
@@ -129,8 +131,9 @@ func StartRedis(ctx context.Context, opts ...Option) (addr string, stop func(), 
 
 	// The one capability pkg/runtime's interface lacks: run a NEW container from
 	// an image with published ports. Done via the detected runtime's CLI,
-	// mirroring StartNATS / StartEtcd.
-	runOut, runErr := exec.CommandContext(ctx, binary, args...).CombinedOutput()
+	// mirroring StartNATS / StartEtcd. On a run failure runNewContainer
+	// best-effort removes any container the failed run may have created (BROK-2).
+	runOut, runErr := runNewContainer(ctx, rt, execRun, binary, name, args)
 	if runErr != nil {
 		return "", noopStop, fmt.Errorf(
 			"brokertest: %s run failed: %w: %s", binary, runErr, strings.TrimSpace(string(runOut)))
@@ -141,14 +144,20 @@ func StartRedis(ctx context.Context, opts ...Option) (addr string, stop func(), 
 	// failure path can still clean up.
 	stop = makeStop(rt, name)
 
-	hostPort, err := resolveRedisHostPort(ctx, rt, name, cfg.hostPort)
+	// Bound the resolve + readiness phase so a container that starts but never
+	// serves fails with a clear timeout instead of hanging on a deadline-less
+	// ctx (BROK-1, §11.4.108). A caller-supplied deadline is respected as-is.
+	phaseCtx, cancelPhase := startupContext(ctx, defaultStartupTimeout)
+	defer cancelPhase()
+
+	hostPort, err := resolveRedisHostPort(phaseCtx, rt, name, cfg.hostPort)
 	if err != nil {
 		stop()
 		return "", noopStop, fmt.Errorf("brokertest: resolve host port: %w", err)
 	}
 
 	addr = net.JoinHostPort("127.0.0.1", hostPort)
-	if err := waitRedisReady(ctx, hostPort); err != nil {
+	if err := waitRedisReady(phaseCtx, hostPort); err != nil {
 		stop()
 		return "", noopStop, fmt.Errorf("brokertest: redis not ready at %s: %w", addr, err)
 	}
@@ -169,6 +178,12 @@ func resolveRedisHostPort(
 	for {
 		st, err := rt.Status(ctx, name)
 		if err == nil {
+			// Fail fast if the container has already exited/died (BROK-4).
+			if exitedState(st) {
+				return "", fmt.Errorf(
+					"container %s exited before becoming ready (state=%s, exit_code=%d)",
+					name, st.State, st.ExitCode)
+			}
 			if p := redisClientHostPort(st); p != "" {
 				return p, nil
 			}
