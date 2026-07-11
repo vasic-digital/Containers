@@ -152,8 +152,21 @@ func (r *ServiceRegistry) Register(name string, port int, opts ...ServiceOption)
 		}
 	}
 
-	svc.DiscoveredAt = time.Now()
+	// SR2-DEEP-1 (§11.4.108/§11.4.111 metadata correctness): preserve the
+	// ORIGINAL first-seen timestamp when re-registering an already-known name.
+	// Register always builds a FRESH *Service, so without this an update
+	// (refresh / heartbeat / port change / label change) clobbers DiscoveredAt
+	// with the current time on every call, erasing the service's true first-seen
+	// age — even though LastChecked already exists precisely to track the latest
+	// touch. A re-register is an UPDATE of an existing service, not a first
+	// discovery. The existing entry is read here under r.mu (still the OLD value,
+	// as the store below has not run yet).
 	svc.LastChecked = time.Now()
+	if existing, ok := r.services[name]; ok && existing != nil && !existing.DiscoveredAt.IsZero() {
+		svc.DiscoveredAt = existing.DiscoveredAt
+	} else {
+		svc.DiscoveredAt = time.Now()
+	}
 
 	r.services[name] = svc
 	host, port := svc.Host, svc.Port
@@ -569,7 +582,15 @@ func (r *ServiceRegistry) loadFromDisk() {
 		}
 		r.services[name] = svc
 	}
-	r.logger.Info("Loaded %d services from registry", len(loaded))
+	// SR2-DEEP-2 (§11.4.6 report-accuracy): report the count of services
+	// ACTUALLY stored, not len(loaded). len(loaded) counts every JSON entry
+	// INCLUDING null entries dropped above (SR2-1), so a file such as
+	// {"foo":null,"bar":{...}} would log "Loaded 2 services" while only 1 was
+	// stored — an operator-facing count that directly contradicts the
+	// Error-level drop log. r.services holds exactly the stored (non-null)
+	// entries at this point (New starts it empty; loadFromDisk is its only
+	// pre-return populator, and this runs while r.mu is held).
+	r.logger.Info("Loaded %d services from registry", len(r.services))
 }
 
 // reapOrphanedTempFiles removes any leftover services-*.json.tmp file from
