@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	iexec "digital.vasic.containers/internal/exec"
@@ -38,10 +39,32 @@ func NewConnectionPool(opts Options) (*ConnectionPool, error) {
 	if dir == "" {
 		dir = "/tmp/containers-ssh-ctrl"
 	}
+
+	// REMOTE-MED-4: os.MkdirAll(dir, 0700) only enforces the 0700 mode
+	// when it actually CREATES dir. A pre-existing directory — left
+	// over from a previous run, or pre-created by a different local
+	// user — is otherwise silently trusted even if its permissions are
+	// looser, and the control-socket filenames inside it are fully
+	// predictable (ctrl-<address>-<port>), so a hostile co-resident
+	// user could pre-stage a world-readable/writable directory to
+	// intercept or tamper with ControlMaster sockets. Detect whether
+	// dir already existed BEFORE MkdirAll (which is a no-op on an
+	// existing directory and does not change its mode/owner), then
+	// verify it is owned by the current user and not writable by
+	// group/other (see verifySocketDirOwnership for why this checks
+	// the write bits rather than an exact mode).
+	preExisted := isExistingDir(dir)
+
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf(
 			"create control socket dir %s: %w", dir, err,
 		)
+	}
+
+	if preExisted {
+		if err := verifySocketDirOwnership(dir); err != nil {
+			return nil, err
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -53,6 +76,61 @@ func NewConnectionPool(opts Options) (*ConnectionPool, error) {
 		cleanupFn:  cancel,
 	}
 	return pool, nil
+}
+
+// isExistingDir reports whether path already exists and is a
+// directory.
+func isExistingDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+// verifySocketDirOwnership refuses to trust a pre-existing control
+// socket directory unless (a) it is owned by the current user and
+// (b) it grants NO write access to group or other (REMOTE-MED-4).
+// Socket filenames under this directory are fully predictable
+// (ctrl-<address>-<port>), so a directory owned by a different local
+// user, or one writable by group/other, would let that other user
+// pre-stage, replace, or race a ControlMaster socket at a name we are
+// about to use.
+//
+// This deliberately checks the WRITE bits rather than requiring an
+// exact 0700 match: os.MkdirAll(dir, 0700) only forces 0700 when it
+// creates dir itself; legitimately-owned pre-existing directories
+// (e.g. a test harness's t.TempDir(), which is created via
+// os.Mkdir(dir, 0777) and therefore lands at whatever the process
+// umask allows — commonly 0755) are safe to reuse as long as no other
+// user can write into them. Rejecting every mode other than exactly
+// 0700 would also reject those same-owner, non-writable-by-others
+// directories, which is not the actual security boundary here.
+func verifySocketDirOwnership(dir string) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf(
+			"stat pre-existing control socket dir %s: %w", dir, err,
+		)
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		if uid := int(stat.Uid); uid != os.Getuid() {
+			return fmt.Errorf(
+				"control socket dir %s already existed owned by uid "+
+					"%d (want %d, the current user) — refusing to "+
+					"trust a pre-existing directory owned by another "+
+					"user",
+				dir, uid, os.Getuid(),
+			)
+		}
+	}
+	if perm := info.Mode().Perm(); perm&0o022 != 0 {
+		return fmt.Errorf(
+			"control socket dir %s already existed writable by "+
+				"group or other (mode %04o) — refusing to trust a "+
+				"pre-existing directory that another local user may "+
+				"be able to write into",
+			dir, perm,
+		)
+	}
+	return nil
 }
 
 // Acquire returns the path to a ControlMaster socket for the given
@@ -163,12 +241,24 @@ func (p *ConnectionPool) dialLockLocked(key string) *sync.Mutex {
 // Release decrements the reference count for a host's connection.
 // When refs reaches zero the entry is kept alive for reuse until
 // ControlPersist expires or Close is called.
+//
+// REMOTE-MED-3: Release is keyed only by host, with no per-caller
+// token to verify THIS caller actually holds the ref it is about to
+// drop. Execute unconditionally `defer`s Release even though sshArgs
+// silently swallows an Acquire failure (falls back to a direct
+// connection without incrementing refs). If a caller whose own
+// Acquire failed races with a different, live caller that
+// successfully acquired the same host, the failing caller's deferred
+// Release must not steal/underflow the live holder's ref count.
+// Floor the decrement at zero so refs can never go negative — the
+// minimal, safe hardening of the invariant regardless of which
+// caller's Release fires in which order.
 func (p *ConnectionPool) Release(host RemoteHost) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	key := hostKey(host)
-	if entry, ok := p.active[key]; ok {
+	if entry, ok := p.active[key]; ok && entry.refs > 0 {
 		entry.refs--
 	}
 }

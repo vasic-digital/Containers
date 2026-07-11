@@ -197,7 +197,19 @@ func (e *SSHExecutor) CopyFile(
 		defer cancel()
 	}
 
-	args := e.scpArgs(host)
+	args, err := e.scpArgs(ctx, host)
+	if err != nil {
+		return err
+	}
+	// scpArgs may have acquired a pooled ControlMaster connection
+	// (refs++), same as sshArgs. CopyFile is synchronous (blocks until
+	// cmd.Run() returns below), so a defer here fires only once the
+	// transfer has actually finished — see the ExecuteStream ownership
+	// comment above for why a stream-returning method could not do this.
+	// Release is a no-op when nothing was acquired.
+	if e.pool != nil {
+		defer e.pool.Release(host)
+	}
 	args = append(args,
 		localPath,
 		fmt.Sprintf(
@@ -271,7 +283,19 @@ func (e *SSHExecutor) CopyDir(
 	remoteBase := filepath.Base(remoteDir)
 	remoteParent := filepath.Dir(remoteDir)
 
-	args := e.scpArgs(host)
+	args, err := e.scpArgs(ctx, host)
+	if err != nil {
+		return err
+	}
+	// scpArgs may have acquired a pooled ControlMaster connection
+	// (refs++), same as sshArgs / CopyFile. CopyDir is synchronous
+	// (blocks until cmd.Run() returns below, and the basename-mismatch
+	// branch's own pre-clean also blocks before that), so a defer here
+	// is safe and fires exactly once regardless of which branch below
+	// runs. Release is a no-op when nothing was acquired.
+	if e.pool != nil {
+		defer e.pool.Release(host)
+	}
 	args = append([]string{"-r"}, args...)
 
 	if localBase == remoteBase {
@@ -455,7 +479,18 @@ func (e *SSHExecutor) sshArgs(
 	return args, nil
 }
 
-func (e *SSHExecutor) scpArgs(host RemoteHost) []string {
+// scpArgs builds the scp CLI arguments for host, mirroring sshArgs
+// (including ControlMaster acquisition — REMOTE-MED-2). Without this
+// parity, scp transfers (CopyFile + the common-case CopyDir) never
+// reused a live ControlMaster socket: every file-copy opened a brand
+// new TCP+SSH connection even when a multiplexable master was already
+// up, defeating the pooling benefit for the file-shipping workload
+// where it matters most, and leaving pool.ActiveCount() blind to scp
+// activity. scp accepts the identical OpenSSH multiplexing option (`-o
+// ControlPath=<socket>`) that ssh does.
+func (e *SSHExecutor) scpArgs(
+	ctx context.Context, host RemoteHost,
+) ([]string, error) {
 	args := []string{
 		"-o", "StrictHostKeyChecking=" +
 			boolToYesNo(e.opts.StrictHostKeyCheck),
@@ -483,11 +518,24 @@ func (e *SSHExecutor) scpArgs(host RemoteHost) []string {
 
 	args = append(args, "-P", strconv.Itoa(host.SSHPort()))
 
+	if e.pool != nil && e.opts.ControlMasterEnabled {
+		socketPath, err := e.pool.Acquire(ctx, host)
+		if err != nil {
+			e.logger.Warn(
+				"ControlMaster unavailable for %s, "+
+					"falling back to direct: %v",
+				host.Name, err,
+			)
+		} else {
+			args = append(args, "-o", "ControlPath="+socketPath)
+		}
+	}
+
 	if host.KeyPath != "" {
 		args = append(args, "-i", host.KeyPath)
 	}
 
-	return args
+	return args, nil
 }
 
 // streamReader wraps an SSH command's stdout pipe.

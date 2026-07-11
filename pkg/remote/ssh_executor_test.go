@@ -451,7 +451,8 @@ func TestSSHExecutor_SCPArgs_KeepAlive(t *testing.T) {
 	require.NoError(t, err)
 	defer exec.Close()
 
-	args := exec.scpArgs(unreachableHost())
+	args, err := exec.scpArgs(context.Background(), unreachableHost())
+	require.NoError(t, err)
 
 	assert.True(t,
 		containsSequence(args, "-o", "ServerAliveInterval=30"),
