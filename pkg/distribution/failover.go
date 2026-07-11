@@ -82,6 +82,37 @@ func (f *FailoverHandler) CheckAndFailover(
 		}
 	}
 
+	// CT-HARDEN-DIST2HARD DI-4 (ASSESSED, minimal honest fix): a reschedule
+	// PLAN was computed below but never APPLIED anywhere — d.Status() kept
+	// reporting these containers StateRunning on a host CheckAndFailover
+	// itself just proved offline (StateMigrating was dead code, never
+	// assigned). Full auto-reschedule (re-driving Distribute for
+	// rescheduleReqs here) has broader blast-radius implications — it would
+	// need to reconcile the OLD offline-host entries the same way
+	// reconcileRelocations does, decide whether a container currently
+	// mid-failover should still count toward capacity on other hosts, and
+	// interact with a concurrent caller-driven Distribute/Rebalance — which
+	// this hardening batch flags as a larger follow-up rather than
+	// implementing here. What IS fixed now: the tracked state stops lying —
+	// every affected StateRunning entry is flipped to StateMigrating so
+	// Status() honestly reflects that these containers are being failed over,
+	// instead of silently claiming they are still healthily running on a
+	// host proven offline.
+	if len(actions) > 0 {
+		affected := make(map[string]bool, len(actions))
+		for _, a := range actions {
+			affected[a.ContainerName] = true
+		}
+		d.mu.Lock()
+		for i := range d.containers {
+			if affected[d.containers[i].Requirement.Name] &&
+				d.containers[i].State == StateRunning {
+				d.containers[i].State = StateMigrating
+			}
+		}
+		d.mu.Unlock()
+	}
+
 	// Reschedule if possible.
 	if d.opts.Scheduler != nil && len(rescheduleReqs) > 0 {
 		plan, err := d.opts.Scheduler.ScheduleBatch(
