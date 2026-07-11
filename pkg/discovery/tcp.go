@@ -44,7 +44,7 @@ func (d *TCPDiscoverer) Discover(
 	}
 
 	timeout := target.Timeout
-	if timeout == 0 {
+	if timeout <= 0 {
 		timeout = defaultDiscoveryTimeout
 	}
 

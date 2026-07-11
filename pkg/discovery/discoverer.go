@@ -6,9 +6,13 @@ import (
 )
 
 // defaultDiscoveryTimeout is the fallback probe timeout applied when a
-// DiscoveryTarget leaves Timeout unset (zero). Hoisted here so the DNS and
-// TCP discoverers share one authoritative value instead of each hardcoding a
-// duplicate literal (§6.R no-hardcoding / de-duplication).
+// DiscoveryTarget leaves Timeout non-positive — either unset (zero) or a
+// nonsensical negative value. Both DNS and TCP normalise `Timeout <= 0` to
+// this default: a negative duration otherwise poisons the probe (an
+// already-expired context / a past dial deadline) and falsely reports a
+// reachable target unreachable. Hoisted here so the DNS and TCP discoverers
+// share one authoritative value instead of each hardcoding a duplicate
+// literal (§6.R no-hardcoding / de-duplication).
 const defaultDiscoveryTimeout = 5 * time.Second
 
 // DiscoveryTarget describes a service endpoint to discover.

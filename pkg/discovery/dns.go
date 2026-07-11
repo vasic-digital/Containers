@@ -62,7 +62,7 @@ func (d *DNSDiscoverer) Discover(
 	}
 
 	timeout := target.Timeout
-	if timeout == 0 {
+	if timeout <= 0 {
 		timeout = defaultDiscoveryTimeout
 	}
 
