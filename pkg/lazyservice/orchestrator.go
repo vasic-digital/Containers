@@ -54,7 +54,16 @@ type LazyOrchestrator struct {
 	mu            sync.RWMutex
 	started       map[string]bool
 	failed        map[string]error
-	workDir       string
+	// bootCtx carries the caller's context for the in-flight boot of each
+	// service. The lifecycle.LazyBooter startFn closure is a ctx-less
+	// `func() error`, so startServiceWithPath stows the caller ctx here
+	// (keyed by service name) right before invoking booter.EnsureStarted();
+	// the closure then reads it back so startServiceInternal derives its
+	// timeout FROM the caller's context — a caller cancel/deadline aborts the
+	// compose Up + health wait instead of being ignored (LZSVC-2). Guarded by
+	// mu.
+	bootCtx map[string]context.Context
+	workDir string
 	// Registry of available container runtimes (keyed by runtime.Name()).
 	runtimes map[string]runtime.ContainerRuntime
 	// Preferred runtime order (by name: "podman", "docker", etc.)
@@ -98,6 +107,7 @@ func NewLazyOrchestrator(opts ...Option) (*LazyOrchestrator, error) {
 		booters:           make(map[string]*lifecycle.LazyBooter),
 		started:           make(map[string]bool),
 		failed:            make(map[string]error),
+		bootCtx:           make(map[string]context.Context),
 		runtimes:          make(map[string]runtime.ContainerRuntime),
 		runtimePreference: []string{"podman", "docker", "kubernetes"},
 		logger:            logging.NopLogger{},
@@ -150,9 +160,12 @@ func (lo *LazyOrchestrator) RegisterService(svc *ServiceDefinition) error {
 
 	lo.services[svc.Name] = svc
 
-	// Create lazy booter for this service
+	// Create lazy booter for this service. The startFn is ctx-less (the
+	// LazyBooter contract), so it resolves the caller's context from bootCtx
+	// (stowed by startServiceWithPath immediately before EnsureStarted) — this
+	// is how the caller ctx threads into the boot (LZSVC-2).
 	startFn := func() error {
-		return lo.startServiceInternal(svc)
+		return lo.startServiceInternal(lo.bootContext(svc.Name), svc)
 	}
 	lo.booters[svc.Name] = lifecycle.NewLazyBooter(startFn)
 
@@ -193,6 +206,13 @@ func (lo *LazyOrchestrator) startServiceWithPath(ctx context.Context, name strin
 		return fmt.Errorf("service %s has no booter", name)
 	}
 
+	// Abort dependency resolution promptly if the caller's context is already
+	// cancelled/expired (LZSVC-2): a dead caller ctx must not drive a deep
+	// dependency chain (up to N×StartTimeout of ignored deadline).
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("start service %s aborted: %w", name, err)
+	}
+
 	// Cycle detection: this service is already being resolved higher up the
 	// current path, so its Dependencies form a cycle. Surface it (§11.4
 	// anti-bluff: a clear error, never a silent swallow) and unwind.
@@ -208,6 +228,14 @@ func (lo *LazyOrchestrator) startServiceWithPath(ctx context.Context, name strin
 			return fmt.Errorf("dependency %s failed: %w", depName, err)
 		}
 	}
+
+	// Stow the caller ctx so the (ctx-less) booter startFn can thread it into
+	// startServiceInternal for the boot that EnsureStarted may trigger below
+	// (LZSVC-2). Overwriting a stale entry is harmless — it is only read when
+	// EnsureStarted actually runs the once-guarded startFn.
+	lo.mu.Lock()
+	lo.bootCtx[name] = ctx
+	lo.mu.Unlock()
 
 	// Start this service via lazy booter
 	if err := booter.EnsureStarted(); err != nil {
@@ -275,7 +303,7 @@ func (lo *LazyOrchestrator) StopService(ctx context.Context, name string) error 
 	lo.mu.Lock()
 	lo.started[name] = false
 	lo.booters[name] = lifecycle.NewLazyBooter(func() error {
-		return lo.startServiceInternal(svc)
+		return lo.startServiceInternal(lo.bootContext(svc.Name), svc)
 	})
 	lo.mu.Unlock()
 
@@ -327,7 +355,15 @@ func (lo *LazyOrchestrator) GetServiceStatus(name string) (*ServiceStatus, error
 	}
 
 	if hasBooter {
-		status.Started = booter.Started()
+		// LZSVC-3: report Started from the orchestrator's OWN success flag,
+		// NOT booter.Started(). LazyBooter.Started() flips true once the boot
+		// ATTEMPT settles — on success AND on failure — so a failed or
+		// health-failed boot would report Started=true alongside a non-nil
+		// LastError (a contradictory status). lo.started[name] is set true
+		// ONLY on a genuine end-to-end success (compose Up + health pass), so
+		// a failed boot correctly reports Started=false with its LastError.
+		// Read under the RLock already held for the whole method.
+		status.Started = lo.started[name]
 		status.IsStarting = booter.IsStarting()
 		if err := booter.GetError(); err != nil {
 			status.LastError = err.Error()
@@ -377,8 +413,24 @@ func (lo *LazyOrchestrator) ListFreeServices() []*ServiceDefinition {
 	return result
 }
 
-// startServiceInternal performs the actual service startup.
-func (lo *LazyOrchestrator) startServiceInternal(svc *ServiceDefinition) error {
+// bootContext returns the caller context stowed by startServiceWithPath for
+// the named service's in-flight boot, or context.Background() when none is
+// recorded (e.g. a boot not driven through StartService). It is the read side
+// of the LZSVC-2 ctx-threading seam.
+func (lo *LazyOrchestrator) bootContext(name string) context.Context {
+	lo.mu.RLock()
+	ctx := lo.bootCtx[name]
+	lo.mu.RUnlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+// startServiceInternal performs the actual service startup. ctx is the caller's
+// context (threaded in via bootContext / LZSVC-2); the per-service StartTimeout
+// is applied ON TOP of it, so a caller cancel/deadline aborts the boot.
+func (lo *LazyOrchestrator) startServiceInternal(ctx context.Context, svc *ServiceDefinition) error {
 	project := compose.ComposeProject{
 		File:    svc.ComposeFile,
 		Profile: svc.Profile,
@@ -386,7 +438,13 @@ func (lo *LazyOrchestrator) startServiceInternal(svc *ServiceDefinition) error {
 
 	lo.logger.Info("starting lazy service: %s (file=%s)", svc.Name, svc.ComposeFile)
 
-	ctx, cancel := context.WithTimeout(context.Background(), svc.StartTimeout)
+	// Bound the boot by StartTimeout, but derive FROM the caller ctx so a
+	// caller cancel/deadline aborts the Up + health wait (LZSVC-2). A nil ctx
+	// would panic context.WithTimeout, so fall back to Background defensively.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, svc.StartTimeout)
 	defer cancel()
 
 	// Start the service
@@ -397,10 +455,25 @@ func (lo *LazyOrchestrator) startServiceInternal(svc *ServiceDefinition) error {
 		return fmt.Errorf("compose up failed: %w", err)
 	}
 
-	// Wait for health check if defined
+	// Wait for health check if defined.
 	if svc.HealthCheck != nil {
-		if err := lo.waitForHealth(ctx, svc); err != nil {
-			return fmt.Errorf("health check failed: %w", err)
+		if healthErr := lo.waitForHealth(ctx, svc); healthErr != nil {
+			// LZSVC-1: Up SUCCEEDED, so a stack is genuinely running, but the
+			// service never became healthy. We return BEFORE setting
+			// lo.started[svc.Name]=true, and StopService/StopAll only tear down
+			// services flagged started — so this running stack would survive as
+			// an orphan (and with AlternativeServices, the primary would leak
+			// while the alternative also boots). Tear the just-started stack
+			// down here so no orphan survives. Use a FRESH context bounded by
+			// StopTimeout: the health failure may be a ctx-deadline expiry, in
+			// which case the boot ctx is already Done and would abort Down
+			// immediately. Surface (never swallow) a teardown failure.
+			downCtx, downCancel := context.WithTimeout(context.Background(), svc.StopTimeout)
+			defer downCancel()
+			if downErr := lo.orchestrator.Down(downCtx, project); downErr != nil {
+				return fmt.Errorf("health check failed: %w (teardown of orphaned stack also failed: %v)", healthErr, downErr)
+			}
+			return fmt.Errorf("health check failed: %w", healthErr)
 		}
 	}
 
@@ -418,13 +491,23 @@ func (lo *LazyOrchestrator) waitForHealth(ctx context.Context, svc *ServiceDefin
 		return nil
 	}
 
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
 	deadline, hasDeadline := ctx.Deadline()
 	if !hasDeadline {
 		deadline = time.Now().Add(2 * time.Minute)
 	}
+
+	// LZSVC-4: probe ONCE immediately, before entering the ticker loop. The
+	// loop below only checks health inside `case <-ticker.C` (first tick at
+	// 2s), so an instantly-healthy service incurred >=2s of spurious latency,
+	// and a service with StartTimeout<2s timed out (ctx.Done fires) before the
+	// first probe ever ran. An immediate probe returns success right away for
+	// an already-healthy service.
+	if res := lo.healthChecker.Check(ctx, *svc.HealthCheck); res.Healthy {
+		return nil
+	}
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
