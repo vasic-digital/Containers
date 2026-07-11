@@ -293,6 +293,23 @@ func (o *DefaultOrchestrator) Up(
 	// semantics still hold for the caller.
 	if cfg.Wait && !o.isPodmanCompose {
 		args = append(args, "--wait")
+		// COMP2-1: docker compose's native `--wait` accepts a companion
+		// `--wait-timeout <seconds>` flag ("Maximum duration in seconds to
+		// wait for the project to be running|healthy" --
+		// docs.docker.com/reference/cli/docker/compose/up, verified
+		// 2026-07-11). CO-2 added WaitTimeout as the caller's wait-deadline
+		// knob and wired it to the podman host-side poll (waitForServices)
+		// but left the docker native path UNBOUNDED -- WithWaitTimeout was
+		// silently dropped on docker, so `up --wait` could block far past the
+		// caller's requested deadline. Forward the caller's explicit timeout
+		// so the wait-deadline is honoured on BOTH runtimes. When unset (0)
+		// docker's `--wait` keeps its own built-in default (not this
+		// package's podman-only 120s), so the flag is emitted only when the
+		// caller set one.
+		if cfg.WaitTimeout > 0 {
+			args = append(args, "--wait-timeout",
+				strconv.Itoa(cfg.WaitTimeout))
+		}
 	}
 
 	args = append(args, project.Services...)
