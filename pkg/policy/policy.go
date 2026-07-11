@@ -307,11 +307,25 @@ type yamlPolicyFile struct {
 	Patterns []yamlPattern `yaml:"patterns"`
 }
 
-// resolve fills in a pattern-level yamlCap's Pids/OOMAdj from the parsed
-// defaults when the pattern omits them, mirroring apply_caps.py's
-// make_cap(entry, default) fallback semantics, then returns the
-// equivalent [Cap].
-func (c yamlCap) resolve(mem, memswap string, defPids, defOOM int) Cap {
+// resolve fills in a pattern-level yamlCap's Mem/Memswap/Pids/OOMAdj from the
+// parsed defaults when the pattern omits them, mirroring apply_caps.py's
+// make_cap(entry, default) fallback semantics. make_cap falls back ALL FOUR
+// fields (`str(d.get("mem", default.mem))`, ... for memswap/pids/oom_adj) — an
+// earlier version only inherited Pids/OOMAdj, so a pattern that legitimately
+// omitted `mem:`/`memswap:` to inherit the top-level `defaults:` value (a
+// make_cap-valid YAML shape) was scored as drift by [VerifyAgainstYAML] even
+// though apply_caps.py produced an identical cap. An omitted mem/memswap
+// surfaces as the zero-value empty string, treated here as "absent" → inherit
+// the default, exactly as make_cap's d.get("mem", default.mem) does.
+func (c yamlCap) resolve(defMem, defMemswap string, defPids, defOOM int) Cap {
+	mem := c.Mem
+	if mem == "" {
+		mem = defMem
+	}
+	memswap := c.Memswap
+	if memswap == "" {
+		memswap = defMemswap
+	}
 	pids := defPids
 	if c.Pids != nil {
 		pids = *c.Pids
@@ -328,11 +342,12 @@ func (c yamlCap) resolve(mem, memswap string, defPids, defOOM int) Cap {
 // against [Default]. It returns nil when the two representations agree,
 // or a descriptive error naming the first drifted field otherwise.
 //
-// A pattern entry that omits `pids:` / `oom_adj:` inherits the top-level
-// `defaults:` value, exactly like apply_caps.py's make_cap(entry, default)
-// — a bare presence/absence diff would false-positive on every rule that
-// relies on that fallback (most of them), so this mirrors that resolution
-// rather than requiring every field to be spelled out explicitly.
+// A pattern entry that omits any of `mem:` / `memswap:` / `pids:` / `oom_adj:`
+// inherits the top-level `defaults:` value, exactly like apply_caps.py's
+// make_cap(entry, default) (which falls back ALL FOUR fields) — a bare
+// presence/absence diff would false-positive on every rule that relies on
+// that fallback, so this mirrors that resolution rather than requiring every
+// field to be spelled out explicitly.
 func VerifyAgainstYAML(yamlPath string) error {
 	raw, err := os.ReadFile(yamlPath)
 	if err != nil {
@@ -370,7 +385,7 @@ func VerifyAgainstYAML(yamlPath string) error {
 			return fmt.Errorf("%s: rule %d match drift: policy.go has %q, YAML has %q",
 				yamlPath, i, gr.Match, yp.Match)
 		}
-		yCap := yp.yamlCap.resolve(yp.Mem, yp.Memswap, defPids, defOOM)
+		yCap := yp.yamlCap.resolve(y.Defaults.Mem, y.Defaults.Memswap, defPids, defOOM)
 		if gr.Cap != yCap {
 			return fmt.Errorf("%s: rule %d (%q) cap drift: policy.go has %+v, YAML has %+v",
 				yamlPath, i, gr.Match, gr.Cap, yCap)
