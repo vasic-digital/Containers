@@ -125,6 +125,16 @@ func buildDynamicForwardArgs(o Options) []string {
 	if connectTimeout <= 0 {
 		connectTimeout = 10 * time.Second
 	}
+	// §EG2-2: ssh's ConnectTimeout option is an INTEGER number of seconds, and
+	// ConnectTimeout=0 means "no timeout — fall back to the ~2-minute system TCP
+	// default", the OPPOSITE of a tight bound. int(d.Seconds()) truncates, so any
+	// sub-second ConnectTimeout (e.g. 500ms) silently rendered "ConnectTimeout=0",
+	// disabling the ssh-side connect bound the caller asked to tighten. Clamp to a
+	// floor of 1s so a positive request is never turned into "unbounded".
+	connectSecs := int(connectTimeout.Seconds())
+	if connectSecs < 1 {
+		connectSecs = 1
+	}
 	args := []string{
 		"-N",
 		"-D", o.SocksAddr(),
@@ -133,7 +143,7 @@ func buildDynamicForwardArgs(o Options) []string {
 		"-o", "ExitOnForwardFailure=yes",
 		"-o", "ServerAliveInterval=30",
 		"-o", "ServerAliveCountMax=3",
-		"-o", fmt.Sprintf("ConnectTimeout=%d", int(connectTimeout.Seconds())),
+		"-o", fmt.Sprintf("ConnectTimeout=%d", connectSecs),
 		"-p", strconv.Itoa(o.sshPort()),
 	}
 	if o.KeyPath != "" {
@@ -179,6 +189,17 @@ func TunnelUp(ctx context.Context, o Options, logger logging.Logger) (*Tunnel, e
 	}
 	if o.LocalPort <= 0 {
 		return nil, fmt.Errorf("egress: LocalPort is required")
+	}
+	// §EG2-1: the ssh child is spawned as a bare argv (execCommand("ssh", args...),
+	// no shell), so shell metacharacters in the destination are inert — but a
+	// destination that BEGINS WITH '-' is parsed by ssh's own getopt as an OPTION,
+	// not a host. e.g. VPNHost "-oProxyCommand=<cmd>" injects ssh's ProxyCommand
+	// (arbitrary command execution) since destination() is appended as the final
+	// positional with no "--" guard. Refuse it (ssh has no reliable "--" end-of-
+	// options for the host, so rejection is the safe, deterministic fix). Checking
+	// destination() covers a leading '-' in EITHER VPNHost OR the User@VPNHost form.
+	if strings.HasPrefix(o.destination(), "-") {
+		return nil, fmt.Errorf("egress: refusing ssh destination %q that begins with '-' (would be parsed as an ssh option — argument injection)", o.destination())
 	}
 
 	args := buildDynamicForwardArgs(o)
