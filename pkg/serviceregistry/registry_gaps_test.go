@@ -30,7 +30,7 @@ func TestWithLabels_EmptyMap(t *testing.T) {
 // TestIsPortAvailable_Available verifies isPortAvailable returns true
 // for a port that is not in use (exercises the ln.Close() true branch).
 func TestIsPortAvailable_Available(t *testing.T) {
-	r := New(WithRegistryDir(""))
+	r := New(WithRegistryDir(t.TempDir()))
 	// FindAvailablePort already exercises the true path; call it here.
 	port := r.FindAvailablePort(41000)
 	require.Greater(t, port, 0)
@@ -46,7 +46,7 @@ func TestIsPortAvailable_Occupied(t *testing.T) {
 	defer ln.Close()
 
 	addr := ln.Addr().(*net.TCPAddr)
-	r := New(WithRegistryDir(""))
+	r := New(WithRegistryDir(t.TempDir()))
 	assert.False(t, r.isPortAvailable(addr.Port))
 }
 
@@ -61,7 +61,7 @@ func TestFindAvailablePort_ReturnsZero(t *testing.T) {
 	addr := ln.Addr().(*net.TCPAddr)
 	port := addr.Port
 
-	r := New(WithRegistryDir(""))
+	r := New(WithRegistryDir(t.TempDir()))
 	// Use a range of exactly 1 port that is occupied.
 	// startPort + 10000 > port, so we need to override indirectly.
 	// Instead, intercept by using defaultHost set to an invalid addr
@@ -92,7 +92,7 @@ func TestSaveToDisk_MkdirFail(t *testing.T) {
 
 // TestLoadFromDisk_EmptyRegistryDir covers the early return in loadFromDisk.
 func TestLoadFromDisk_EmptyRegistryDir(t *testing.T) {
-	r := New(WithRegistryDir(""))
+	r := New(WithRegistryDir(t.TempDir()))
 	// Should not panic; registryDir is empty -> early return.
 	r.loadFromDisk()
 }

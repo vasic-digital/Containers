@@ -14,7 +14,7 @@ import (
 // This exercises the `select { case <-ctx.Done(): return nil, ctx.Err() }`
 // branch inside the loop.
 func TestDiscover_ContextCancelled(t *testing.T) {
-	r := New(WithRegistryDir(""))
+	r := New(WithRegistryDir(t.TempDir()))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel before calling Discover
