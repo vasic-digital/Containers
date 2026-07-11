@@ -334,10 +334,20 @@ func (d *Display) renderRow(p ContainerProcess) string {
 	sb.WriteString(d.colorize(d.hostColor(p.Host), padRight(truncate(p.Host, 12), 12)))
 	sb.WriteString(d.colorize(stateColor, padRight(p.State, 8)))
 
-	cpuColor := d.cpuColor(p.CPUPercent)
-	sb.WriteString(d.colorize(cpuColor, padRight(fmt.Sprintf("%.1f%%", p.CPUPercent), 7)))
-	sb.WriteString(d.colorize(d.memColor(p.MemoryPercent), padRight(formatBytes(p.MemoryUsage), 10)))
-	sb.WriteString(d.colorize(d.memColor(p.MemoryPercent), padRight(fmt.Sprintf("%.1f%%", p.MemoryPercent), 7)))
+	if p.StatsUnavailable {
+		// CT3-7 (§11.4.108): a failed/empty stats collection must be
+		// visually distinct from a confirmed 0% reading — colorPurple/"N/A"
+		// never appears in the genuine-reading cpuColor/memColor palette
+		// (green/yellow/red), so it cannot be mistaken for a real value.
+		sb.WriteString(d.colorize(colorPurple, padRight("N/A", 7)))
+		sb.WriteString(d.colorize(colorPurple, padRight("N/A", 10)))
+		sb.WriteString(d.colorize(colorPurple, padRight("N/A", 7)))
+	} else {
+		cpuColor := d.cpuColor(p.CPUPercent)
+		sb.WriteString(d.colorize(cpuColor, padRight(fmt.Sprintf("%.1f%%", p.CPUPercent), 7)))
+		sb.WriteString(d.colorize(d.memColor(p.MemoryPercent), padRight(formatBytes(p.MemoryUsage), 10)))
+		sb.WriteString(d.colorize(d.memColor(p.MemoryPercent), padRight(fmt.Sprintf("%.1f%%", p.MemoryPercent), 7)))
+	}
 	sb.WriteString(d.colorize(colorWhite, padRight(formatNetIO(p.NetworkRx, p.NetworkTx), 12)))
 	sb.WriteString(d.colorize(colorWhite, padRight(formatBlockIO(p.BlockRead, p.BlockWrite), 12)))
 	sb.WriteString(d.colorize(colorWhite, padRight(fmt.Sprintf("%d", p.PIDs), 5)))
@@ -454,18 +464,40 @@ func (d *Display) updateSize() {
 	d.height = height
 }
 
+// padRight pads (or byte-unsafely-truncates, pre-fix) s to width. CT3-10:
+// slicing the raw string by BYTE offset (the old `s[:width]`) can cut a
+// multi-byte UTF-8 rune in half for non-ASCII container/image names,
+// corrupting the rendered cell. Operating on []rune instead makes every
+// slice/count a rune count, so the cut always lands on a rune boundary and
+// the padded width matches the actual number of displayed characters.
 func padRight(s string, width int) string {
-	if len(s) >= width {
-		return s[:width]
+	runes := []rune(s)
+	if len(runes) >= width {
+		if width < 0 {
+			width = 0
+		}
+		return string(runes[:width])
 	}
-	return s + strings.Repeat(" ", width-len(s))
+	return s + strings.Repeat(" ", width-len(runes))
 }
 
+// truncate shortens s to at most maxLen displayed characters, appending "..."
+// when it actually cuts content. CT3-10: the old `s[:maxLen-3]` byte slice
+// could split a multi-byte UTF-8 rune (accented / CJK characters) at the
+// truncation boundary, producing an invalid/corrupted rune in the output.
+// Slicing []rune(s) instead guarantees every cut lands on a rune boundary.
 func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
 		return s
 	}
-	return s[:maxLen-3] + "..."
+	if maxLen <= 3 {
+		if maxLen < 0 {
+			maxLen = 0
+		}
+		return string(runes[:maxLen])
+	}
+	return string(runes[:maxLen-3]) + "..."
 }
 
 func formatBytes(b uint64) string {

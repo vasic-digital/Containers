@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -157,18 +158,25 @@ func (c *Collector) collectLocal(ctx context.Context) ([]ContainerProcess, error
 	}
 
 	for i := range containers {
-		stats, _ := c.getContainerStats(ctx, rt, containers[i].ID)
-		if stats != nil {
-			containers[i].CPUPercent = stats.CPUPercent
-			containers[i].MemoryUsage = stats.MemoryUsage
-			containers[i].MemoryLimit = stats.MemoryLimit
-			containers[i].MemoryPercent = stats.MemoryPercent
-			containers[i].NetworkRx = stats.NetworkRx
-			containers[i].NetworkTx = stats.NetworkTx
-			containers[i].BlockRead = stats.BlockRead
-			containers[i].BlockWrite = stats.BlockWrite
-			containers[i].PIDs = stats.PIDs
+		stats, statsErr := c.getContainerStats(ctx, rt, containers[i].ID)
+		if statsErr != nil || stats == nil {
+			// CT3-7 (§11.4.108): a failed/empty stats collection leaves
+			// CPUPercent/MemoryUsage at the Go zero-value, which renders
+			// identically to a genuinely-idle 0% container unless flagged —
+			// StatsUnavailable is the distinct signal the renderer needs to
+			// show "N/A" instead of a confirmed "0.0%".
+			containers[i].StatsUnavailable = true
+			continue
 		}
+		containers[i].CPUPercent = stats.CPUPercent
+		containers[i].MemoryUsage = stats.MemoryUsage
+		containers[i].MemoryLimit = stats.MemoryLimit
+		containers[i].MemoryPercent = stats.MemoryPercent
+		containers[i].NetworkRx = stats.NetworkRx
+		containers[i].NetworkTx = stats.NetworkTx
+		containers[i].BlockRead = stats.BlockRead
+		containers[i].BlockWrite = stats.BlockWrite
+		containers[i].PIDs = stats.PIDs
 	}
 
 	return containers, nil
@@ -245,17 +253,38 @@ func (c *Collector) collectFromHost(ctx context.Context, host remote.RemoteHost)
 		containers[i].Host = host.Name
 		containers[i].Location = "remote:" + host.Name
 
-		statsCmd := fmt.Sprintf("%s stats --no-stream --format json %s", rt, containers[i].ID)
-		statsResult, err := c.sshExecutor.Execute(ctx, host, statsCmd)
-		if err == nil {
-			stats := parseContainerStats([]byte(statsResult.Stdout))
-			if stats != nil {
-				containers[i].CPUPercent = stats.CPUPercent
-				containers[i].MemoryUsage = stats.MemoryUsage
-				containers[i].MemoryLimit = stats.MemoryLimit
-				containers[i].MemoryPercent = stats.MemoryPercent
-			}
+		// CT3-9: containers[i].ID is dynamic data parsed from the PRIOR
+		// `ps -a --format json` command's output (see parseContainerList),
+		// not static configuration. buildRemoteStatsCommand refuses to
+		// interpolate anything outside the safe container-ID charset into a
+		// string that is about to be handed to sshExecutor.Execute — which
+		// runs it through a REMOTE SHELL with no argv-style escaping,
+		// unlike the LOCAL path (getContainerStats above), which passes the
+		// id as a discrete exec.CommandContext argv element (no shell
+		// involved at all).
+		statsCmd, cmdErr := buildRemoteStatsCommand(rt, containers[i].ID)
+		if cmdErr != nil {
+			log.Printf("ctop: collectFromHost: host %s: %v", host.Name, cmdErr)
+			containers[i].StatsUnavailable = true
+			continue
 		}
+
+		statsResult, err := c.sshExecutor.Execute(ctx, host, statsCmd)
+		if err != nil {
+			// CT3-7: distinguish a failed remote stats call from a
+			// genuinely-idle 0% container (see collectLocal above).
+			containers[i].StatsUnavailable = true
+			continue
+		}
+		stats := parseContainerStats([]byte(statsResult.Stdout))
+		if stats == nil {
+			containers[i].StatsUnavailable = true
+			continue
+		}
+		containers[i].CPUPercent = stats.CPUPercent
+		containers[i].MemoryUsage = stats.MemoryUsage
+		containers[i].MemoryLimit = stats.MemoryLimit
+		containers[i].MemoryPercent = stats.MemoryPercent
 	}
 
 	return containers, nil
@@ -267,6 +296,28 @@ func (c *Collector) getContainerStats(ctx context.Context, rt, id string) (*Cont
 		return nil, err
 	}
 	return parseContainerStats(out), nil
+}
+
+// containerIDSafePattern is the safe charset for docker/podman container IDs
+// (hex digests and short IDs alike): letters, digits, underscore, dot, and
+// hyphen. Anything outside this set is refused by buildRemoteStatsCommand
+// rather than interpolated into a remote-shell command string (CT3-9).
+var containerIDSafePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
+// buildRemoteStatsCommand builds the `<runtime> stats --no-stream --format
+// json <id>` command line later handed to sshExecutor.Execute, which runs it
+// through the remote user's shell with NO argv-style escaping (CT3-9). The
+// id originates from a PRIOR command's parsed JSON output — dynamic data,
+// not static configuration — so it MUST be validated against the safe
+// container-ID charset before interpolation; an id outside that charset is
+// refused rather than silently escaped, since a rejected stats call is
+// vastly preferable to a shell-injection-shaped string ever reaching a
+// remote shell.
+func buildRemoteStatsCommand(rt, id string) (string, error) {
+	if !containerIDSafePattern.MatchString(id) {
+		return "", fmt.Errorf("refusing to build remote stats command: unsafe container id %q", id)
+	}
+	return fmt.Sprintf("%s stats --no-stream --format json %s", rt, id), nil
 }
 
 func shortenID(id string) string {
@@ -367,6 +418,12 @@ func parsePIDs(s string) int {
 }
 
 func formatUptime(d time.Duration) string {
+	if d < 0 {
+		// CT3-11: clock skew (StartedAt slightly ahead of local wall-clock)
+		// otherwise yields a negative duration and renders a nonsensical
+		// "-5m" uptime; clamp to zero ("just started") instead.
+		d = 0
+	}
 	days := int(d.Hours()) / 24
 	hours := int(d.Hours()) % 24
 	mins := int(d.Minutes()) % 60

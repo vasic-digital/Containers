@@ -103,6 +103,24 @@ func (r rawContainerJSON) normalize() decodedContainer {
 
 // decodeLabels reads container labels from either a podman/labels object
 // (`{"k":"v"}`) or a docker comma-separated `k=v,k2=v2` string.
+//
+// CT3-8 (KNOWN LIMITATION, assessed — not cleanly fixable, §11.4.112-class
+// honest documentation): the docker comma-string branch below splits on a
+// bare "," so a label VALUE containing a literal comma is silently
+// truncated at the first comma (e.g. `description=hello, world` decodes to
+// `description=hello`, and the dangling ` world` fragment — having no `=`
+// — is dropped entirely). This is not a bug in this decoder's splitting
+// logic; it is an unescapable limitation of docker's own `ps --format
+// json` output shape: docker's Labels field for `ps` is a single flat
+// "k=v,k2=v2" string with NO escaping for commas embedded in a value, and
+// there is no alternative `--format` field on `docker ps` that exposes
+// labels as a structured map (only `docker inspect`'s per-container round
+// trip does — a materially different, materially more expensive command,
+// out of scope for a label-decode fix). Podman is unaffected: its
+// structured labels-object branch (tried FIRST below) has no such
+// ambiguity. See TestWave20_CT3_8_DecodeLabels_CommaInValueTruncates_KnownLimitation
+// in wave20_ct3hard_test.go, which captures this exact behavior as a
+// tracked, honest known-limitation — not a silently-accepted defect.
 func decodeLabels(raw json.RawMessage) map[string]string {
 	if len(raw) == 0 {
 		return nil
