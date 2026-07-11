@@ -68,7 +68,12 @@ func (c *DefaultSystemCollector) Collect() SystemResources {
 	}
 
 	if checker.isLinux() {
-		res.CPUPercent = c.collectCPULinux()
+		// SW2-1: capture the CPU probe's ok flag so a read-failure (unreadable
+		// or malformed /proc/stat) sets res.CPUError instead of silently
+		// leaving CPUPercent at a genuine-looking 0.
+		cpu, cpuOK := c.collectCPULinuxOK()
+		res.CPUPercent = cpu
+		res.CPUError = !cpuOK
 		c.collectMemoryLinux(&res)
 		c.collectDiskLinux(&res)
 	} else {
@@ -92,11 +97,34 @@ func (c *DefaultSystemCollector) collectCPULinux() float64 {
 	return c.collectCPULinuxFromFile("/proc/stat")
 }
 
+// collectCPULinuxOK reads /proc/stat and computes CPU usage since the previous
+// sample, additionally returning ok=false when the /proc/stat read itself
+// FAILED (file unreadable or the cpu line malformed). SW2-1: lets Collect()
+// distinguish a broken CPU probe (→ res.CPUError) from a genuine 0% reading.
+func (c *DefaultSystemCollector) collectCPULinuxOK() (float64, bool) {
+	return c.collectCPULinuxFromFileOK("/proc/stat")
+}
+
 // collectCPULinuxFromFile reads the CPU sample from the given path and computes
 // CPU usage since the previous sample. Separated for testability (mirrors
 // collectMemoryLinuxFromFile) so the counter-guard is exercisable with an
-// injected fixture (CT-HARDEN-MON-HARD MON-1).
+// injected fixture (CT-HARDEN-MON-HARD MON-1). Thin wrapper over
+// collectCPULinuxFromFileOK dropping the ok flag — preserves the original
+// float64 signature for existing callers/tests.
 func (c *DefaultSystemCollector) collectCPULinuxFromFile(path string) float64 {
+	v, _ := c.collectCPULinuxFromFileOK(path)
+	return v
+}
+
+// collectCPULinuxFromFileOK is collectCPULinuxFromFile's OK-returning form.
+// SW2-1: ok=false is returned ONLY for a read failure (unreadable file or
+// malformed cpu line) — the sole "the probe FAILED" condition, so a broken
+// /proc/stat no longer reads as a genuine idle 0%. The counter-guard
+// rejections below return (0, true): the read SUCCEEDED, the single sample was
+// just rejected as non-monotonic and the last-good baseline preserved (a
+// transient the next good tick recovers), which is NOT a probe failure and
+// MUST NOT latch CPUError.
+func (c *DefaultSystemCollector) collectCPULinuxFromFileOK(path string) (float64, bool) {
 	// Hold mu across the whole read-sample → delta → update-prev sequence so
 	// it is atomic against concurrent Collect() callers (CT-HARDEN-MON-1). The
 	// /proc/stat read is a small local file, so serialising it here does not
@@ -104,34 +132,40 @@ func (c *DefaultSystemCollector) collectCPULinuxFromFile(path string) float64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	idle, total, ok := readCPUSampleOKFromFile(path)
-	// Guard against (a) the read-error / malformed-line sentinel (!ok) and
-	// (b) a counter that did not advance or ran BACKWARDS (total <= prevTotal
-	// or idle < prevIdle). Without this, a (0,0) sentinel with a large primed
-	// prevTotal underflows the uint64 delta (float64(0-prevTotal) ≈ 1.8e19),
-	// yielding an out-of-[0,100] CPU%, AND clobbers prev to 0 so the NEXT good
-	// sample computes a second bogus since-boot delta. On any guard hit return
-	// 0 WITHOUT clobbering prev, preserving the last-good baseline
-	// (CT-HARDEN-MON-HARD MON-1).
-	if !ok || total <= c.prevTotal || idle < c.prevIdle {
-		return 0
+	// SW2-1: the read-error / malformed-line sentinel (!ok) is a genuine PROBE
+	// FAILURE — return ok=false so Collect() sets res.CPUError. Returning 0
+	// here also avoids underflowing the uint64 delta: a (0,0) sentinel with a
+	// large primed prevTotal would make float64(0-prevTotal) ≈ 1.8e19, an
+	// out-of-[0,100] CPU%. prev is NOT clobbered, preserving the last-good
+	// baseline (CT-HARDEN-MON-HARD MON-1).
+	if !ok {
+		return 0, false
+	}
+	// Counter did not advance or ran BACKWARDS (total <= prevTotal or idle <
+	// prevIdle). The read SUCCEEDED (ok=true) — this is a rejected non-monotonic
+	// SAMPLE, not a probe failure. Return 0 WITHOUT clobbering prev, and ok=true
+	// so no CPUError is latched (CT-HARDEN-MON-HARD MON-1 / SW2-1).
+	if total <= c.prevTotal || idle < c.prevIdle {
+		return 0, true
 	}
 	idleDelta := float64(idle - c.prevIdle)
 	totalDelta := float64(total - c.prevTotal)
 	// idle is one of the summands of total, so on monotonic counters
-	// idleDelta <= totalDelta ALWAYS. The MON-1 guard above rejects the
+	// idleDelta <= totalDelta ALWAYS. The guard above rejects the
 	// read-error sentinel, total-not-advancing, and idle-running-backwards, but
 	// NOT a PARTIAL rollback where the non-idle sub-counters roll back while
 	// idle and the net total still advance (CPU hotplug / cgroup / namespace
 	// view change) — there idleDelta > totalDelta, and (1 - idleDelta/totalDelta)
 	// goes NEGATIVE, yielding an out-of-[0,100] CPU%. Reject that sample here,
 	// returning 0 WITHOUT clobbering prev so the last-good baseline is preserved
-	// (same philosophy as the MON-1 guard) (CT-HARDEN-MON2HARD MON2-1).
+	// (same philosophy as the MON-1 guard) (CT-HARDEN-MON2HARD MON2-1). ok=true:
+	// read succeeded, sample rejected — not a probe failure (SW2-1).
 	if idleDelta > totalDelta {
-		return 0
+		return 0, true
 	}
 	c.prevIdle = idle
 	c.prevTotal = total
-	return (1.0 - idleDelta/totalDelta) * 100
+	return (1.0 - idleDelta/totalDelta) * 100, true
 }
 
 // readCPUSample parses the first cpu line from /proc/stat and
@@ -202,6 +236,10 @@ func (c *DefaultSystemCollector) collectMemoryLinuxFromFile(
 ) {
 	f, err := os.Open(path)
 	if err != nil {
+		// SW2-1: /proc/meminfo unreadable — the probe FAILED. Flag it so a
+		// broken memory probe is not read as a genuine 0% (resolveMetric then
+		// returns ok=false for system.memory).
+		res.MemoryError = true
 		return
 	}
 	defer f.Close()
@@ -244,6 +282,13 @@ func (c *DefaultSystemCollector) collectMemoryLinuxFromFile(
 	case sawFree:
 		available = memFree + buffers + cached
 	default:
+		// SW2-1: meminfo carried MemTotal but NEITHER MemAvailable NOR MemFree,
+		// so available (hence usage) is genuinely UNKNOWN. Flag it as a probe
+		// failure so the leftover 0% MemoryPercent is not mistaken for a real
+		// idle reading — matching the task's "missing both MemAvailable/MemFree"
+		// failure mode. MemoryTotal above stays populated for consumers that
+		// want it.
+		res.MemoryError = true
 		return // available unknown — leave MemoryUsed/MemoryPercent at 0
 	}
 

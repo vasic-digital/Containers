@@ -342,7 +342,28 @@ func (m *DefaultVolumeManager) Sync(
 		)
 	}
 
+	// SW3-1: reserve the sync atomically with flipping State to MountSyncing,
+	// under the SAME lock — mirrors Mount()'s MountPending barrier (EGVOL-1)
+	// and Unmount()'s MountUnmounting barrier (VOL-HIGH-5). Without this
+	// reservation, two concurrent Sync(name) calls both pass the checks above
+	// and both set MountSyncing UNCONDITIONALLY here, then both call
+	// m.rsync.Sync concurrently against the identical (host, LocalPath,
+	// RemotePath): two real rsync pushes race, and whichever finishes LAST
+	// overwrites info.State/info.Error — the reported outcome can reflect the
+	// WRONG transfer (A's failure silently overwritten by B's success, or vice
+	// versa), a §11.4.108 duplicate-execution / wrong-caller-wins gap exactly
+	// like the one VOL-HIGH-5 closes for Unmount. Exactly one caller may drive
+	// the real rsync at a time; a second concurrent caller is rejected here,
+	// before it issues any remote command. The reservation is released on
+	// every exit path below (the unconditional MountMounted/MountFailed set
+	// after m.rsync.Sync returns), so a completed Sync is freely re-runnable —
+	// host lookup already happened above, so no path leaks a MountSyncing
+	// reservation.
 	m.mu.Lock()
+	if info.State == MountSyncing {
+		m.mu.Unlock()
+		return fmt.Errorf("mount %q is already being synced", name)
+	}
 	info.State = MountSyncing
 	m.mu.Unlock()
 

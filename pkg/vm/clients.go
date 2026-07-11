@@ -184,20 +184,44 @@ func (r *realSSHClient) Upload(ctx context.Context, hostPath, vmPath string) err
 	targetName := filepath.Base(vmPath)
 	runErr := make(chan error, 1)
 	go func() { runErr <- session.Run("scp -t -- " + shellQuote(targetDir)) }()
-	if _, err := fmt.Fprintf(stdin, "C%#o %d %s\n", info.Mode().Perm(), info.Size(), targetName); err != nil {
-		return fmt.Errorf("realSSHClient.Upload: write header: %w", err)
+	// SW1-1: run the blocking SCP source exchange in a goroutine and select on
+	// ctx.Done(), mirroring Run()'s timeout pattern. The pre-fix body ran the
+	// header write, io.Copy(stdin, f), terminator write, and the final
+	// <-runErr synchronously with NO ctx path: a guest that wedges mid-transfer
+	// (stdin buffer full so io.Copy blocks, or a scp -t that never returns so
+	// <-runErr blocks) hung this call FOREVER, stalling matrix.go's bounded
+	// worker pool past its deadline with no recovery. xferErr is buffered
+	// (cap 1) so the exchange goroutine can always deliver its result and never
+	// leaks when the ctx-cancel path returns first.
+	xferErr := make(chan error, 1)
+	go func() {
+		if _, err := fmt.Fprintf(stdin, "C%#o %d %s\n", info.Mode().Perm(), info.Size(), targetName); err != nil {
+			xferErr <- fmt.Errorf("realSSHClient.Upload: write header: %w", err)
+			return
+		}
+		if _, err := io.Copy(stdin, f); err != nil {
+			xferErr <- fmt.Errorf("realSSHClient.Upload: copy bytes: %w", err)
+			return
+		}
+		if _, err := fmt.Fprint(stdin, "\x00"); err != nil {
+			xferErr <- fmt.Errorf("realSSHClient.Upload: write terminator: %w", err)
+			return
+		}
+		_ = stdin.Close()
+		if err := <-runErr; err != nil {
+			xferErr <- fmt.Errorf("realSSHClient.Upload: scp -t %s: %w", targetDir, err)
+			return
+		}
+		xferErr <- nil
+	}()
+	select {
+	case err := <-xferErr:
+		return err
+	case <-ctx.Done():
+		_ = session.Signal(ssh.SIGKILL)
+		_ = session.Close()
+		return fmt.Errorf("realSSHClient.Upload: timeout: %w", ctx.Err())
 	}
-	if _, err := io.Copy(stdin, f); err != nil {
-		return fmt.Errorf("realSSHClient.Upload: copy bytes: %w", err)
-	}
-	if _, err := fmt.Fprint(stdin, "\x00"); err != nil {
-		return fmt.Errorf("realSSHClient.Upload: write terminator: %w", err)
-	}
-	_ = stdin.Close()
-	if err := <-runErr; err != nil {
-		return fmt.Errorf("realSSHClient.Upload: scp -t %s: %w", targetDir, err)
-	}
-	return nil
 }
 
 // Run executes script on the guest via an SSH session. stdout, stderr,
@@ -272,52 +296,82 @@ func (r *realSSHClient) Download(ctx context.Context, vmPath, hostPath string) e
 	if err := session.Start("scp -f -- " + shellQuote(vmPath)); err != nil {
 		return fmt.Errorf("realSSHClient.Download: scp -f %s: %w", vmPath, err)
 	}
-	if _, err := fmt.Fprint(stdin, "\x00"); err != nil {
-		return fmt.Errorf("realSSHClient.Download: send ready: %w", err)
+	// SW1-1: run the blocking SCP sink exchange in a goroutine and select on
+	// ctx.Done(), mirroring Run()'s timeout pattern. The pre-fix body was fully
+	// synchronous with NO ctx path: a guest whose scp -f never sends the header
+	// (reader.ReadString blocks), stalls the body (io.CopyN blocks), or never
+	// exits (session.Wait blocks) hung this call FOREVER. The VM2-5 negative /
+	// oversize-size guards stay INSIDE this goroutine, BEFORE the header ack and
+	// the dest-file open, so a garbled header still can never produce a false
+	// "success" artifact. xferErr is buffered (cap 1) so the exchange goroutine
+	// never leaks when the ctx-cancel path returns first.
+	xferErr := make(chan error, 1)
+	go func() {
+		if _, err := fmt.Fprint(stdin, "\x00"); err != nil {
+			xferErr <- fmt.Errorf("realSSHClient.Download: send ready: %w", err)
+			return
+		}
+		reader := bufio.NewReader(stdoutPipe)
+		header, err := reader.ReadString('\n')
+		if err != nil {
+			xferErr <- fmt.Errorf("realSSHClient.Download: read header: %w", err)
+			return
+		}
+		var mode os.FileMode
+		var size int64
+		var name string
+		if _, err := fmt.Sscanf(header, "C%o %d %s", &mode, &size, &name); err != nil {
+			xferErr <- fmt.Errorf("realSSHClient.Download: parse header %q: %w", header, err)
+			return
+		}
+		// VM2-5: a negative (or implausibly large) size in the SCP header is a
+		// garbled/corrupted response. Without this guard, io.CopyN(out, reader,
+		// size) with a negative size returns (0, nil) immediately — a "clean"
+		// 0-byte file that matrix.go's captor (Download err == nil) records as
+		// genuine captured evidence. Reject BEFORE ack'ing the header or
+		// creating the destination file, so a garbled header can never produce
+		// a false "success" artifact.
+		if size < 0 {
+			xferErr <- fmt.Errorf("realSSHClient.Download: header %q declares negative size %d", strings.TrimSpace(header), size)
+			return
+		}
+		if size > maxSCPDownloadSize {
+			xferErr <- fmt.Errorf("realSSHClient.Download: header %q declares implausible size %d (max %d)", strings.TrimSpace(header), size, maxSCPDownloadSize)
+			return
+		}
+		if _, err := fmt.Fprint(stdin, "\x00"); err != nil {
+			xferErr <- fmt.Errorf("realSSHClient.Download: ack header: %w", err)
+			return
+		}
+		out, err := os.OpenFile(hostPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode.Perm())
+		if err != nil {
+			xferErr <- fmt.Errorf("realSSHClient.Download: open %s: %w", hostPath, err)
+			return
+		}
+		defer out.Close()
+		if _, err := io.CopyN(out, reader, size); err != nil {
+			xferErr <- fmt.Errorf("realSSHClient.Download: copy bytes: %w", err)
+			return
+		}
+		if _, err := fmt.Fprint(stdin, "\x00"); err != nil {
+			xferErr <- fmt.Errorf("realSSHClient.Download: ack terminator: %w", err)
+			return
+		}
+		_ = stdin.Close()
+		if err := session.Wait(); err != nil {
+			xferErr <- fmt.Errorf("realSSHClient.Download: wait: %w", err)
+			return
+		}
+		xferErr <- nil
+	}()
+	select {
+	case err := <-xferErr:
+		return err
+	case <-ctx.Done():
+		_ = session.Signal(ssh.SIGKILL)
+		_ = session.Close()
+		return fmt.Errorf("realSSHClient.Download: timeout: %w", ctx.Err())
 	}
-	reader := bufio.NewReader(stdoutPipe)
-	header, err := reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("realSSHClient.Download: read header: %w", err)
-	}
-	var mode os.FileMode
-	var size int64
-	var name string
-	if _, err := fmt.Sscanf(header, "C%o %d %s", &mode, &size, &name); err != nil {
-		return fmt.Errorf("realSSHClient.Download: parse header %q: %w", header, err)
-	}
-	// VM2-5: a negative (or implausibly large) size in the SCP header is a
-	// garbled/corrupted response. Without this guard, io.CopyN(out, reader,
-	// size) with a negative size returns (0, nil) immediately — a "clean"
-	// 0-byte file that matrix.go's captor (Download err == nil) records as
-	// genuine captured evidence. Reject BEFORE ack'ing the header or
-	// creating the destination file, so a garbled header can never produce
-	// a false "success" artifact.
-	if size < 0 {
-		return fmt.Errorf("realSSHClient.Download: header %q declares negative size %d", strings.TrimSpace(header), size)
-	}
-	if size > maxSCPDownloadSize {
-		return fmt.Errorf("realSSHClient.Download: header %q declares implausible size %d (max %d)", strings.TrimSpace(header), size, maxSCPDownloadSize)
-	}
-	if _, err := fmt.Fprint(stdin, "\x00"); err != nil {
-		return fmt.Errorf("realSSHClient.Download: ack header: %w", err)
-	}
-	out, err := os.OpenFile(hostPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode.Perm())
-	if err != nil {
-		return fmt.Errorf("realSSHClient.Download: open %s: %w", hostPath, err)
-	}
-	defer out.Close()
-	if _, err := io.CopyN(out, reader, size); err != nil {
-		return fmt.Errorf("realSSHClient.Download: copy bytes: %w", err)
-	}
-	if _, err := fmt.Fprint(stdin, "\x00"); err != nil {
-		return fmt.Errorf("realSSHClient.Download: ack terminator: %w", err)
-	}
-	_ = stdin.Close()
-	if err := session.Wait(); err != nil {
-		return fmt.Errorf("realSSHClient.Download: wait: %w", err)
-	}
-	return nil
 }
 
 func (r *realSSHClient) Close() error {

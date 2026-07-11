@@ -42,6 +42,20 @@ type SystemResources struct {
 	MemoryUsed    uint64
 	DiskTotal     uint64
 	DiskUsed      uint64
+	// SW2-1: per-metric collection-failure signals. When a host-metric probe
+	// FAILS, the corresponding *Percent field is left at the Go zero (0.0),
+	// which is indistinguishable from a genuinely-idle host — so an operator
+	// rule like `system.disk > 90 → page` would NEVER fire when the probe is
+	// broken while the disk is actually full. These flags let a consumer (and
+	// resolveMetric) distinguish a probe FAILURE from a genuine-zero reading,
+	// mirroring ResourceSnapshot.ListError one layer up (CT-HARDEN-MON-HARD
+	// MON-3). CPUError is set when /proc/stat is unreadable/malformed;
+	// MemoryError when /proc/meminfo is unreadable OR carries no usable
+	// available-memory figure; DiskError when the statfs probe errors. On the
+	// SUCCESS path each stays false and the *Percent value is authoritative.
+	CPUError    bool
+	MemoryError bool
+	DiskError   bool
 }
 
 // ContainerResources holds resource usage for a single container.
