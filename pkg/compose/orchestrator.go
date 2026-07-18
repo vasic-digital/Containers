@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -856,10 +857,64 @@ func parsePorts(raw string) []string {
 	return result
 }
 
-// detectComposeCmd tries to find a working compose command, preferring
-// Docker Compose v2 plugin, then standalone docker-compose, then
-// podman-compose, then podman compose.
+// composeEnvVar is the env var a consumer sets to pin the compose command,
+// decoupled from any auto-detection order. Value is a whitespace-separated
+// command line, e.g. "podman compose", "podman-compose", or "docker compose".
+// When set and the pinned command verifies, auto-detection is bypassed
+// entirely. This lets a consumer with a rootless-podman-only policy force
+// podman without the library baking any runtime preference into its generic
+// docker-first default.
+//
+// Motivation (R1): on a host with a genuine independent docker AND a genuine
+// independent podman, detectComposeCmd's docker-first candidate order picks
+// docker, and isPodmanBackedCmd does NOT reclassify it (a genuine docker's
+// `docker compose version` banner has no "podman" marker), so a consumer
+// wanting podman silently gets docker. This pin gives the consumer a
+// decoupled override without changing the library's generic default.
+const composeEnvVar = "CONTAINERS_COMPOSE_CMD"
+
+// composeCmdProbe reports whether `<name> [args...] version` runs. It is a
+// package var (defaulting to composeCmdWorks bounded by composeProbeTimeout)
+// so tests can inject a fake, keeping the env-pin + fallback logic in
+// detectComposeCmdWithProbe hermetically unit-testable without a real
+// docker/podman on the test host.
+var composeCmdProbe = func(name string, args []string) bool {
+	return composeCmdWorks(name, args, composeProbeTimeout)
+}
+
+// detectComposeCmd resolves the compose command. Resolution order:
+//  1. CONTAINERS_COMPOSE_CMD env pin (decoupled, consumer-supplied) --
+//     bypasses auto-detection; a pin that does not verify is a HARD error,
+//     never a silent fall-through to the docker-first auto-detect.
+//  2. Auto-detect, preferring Docker Compose v2 plugin, then standalone
+//     docker-compose, then podman-compose, then podman compose.
 func detectComposeCmd() (string, []string, error) {
+	return detectComposeCmdWithProbe(os.Getenv(composeEnvVar), composeCmdProbe)
+}
+
+// detectComposeCmdWithProbe is the testable core of detectComposeCmd: pinned
+// is the raw env-pin value (empty = none) and probe reports whether a
+// candidate `<name> [args...] version` runs. Split out so the pin + fallback
+// logic is hermetically unit-testable; the real detectComposeCmd wires
+// composeCmdProbe (which delegates to composeCmdWorks) as probe.
+func detectComposeCmdWithProbe(
+	pinned string, probe func(name string, args []string) bool,
+) (string, []string, error) {
+	// 1. Explicit consumer pin -- bypass auto-detection, fail closed.
+	if fields := strings.Fields(pinned); len(fields) > 0 {
+		cmd, args := fields[0], fields[1:]
+		if probe(cmd, args) {
+			return cmd, args, nil
+		}
+		return "", nil, fmt.Errorf(
+			"%s pinned compose command %q is not runnable",
+			composeEnvVar, pinned,
+		)
+	}
+
+	// 2. Auto-detect, preferring Docker Compose v2 plugin, then standalone
+	// docker-compose, then podman-compose, then podman compose. Order
+	// preserved for generic (unpinned) consumers.
 	candidates := []struct {
 		cmd  string
 		args []string
@@ -871,14 +926,15 @@ func detectComposeCmd() (string, []string, error) {
 	}
 
 	for _, c := range candidates {
-		if composeCmdWorks(c.cmd, c.args, composeProbeTimeout) {
+		if probe(c.cmd, c.args) {
 			return c.cmd, c.args, nil
 		}
 	}
 
 	return "", nil, fmt.Errorf(
 		"no compose command found: tried docker compose, " +
-			"docker-compose, podman-compose, podman compose",
+			"docker-compose, podman-compose, podman compose " +
+			"(set " + composeEnvVar + " to pin one)",
 	)
 }
 

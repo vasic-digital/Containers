@@ -45,6 +45,10 @@ import (
 // podman) are unresolvable and the real auto-detect path
 // (NewDefaultOrchestrator -> detectComposeCmd) is exercised end-to-end.
 func TestCO1_PodmanShimDetection_ClassifiesAsPodman(t *testing.T) {
+	// R1 hermeticity: neutralize any globally-exported CONTAINERS_COMPOSE_CMD
+	// pin so this real-env auto-detect test is not false-FAILed (§11.4.1) by a
+	// consumer's rootless-podman override sitting in the environment.
+	t.Setenv(composeEnvVar, "")
 	tmpDir := t.TempDir()
 	dockerPath := filepath.Join(tmpDir, "docker")
 	upArgsFile := filepath.Join(tmpDir, "up-args.txt")

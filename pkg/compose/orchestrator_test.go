@@ -291,6 +291,10 @@ func TestDownOptions(t *testing.T) {
 // --- Tests for NewDefaultOrchestrator ---
 
 func TestNewDefaultOrchestrator_Success(t *testing.T) {
+	// R1 hermeticity: neutralize any globally-exported CONTAINERS_COMPOSE_CMD
+	// pin so this real-env auto-detect test is not false-FAILed (§11.4.1) by a
+	// consumer's rootless-podman override sitting in the environment.
+	t.Setenv(composeEnvVar, "")
 	// This test will only succeed if docker or podman is available
 	// on the system. We skip if no compose command is found.
 	o, err := NewDefaultOrchestrator("/tmp", nil)
@@ -305,6 +309,10 @@ func TestNewDefaultOrchestrator_Success(t *testing.T) {
 }
 
 func TestNewDefaultOrchestrator_NilLogger(t *testing.T) {
+	// R1 hermeticity: neutralize any globally-exported CONTAINERS_COMPOSE_CMD
+	// pin so this real-env auto-detect test is not false-FAILed (§11.4.1) by a
+	// consumer's rootless-podman override sitting in the environment.
+	t.Setenv(composeEnvVar, "")
 	o, err := NewDefaultOrchestrator("/tmp", nil)
 	if err != nil {
 		t.Skipf("no compose command available: %v", err) // SKIP-OK: #env-compose-cmd-missing
@@ -318,6 +326,10 @@ func TestNewDefaultOrchestrator_NilLogger(t *testing.T) {
 // --- Tests for detectComposeCmd ---
 
 func TestDetectComposeCmd_FindsDockerCompose(t *testing.T) {
+	// R1 hermeticity: neutralize any globally-exported CONTAINERS_COMPOSE_CMD
+	// pin so this real-env auto-detect test is not false-FAILed (§11.4.1) by a
+	// consumer's rootless-podman override sitting in the environment.
+	t.Setenv(composeEnvVar, "")
 	// Check if docker compose is available
 	cmd := exec.Command("docker", "compose", "version")
 	if err := cmd.Run(); err != nil {
@@ -331,6 +343,10 @@ func TestDetectComposeCmd_FindsDockerCompose(t *testing.T) {
 }
 
 func TestDetectComposeCmd_FindsStandaloneDockerCompose(t *testing.T) {
+	// R1 hermeticity: neutralize any globally-exported CONTAINERS_COMPOSE_CMD
+	// pin so this real-env auto-detect test is not false-FAILed (§11.4.1) by a
+	// consumer's rootless-podman override sitting in the environment.
+	t.Setenv(composeEnvVar, "")
 	// Check if docker-compose is available
 	cmd := exec.Command("docker-compose", "version")
 	if err := cmd.Run(); err != nil {
@@ -351,6 +367,10 @@ func TestDetectComposeCmd_FindsStandaloneDockerCompose(t *testing.T) {
 }
 
 func TestDetectComposeCmd_FindsPodmanCompose(t *testing.T) {
+	// R1 hermeticity: neutralize any globally-exported CONTAINERS_COMPOSE_CMD
+	// pin so this real-env auto-detect test is not false-FAILed (§11.4.1) by a
+	// consumer's rootless-podman override sitting in the environment.
+	t.Setenv(composeEnvVar, "")
 	// Check if podman-compose is available
 	cmd := exec.Command("podman-compose", "version")
 	if err := cmd.Run(); err != nil {
@@ -1309,6 +1329,10 @@ exit 0
 // TestDetectComposeCmd_NoComposeAvailable tests the error path when
 // no compose command is found on the system.
 func TestDetectComposeCmd_NoComposeAvailable(t *testing.T) {
+	// R1 hermeticity: neutralize any globally-exported CONTAINERS_COMPOSE_CMD
+	// pin so the no-compose-found error path is reached instead of the pin's
+	// "not runnable" fail-closed error (§11.4.1).
+	t.Setenv(composeEnvVar, "")
 	// Save original PATH
 	origPath := os.Getenv("PATH")
 	defer os.Setenv("PATH", origPath)
@@ -1326,6 +1350,10 @@ func TestDetectComposeCmd_NoComposeAvailable(t *testing.T) {
 // TestNewDefaultOrchestrator_NoComposeAvailable tests NewDefaultOrchestrator
 // when no compose command is available.
 func TestNewDefaultOrchestrator_NoComposeAvailable(t *testing.T) {
+	// R1 hermeticity: neutralize any globally-exported CONTAINERS_COMPOSE_CMD
+	// pin so the no-compose-found error path is reached instead of the pin's
+	// "not runnable" fail-closed error (§11.4.1).
+	t.Setenv(composeEnvVar, "")
 	// Save original PATH
 	origPath := os.Getenv("PATH")
 	defer os.Setenv("PATH", origPath)
