@@ -223,3 +223,24 @@ See root `/CLAUDE.md` §6.R. No connection address, port, header field name, cre
 ## Commit Style
 
 Conventional Commits: `feat(runtime): add Kubernetes support`
+
+## Inherited universal covenant anchors (from HelixConstitution)
+
+This module inherits the full universal covenant from the Helix Constitution
+(https://github.com/HelixDevelopment/HelixConstitution). The anchors below apply
+directly — they are UNIVERSAL and project-agnostic (no consuming-project context,
+per §11.4.28), so this decoupled module carries them by reference to the
+constitution submodule's `Constitution.md`:
+
+- §11.4.66 — Blocker-resolution interactive-clarification mandate. When a blocker
+  cannot be resolved from evidence, ask a precise clarifying question rather than
+  guess. [full → constitution `Constitution.md` §11.4.66]
+- §11.4.67 — Shell-script target-shell-parseability mandate. Every shell script
+  MUST parse clean under its declared target shell (`sh -n` / `bash -n`).
+  [full → constitution `Constitution.md` §11.4.67]
+- §11.4.69 — Universal sink-side positive-evidence taxonomy. Every user-visible
+  feature PASS cites a captured-evidence artefact matching the taxonomy shape.
+  [full → constitution `Constitution.md` §11.4.69]
+- §11.4.85 — Stress + chaos test mandate. Every fix ships full-automation stress
+  AND chaos tests with captured-evidence proofs. [full → constitution
+  `Constitution.md` §11.4.85]
