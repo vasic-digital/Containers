@@ -787,9 +787,19 @@ func TestBootResult_AttestationSchemaUnchanged(t *testing.T) {
 	// appear in attestation rows for passing runs. Its presence here is
 	// intentional: adding a nil-safe diagnostic field is not a breaking
 	// schema change for existing consumers.
+	//
+	// ResolvedAVDName was added 2026-07-26 (LVA-014 fix #1): it records
+	// which baked AVD actually booted when the containerized runner
+	// substitutes the requested matrix name (e.g. CZ_API34_Phone → the
+	// image's baked "default"). Empty on exact-match and host-direct
+	// boots. Like BootDiag it is NOT marshalled into the attestation
+	// JSON — matrix.go writeAttestation builds its own rowJSON struct —
+	// so downstream attestation consumers (scripts/tag.sh) see no schema
+	// change. Additive, nil-safe, attestation-invisible: same contract
+	// class as BootDiag.
 	expectedFields := []string{
 		"AVD", "ADBPort", "BootCompleted", "BootDiag", "BootDuration",
-		"ConsolePort", "Error", "Started",
+		"ConsolePort", "Error", "ResolvedAVDName", "Started",
 	}
 	bootResultType := reflect.TypeOf(BootResult{})
 	require.Equal(t, len(expectedFields), bootResultType.NumField(),

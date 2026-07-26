@@ -191,6 +191,13 @@ func TestContainerized_EMU4_authorizeADBTempDirReapedByTeardown(t *testing.T) {
 		scripts: map[string]fakeScript{
 			"adb connect localhost:5555":                             {Out: []byte("connected\n")},
 			"adb -s localhost:5555 shell getprop sys.boot_completed": {Out: []byte("1\n")},
+			// LVA-014 fix #2: WaitForBoot's container-liveness check runs
+			// before the first getprop poll once containerName is set;
+			// answer "running" for each cycle's container so the poll
+			// proceeds to the (successful) getprop.
+			livenessInspectKey("lava-emu-emu4-test-0"): {Out: []byte("true 0\n")},
+			livenessInspectKey("lava-emu-emu4-test-1"): {Out: []byte("true 0\n")},
+			livenessInspectKey("lava-emu-emu4-test-2"): {Out: []byte("true 0\n")},
 		},
 	}
 	c, err := NewContainerized(ContainerizedConfig{

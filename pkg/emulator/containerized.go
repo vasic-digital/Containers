@@ -372,6 +372,40 @@ func (c *Containerized) Boot(
 	c.containerName = containerName
 	c.hostADBPort = hostPort
 
+	// LVA-014 fix #1 (2026-07-26): resolve the per-AVD image (the {api}
+	// template token) and the AVD name actually baked into that image
+	// BEFORE launching the container. The §6.AE.2 matrix names
+	// (CZ_API34_Phone, ...) are ADVISORY when the image carries a baked
+	// AVD for the requested api level — the baked images ship exactly
+	// one AVD named "default", and passing the matrix name verbatim was
+	// the 2026-07-04 "boot hang" root cause (entrypoint exit in ~4s,
+	// --rm reaped the log, WaitForBoot misreported it as a boot
+	// timeout). A requested api with no matching baked AVD fails HERE,
+	// immediately, with the available baked AVDs named in the error.
+	image, err := resolveImageForAVD(c.image, avd)
+	if err != nil {
+		return BootResult{
+			AVD:          avd,
+			Started:      false,
+			BootDuration: time.Since(startedAt),
+			Error:        err,
+		}, err
+	}
+	resolvedName, note, err := c.resolveAVDName(ctx, avd, image)
+	if err != nil {
+		return BootResult{
+			AVD:          avd,
+			Started:      false,
+			BootDuration: time.Since(startedAt),
+			Error:        err,
+		}, err
+	}
+	if note != "" {
+		noteToStderr(note)
+	}
+	runAVD := avd
+	runAVD.Name = resolvedName
+
 	// Build `podman run -d --name X [-device /dev/kvm] -p ...` args.
 	// --device /dev/kvm is included only when the KVM device is
 	// present on the host (Linux x86_64 with KVM enabled). On macOS
@@ -380,7 +414,7 @@ func (c *Containerized) Boot(
 	// emulation. buildContainerRunArgs centralises this decision so
 	// it is unit-testable without running a real container.
 	args := buildContainerRunArgs(
-		c.runtimeBinary, containerName, hostPort, avd, coldBoot, c.image,
+		c.runtimeBinary, containerName, hostPort, runAVD, coldBoot, image,
 	)
 
 	out, err := c.executor.Execute(ctx, c.runtimeBinary, args...)
@@ -394,13 +428,20 @@ func (c *Containerized) Boot(
 		}, wrapped
 	}
 
-	return BootResult{
+	result := BootResult{
 		AVD:          avd,
 		Started:      true,
 		BootDuration: time.Since(startedAt),
 		ConsolePort:  hostPort - 1,
 		ADBPort:      hostPort,
-	}, nil
+	}
+	if resolvedName != avd.Name {
+		// Forensic honesty: the attestation row keeps the REQUESTED
+		// matrix identity (avd.Name/api/form); this field records which
+		// baked AVD actually booted inside the container.
+		result.ResolvedAVDName = resolvedName
+	}
+	return result, nil
 }
 
 // WaitForBoot polls `adb -s emulator-<port> shell getprop
@@ -462,6 +503,29 @@ func (c *Containerized) WaitForBoot(
 	}
 	target := fmt.Sprintf("localhost:%d", port)
 	for time.Now().Before(deadline) {
+		// LVA-014 fix #2 (2026-07-26): container-liveness check. When
+		// this instanceBooted a container (containerName != ""), verify
+		// on every poll iteration that the emulator CONTAINER is still
+		// running BEFORE trusting the adb poll. Without this, an
+		// entrypoint failure (e.g. the 2026-07-04 AVD-name mismatch —
+		// container exited in ~4s) left WaitForBoot polling a dead
+		// forwarded port until the deadline, misreporting a fast config
+		// error as a multi-minute boot timeout. Skipped when
+		// containerName is empty (WaitForBoot invoked without Boot —
+		// the EMU-1 semantics of the plain adb poll are preserved
+		// byte-for-byte on that path).
+		if c.containerName != "" {
+			if exited, detail := c.containerExited(cctx); exited {
+				// Capture logs NOW, before the container's --rm reaps
+				// them (best-effort — the reaper may already have won
+				// the race; captureContainerLogs reports that honestly).
+				logs := c.captureContainerLogs(cctx)
+				return time.Since(startedAt), fmt.Errorf(
+					"emulator container %s exited before sys.boot_completed=1 (%s). Last container logs:\n%s",
+					c.containerName, detail, logs,
+				)
+			}
+		}
 		out, err := c.executor.Execute(
 			cctx, c.adbBinaryPath, "-s", target, "shell", "getprop", "sys.boot_completed",
 		)
@@ -496,6 +560,76 @@ func (c *Containerized) WaitForBoot(
 		"WaitForBoot timed out after %s waiting for sys.boot_completed=1 on port %d",
 		timeout, port,
 	)
+}
+
+// containerInspectStateFormat is the Go-template passed to
+// `podman/docker inspect --format` by containerExited. Both runtimes
+// render it as "<running> <exitCode>" (e.g. "true 0", "false 1").
+const containerInspectStateFormat = "{{.State.Running}} {{.State.ExitCode}}"
+
+// containerExited reports whether the emulator container is no longer
+// running. The inspect output is "true <code>" while running; anything
+// else (including an inspect ERROR — e.g. the container already reaped
+// by its own --rm) is treated as exited, because a container WaitForBoot
+// cannot observe is a container whose adb port is dead. The returned
+// detail string is operator-facing: it carries the exit code when known
+// or the inspect failure when the container is already gone.
+//
+// LVA-014 fix #2. Fail-fast beats fail-late: polling a dead forwarded
+// port to the deadline converts a 4-second config error into a
+// multi-minute "boot timeout" (the exact 2026-07-04 misdiagnosis).
+func (c *Containerized) containerExited(ctx context.Context) (exited bool, detail string) {
+	out, err := c.executor.Execute(
+		ctx, c.runtimeBinary, "inspect", "--format",
+		containerInspectStateFormat, c.containerName,
+	)
+	if err != nil {
+		return true, fmt.Sprintf(
+			"container inspect failed — already reaped by --rm?: %v (output: %s)",
+			err, strings.TrimSpace(string(out)),
+		)
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) >= 1 && fields[0] == "true" {
+		return false, ""
+	}
+	exitCode := "unknown"
+	if len(fields) >= 2 {
+		exitCode = fields[1]
+	}
+	return true, fmt.Sprintf("container no longer running (exit code %s)", exitCode)
+}
+
+// maxCapturedLogBytes caps the container-log tail embedded in a
+// WaitForBoot liveness error. The full log stays available via the
+// runtime CLI while the container exists; the error needs enough tail
+// to carry the entrypoint's diagnostic (the AVD-not-found pre-check
+// message is a few lines), not the whole boot log.
+const maxCapturedLogBytes = 4000
+
+// captureContainerLogs fetches the tail of the emulator container's
+// logs BEFORE the container's --rm reaps them. Best-effort: when the
+// reaper won the race (or the runtime errors for any other reason) the
+// returned string says so explicitly — a missing log is reported, never
+// silently substituted with an empty block.
+func (c *Containerized) captureContainerLogs(ctx context.Context) string {
+	out, err := c.executor.Execute(
+		ctx, c.runtimeBinary, "logs", "--tail", "100", c.containerName,
+	)
+	if err != nil {
+		return fmt.Sprintf(
+			"(container logs unavailable — %s logs: %v, output: %s)",
+			c.runtimeBinary, err, strings.TrimSpace(string(out)),
+		)
+	}
+	logs := strings.TrimSpace(string(out))
+	if len(logs) > maxCapturedLogBytes {
+		logs = "…[truncated]…\n" + logs[len(logs)-maxCapturedLogBytes:]
+	}
+	if logs == "" {
+		return "(container produced no log output)"
+	}
+	return logs
 }
 
 // containerADBKeyPath is where the Containerfile generates the baked

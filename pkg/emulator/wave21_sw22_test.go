@@ -38,6 +38,12 @@ func TestContainerized_WaitForBoot_TimeoutWrapsAuthorizeADBFailure_SW22(t *testi
 			// authorizeADB's `podman cp <container>:<key> <host>` fails,
 			// so authorizeADB returns a non-nil error (authErr != nil).
 			"podman": {Out: []byte("Error: no such container\n"), Err: errors.New("exit 125")},
+			// LVA-014 fix #2: WaitForBoot's container-liveness inspect
+			// must answer "running" (exact key — it takes precedence over
+			// the failing "podman" name fallback above) so the poll
+			// reaches the deadline instead of fast-failing on the
+			// container-exit path this test is NOT about.
+			livenessInspectKey("sw22-fake-container"): {Out: []byte("true 0\n")},
 			// adb: `connect` returns a nil error (so WaitForBoot reaches the
 			// poll loop rather than its early `adb connect: ...` return), and
 			// `getprop sys.boot_completed` returns a non-"1" value so the boot
