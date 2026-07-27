@@ -13,9 +13,9 @@ func NewEndpoint() *Builder {
 	return &Builder{
 		ep: ServiceEndpoint{
 			Enabled:    true,
-			HealthType: "http",
-			Timeout:    10 * time.Second,
-			RetryCount: 3,
+			HealthType: defaultHealthType,
+			Timeout:    defaultTimeout,
+			RetryCount: defaultRetryCount,
 		},
 	}
 }
@@ -117,6 +117,20 @@ func (b *Builder) WithDiscoveryTimeout(d time.Duration) *Builder {
 }
 
 // Build returns the constructed ServiceEndpoint.
+//
+// Build is intentionally non-validating and its signature is FROZEN for
+// backward compatibility (existing `ep := b.Build()` call sites, e.g. in
+// cmd/ota-device-emu-boot, must keep compiling). Use BuildValidated when
+// an error path is wanted.
 func (b *Builder) Build() ServiceEndpoint {
 	return b.ep
+}
+
+// BuildValidated is the additive, non-breaking companion to Build: it
+// returns the constructed ServiceEndpoint together with the result of
+// Validate(). Callers that want an error path use this; Build() callers
+// are unaffected (EP-3, §11.4.122 — no existing signature changed).
+func (b *Builder) BuildValidated() (ServiceEndpoint, error) {
+	ep := b.ep
+	return ep, ep.Validate()
 }

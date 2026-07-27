@@ -86,7 +86,19 @@ func LoadManifest(path string) (*Manifest, error) {
 }
 
 // FindByID returns the image entry whose ID matches.
+//
+// A nil receiver returns a clean error instead of panicking. This is the
+// single choke point Store.Get/Verify/Refresh all funnel through, so
+// guarding here protects the whole exported Store API against a nil
+// *Manifest — e.g. a caller that forwards LoadManifest's return value
+// without checking its error, or any future external consumer of this
+// decoupled, reusable module (per the containers module's §11.4.28
+// equal-codebase mandate this package must stay project-agnostic and
+// safe for callers this repo does not control).
 func (m *Manifest) FindByID(id string) (*ImageEntry, error) {
+	if m == nil {
+		return nil, fmt.Errorf("manifest: nil manifest (no image with id %q)", id)
+	}
 	for i := range m.Images {
 		if m.Images[i].ID == id {
 			return &m.Images[i], nil

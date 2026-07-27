@@ -122,16 +122,25 @@ func (m *DefaultMonitor) collect(ctx context.Context) {
 		snap.System = m.sys.Collect()
 	}
 
-	// Collect container stats.
+	// Collect container stats. A List error or a per-container Stats error
+	// must NOT silently read as "0 containers, all healthy" (§11.4.68/.69
+	// error-as-healthy). The Stats-errored container is still dropped (existing
+	// intended behavior, codified by TestDefaultMonitor_StatsError); the
+	// hardening only SURFACES the failure on the snapshot so a consumer can
+	// tell a genuinely empty host from a failed probe (CT-HARDEN-MON-HARD
+	// MON-3).
 	if m.rt != nil {
 		containers, err := m.rt.List(ctx, runtime.ListFilter{
 			All:    false,
 			Status: []runtime.ContainerState{runtime.StateRunning},
 		})
-		if err == nil {
+		if err != nil {
+			snap.ListError = true
+		} else {
 			for _, c := range containers {
 				stats, sErr := m.rt.Stats(ctx, c.ID)
 				if sErr != nil {
+					snap.StatsFailures++
 					continue
 				}
 				snap.Containers[c.Name] = ContainerResources{

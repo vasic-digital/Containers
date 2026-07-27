@@ -3,6 +3,8 @@ package remote
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -50,12 +52,19 @@ func TestComposeDetector_Detect_PodmanComposePriority(t *testing.T) {
 	exec := &mockExecutor{}
 	host := RemoteHost{Name: "test-host", Runtime: "podman"}
 
+	// Derive the expected pipx path the SAME way the production code does
+	// (os.UserHomeDir(), never a hardcoded literal) so this test is portable
+	// across machines/users/OSes.
+	home, err := os.UserHomeDir()
+	require.NoError(t, err)
+	pipxPath := filepath.Join(home, ".local", "bin", "podman-compose")
+
 	callCount := 0
 	exec.executeFunc = func(ctx context.Context, h RemoteHost, cmd string) (*CommandResult, error) {
 		callCount++
 		// Accept both pipx and system podman-compose
 		if cmd == "podman-compose version --short" ||
-			cmd == "/home/milosvasic/.local/bin/podman-compose version --short" {
+			cmd == pipxPath+" version --short" {
 			return &CommandResult{ExitCode: 0, Stdout: "1.0.6"}, nil
 		}
 		return &CommandResult{ExitCode: 1, Stderr: "not found"}, nil
@@ -68,6 +77,81 @@ func TestComposeDetector_Detect_PodmanComposePriority(t *testing.T) {
 	assert.Equal(t, "podman-compose", result.Name)
 	assert.Equal(t, "1.0.6", result.Version)
 	assert.LessOrEqual(t, callCount, 2, "should stop at first successful detection (pipx or system)")
+}
+
+// TestComposeDetector_Detect_PipxCandidateUsesRealHomeDir proves the
+// highest-priority candidate is built from a genuine home-directory
+// resolution (os.UserHomeDir()) rather than a hardcoded absolute path.
+//
+// It deliberately overrides $HOME to a SYNTHETIC value that could never
+// coincide with any hardcoded literal (in particular, it is guaranteed to
+// differ from the real operator's home directory, whatever machine this
+// test runs on -- including a machine whose real home happens to BE
+// "/home/milosvasic", which would otherwise let a hardcoded-path regression
+// slip through undetected). If the production code ever regresses to
+// hardcoding "/home/milosvasic/.local/bin/podman-compose" (or any other
+// fixed path), the detector would probe that fixed string instead of the
+// synthetic $HOME-derived one, the mock would never see a match for it, and
+// this test would fail with "no compose command found on host test-host".
+func TestComposeDetector_Detect_PipxCandidateUsesRealHomeDir(t *testing.T) {
+	syntheticHome := filepath.Join(t.TempDir(), "not-milosvasic", "synthetic-operator-home")
+	t.Setenv("HOME", syntheticHome)
+
+	wantPipxPath := filepath.Join(syntheticHome, ".local", "bin", "podman-compose")
+	wantPipxCmd := wantPipxPath + " version --short"
+
+	exec := &mockExecutor{}
+	host := RemoteHost{Name: "test-host", Runtime: "podman"}
+
+	var firstCommand string
+	exec.executeFunc = func(ctx context.Context, h RemoteHost, cmd string) (*CommandResult, error) {
+		if firstCommand == "" {
+			firstCommand = cmd
+		}
+		if cmd == wantPipxCmd {
+			return &CommandResult{ExitCode: 0, Stdout: "1.0.6"}, nil
+		}
+		return &CommandResult{ExitCode: 1, Stderr: "not found"}, nil
+	}
+
+	detector := NewComposeDetector(exec, logging.NopLogger{})
+	result, err := detector.Detect(context.Background(), host)
+
+	require.NoError(t, err, "detector must find the pipx candidate built from the "+
+		"test-overridden $HOME -- a hardcoded home-directory path would never match here")
+	assert.Equal(t, wantPipxPath, result.Binary,
+		"the highest-priority candidate's binary path must equal filepath.Join(realHomeDir, \".local\", \"bin\", \"podman-compose\")")
+	assert.Equal(t, wantPipxCmd, firstCommand,
+		"the pipx candidate must be probed FIRST (highest priority)")
+}
+
+// TestComposeDetector_Detect_NoHomeDir_SkipsPipxCandidate proves the
+// detector degrades gracefully (never probes a malformed/empty path) when
+// the home directory cannot be resolved at all.
+func TestComposeDetector_Detect_NoHomeDir_SkipsPipxCandidate(t *testing.T) {
+	t.Setenv("HOME", "")
+
+	exec := &mockExecutor{}
+	host := RemoteHost{Name: "test-host", Runtime: "podman"}
+
+	var commands []string
+	exec.executeFunc = func(ctx context.Context, h RemoteHost, cmd string) (*CommandResult, error) {
+		commands = append(commands, cmd)
+		if cmd == "podman-compose version --short" {
+			return &CommandResult{ExitCode: 0, Stdout: "1.0.6"}, nil
+		}
+		return &CommandResult{ExitCode: 1, Stderr: "not found"}, nil
+	}
+
+	detector := NewComposeDetector(exec, logging.NopLogger{})
+	result, err := detector.Detect(context.Background(), host)
+
+	require.NoError(t, err)
+	assert.Equal(t, "podman-compose", result.Binary)
+	for _, c := range commands {
+		assert.NotContains(t, c, ".local/bin/podman-compose",
+			"no pipx candidate should ever be probed when the home directory cannot be resolved")
+	}
 }
 
 func TestComposeDetector_Detect_DockerComposePriority(t *testing.T) {

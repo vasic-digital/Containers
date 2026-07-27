@@ -289,8 +289,8 @@ func TestCuttlefish_Stop_Sequence(t *testing.T) {
 	require.NoError(t, c.Stop(context.Background()))
 
 	// Stop issued: graceful `podman exec cvd-tier2 stop_cvd` then
-	// `podman rm -f cvd-tier2`. (Cleanup's orphan reap runs the real
-	// reaper, which finds no crosvm/run_cvd on the test host.)
+	// `podman rm -f cvd-tier2` (the authoritative teardown). Per §11.4.174 Stop
+	// performs NO host-wide cvd reap.
 	var sawExecStopCvd, sawRmForce bool
 	for _, call := range fe.calls {
 		if call.Name == "podman" && len(call.Args) >= 3 &&

@@ -75,8 +75,8 @@ func (e *statsErrorExecutor) Execute(ctx context.Context, name string, args ...s
 
 // TestCollect_WithHostManager exercises the hostManager != nil branch in Collect.
 func TestCollect_WithHostManager(t *testing.T) {
-	psOutput := `[{"Id":"abc123","Names":["/test"],"Image":"nginx","Created":"2024-01-01T00:00:00Z","State":{"Status":"running","StartedAt":"2024-01-01T00:00:00Z"}}]`
-	statsOutput := `{"CPUPerc":"5.0%","MemUsage":"50MiB / 1GiB","MemPerc":"5.0%","NetIO":"0B / 0B","BlockIO":"0B / 0B","PIDs":"1"}`
+	psOutput := `[{"Id":"abc123","Names":["/test"],"Image":"nginx","Created":1704067200,"State":"running","Status":"Up","StartedAt":1704067200}]`
+	statsOutput := `[{"cpu_percent":"5.0%","mem_usage":"50MB / 1GB","mem_percent":"5.0%","net_io":"0B / 0B","block_io":"0B / 0B","pids":"1"}]`
 
 	exec := &mockExecutor{
 		responses: map[string][]byte{
@@ -131,7 +131,7 @@ func TestCollectLocal_BothFail(t *testing.T) {
 
 // TestGetContainerStats_Error exercises the error branch in getContainerStats.
 func TestGetContainerStats_Error(t *testing.T) {
-	psOutput := `[{"Id":"abc123","Names":["/test"],"Image":"nginx","Created":"2024-01-01T00:00:00Z","State":{"Status":"running","StartedAt":"2024-01-01T00:00:00Z"}}]`
+	psOutput := `[{"Id":"abc123","Names":["/test"],"Image":"nginx","Created":1704067200,"State":"running","Status":"Up","StartedAt":1704067200}]`
 
 	exec := &statsErrorExecutor{
 		responses: map[string][]byte{
@@ -161,12 +161,12 @@ func TestDisplay_Render_MaxRows(t *testing.T) {
 	var parts []string
 	for _, c := range containers {
 		parts = append(parts, fmt.Sprintf(
-			`{"Id":"%s","Names":["%s"],"Image":"nginx","Created":"2024-01-01T00:00:00Z","State":{"Status":"running","StartedAt":"2024-01-01T00:00:00Z"}}`,
+			`{"Id":"%s","Names":["%s"],"Image":"nginx","Created":1704067200,"State":"running","Status":"Up","StartedAt":1704067200}`,
 			c["Id"], (c["Names"].([]string))[0],
 		))
 	}
 	psOutput := "[" + strings.Join(parts, ",") + "]"
-	statsOutput := `{"CPUPerc":"1.0%","MemUsage":"10MiB / 1GiB","MemPerc":"1.0%","NetIO":"0B / 0B","BlockIO":"0B / 0B","PIDs":"1"}`
+	statsOutput := `[{"cpu_percent":"1.0%","mem_usage":"10MB / 1GB","mem_percent":"1.0%","net_io":"0B / 0B","block_io":"0B / 0B","pids":"1"}]`
 
 	exec := &mockExecutor{
 		responses: map[string][]byte{
@@ -215,8 +215,8 @@ func TestDisplay_RenderJSON_Error(t *testing.T) {
 
 // TestDisplay_RenderJSON_WithContainers exercises normal RenderJSON path.
 func TestDisplay_RenderJSON_WithContainers(t *testing.T) {
-	psOutput := `[{"Id":"json1","Names":["/json-test"],"Image":"nginx","Created":"2024-01-01T00:00:00Z","State":{"Status":"running","StartedAt":"2024-01-01T00:00:00Z"}}]`
-	statsOutput := `{"CPUPerc":"3.0%","MemUsage":"30MiB / 1GiB","MemPerc":"3.0%","NetIO":"0B / 0B","BlockIO":"0B / 0B","PIDs":"1"}`
+	psOutput := `[{"Id":"json1","Names":["/json-test"],"Image":"nginx","Created":1704067200,"State":"running","Status":"Up","StartedAt":1704067200}]`
+	statsOutput := `[{"cpu_percent":"3.0%","mem_usage":"30MB / 1GB","mem_percent":"3.0%","net_io":"0B / 0B","block_io":"0B / 0B","pids":"1"}]`
 
 	exec := &mockExecutor{
 		responses: map[string][]byte{

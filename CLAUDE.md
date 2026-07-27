@@ -2,7 +2,7 @@
 
 ## INHERITED FROM constitution/CLAUDE.md
 
-All rules in `constitution/CLAUDE.md` (and the `constitution/Constitution.md` it references) apply unconditionally. This file's rules below extend them — they MUST NOT weaken any inherited rule. See parent root `CLAUDE.md` §6.AD for the Lava-specific incorporation context (29th §6.L cycle, 2026-05-14) and §6.AD-debt for the implementation-gap inventory. Use `constitution/find_constitution.sh` from the parent project root to resolve the absolute path of the submodule from any nested location.
+All rules in `constitution/CLAUDE.md` (and the `constitution/Constitution.md` it references) apply unconditionally. This file's rules below extend them — they MUST NOT weaken any inherited rule. Use `constitution/find_constitution.sh` from the parent project root to resolve the absolute path of the submodule from any nested location.
 
 ## INHERITED FROM the Helix Constitution
 
@@ -19,7 +19,11 @@ Canonical reference: https://github.com/HelixDevelopment/HelixConstitution
 ```bash
 # Real orchestration flow: boot a container via pkg/boot.BootManager and
 # verify its health check passes against a live runtime (Docker/Podman).
-cd Containers && GOMAXPROCS=2 nice -n 19 go test -tags=integration -count=1 -race -v ./tests/integration/...
+# Run from this module's own root (wherever the consuming project checks out
+# this submodule, e.g. `submodules/containers/` — never a hardcoded nested
+# capitalized `Containers/` directory, which does not exist on a standalone
+# clone of this repo).
+GOMAXPROCS=2 nice -n 19 go test -tags=integration -count=1 -race -v ./tests/integration/...
 ```
 Expect: PASS; exercises `runtime.AutoDetect`, `boot.BootManager.BootAll`, and `health.HealthChecker` against a real container runtime per this module's `README.md` Quick Start. Requires a rootless Docker/Podman runtime available to the current user.
 
@@ -52,23 +56,39 @@ go test -bench=. ./tests/benchmark/
 
 | Package | Purpose |
 |---------|---------|
-| `pkg/runtime` | Container runtime abstraction (Docker/Podman/K8s) |
+| `pkg/applesim` | Apple iOS/iPadOS/tvOS/watchOS Simulator detection + lifecycle control via host-native `xcrun simctl` (macOS-host-only; cannot run inside a Linux container) |
+| `pkg/boot` | High-level BootManager composing everything |
+| `pkg/brokertest` | Ephemeral message-broker containers (etcd, Postgres, ...) for integration testing, built on `pkg/runtime` |
+| `pkg/cache` | Content-addressable store for image artifacts (qcow2 for VMs, Android system-images for emulators) with SHA-256 verify-on-fetch |
 | `pkg/compose` | Docker Compose orchestration |
-| `pkg/health` | Health checking (TCP/HTTP/gRPC/Custom) |
-| `pkg/endpoint` | Service endpoint configuration |
-| `pkg/lifecycle` | Advanced lifecycle (lazy boot, idle shutdown, semaphores) |
-| `pkg/monitor` | Resource monitoring (CPU/memory/disk), cluster snapshots |
-| `pkg/event` | Event bus for lifecycle hooks (20 event types) |
+| `pkg/crossbuild` | Cross-platform binary builds inside container-bound or QEMU-bound build environments (e.g. Windows `.msi` via Wine + JDK) |
+| `pkg/ctop` | top/htop-style container monitoring TUI for local and remote containers |
+| `pkg/cuttlefish` | Lifecycle wrapper for Google Cuttlefish (`cvd`) virtual-Android device (real A/B `update_engine`/AVB OTA testing) via rootful+privileged container |
 | `pkg/discovery` | Service discovery (TCP/DNS) |
+| `pkg/distribution` | Distribution orchestrator: schedule, deploy, failover |
+| `pkg/egress` | VPN-host egress routing + diagnosis (SSH dynamic SOCKS5 tunnel) for reaching network-blocked upstreams |
+| `pkg/emulator` | Multi-target (Android) emulator orchestration for the container ecosystem |
+| `pkg/endpoint` | Service endpoint configuration |
+| `pkg/envconfig` | Environment-variable-based configuration for remote hosts |
+| `pkg/event` | Event bus for lifecycle hooks (20 event types) |
+| `pkg/genymotion` | Genymotion Desktop Android virtual device (VM-based) detection + lifecycle control via `gmtool`, cross-platform |
+| `pkg/health` | Health checking (TCP/HTTP/gRPC/Custom) |
+| `pkg/i18n` | Translator contract for externalizing user-facing error/status text (no-hardcoded-content mandate) |
+| `pkg/lazyservice` | Lazy-boot service orchestrator: dependency-ordered startup, alternative-service fallback, status queries |
+| `pkg/lifecycle` | Advanced lifecycle (lazy boot, idle shutdown, semaphores) |
 | `pkg/logging` | Logging abstraction (bring your own) |
 | `pkg/metrics` | Prometheus-compatible metrics |
-| `pkg/boot` | High-level BootManager composing everything |
-| `pkg/remote` | Remote host management, SSH executor, connection pooling |
-| `pkg/scheduler` | Resource-aware container scheduling (5 strategies) |
+| `pkg/monitor` | Resource monitoring (CPU/memory/disk), cluster snapshots |
 | `pkg/network` | SSH tunnel management, port allocation, overlay networks |
+| `pkg/orchestrator` | `DefaultOrchestrator` for auto-discovering and managing containerized services, local and remote |
+| `pkg/policy` | Resource-cap policy (mem/memswap/pids/oom_score_adj) for container stacks; Go counterpart of `scripts/resource-policy/policy.yaml` |
+| `pkg/remote` | Remote host management, SSH executor, connection pooling |
+| `pkg/remoteexec` | Durable remote/local execution of long-running jobs that survive the launching SSH/login session ending |
+| `pkg/runtime` | Container runtime abstraction (Docker/Podman/K8s) |
+| `pkg/scheduler` | Resource-aware container scheduling (5 strategies) |
+| `pkg/serviceregistry` | Disk-persisted service registry: register/discover services by name, port allocation, health tracking |
+| `pkg/vm` | QEMU full-system VM orchestration (sibling of `pkg/emulator`; shares `pkg/cache` for image artifacts) |
 | `pkg/volume` | Remote volume management (SSHFS/NFS/rsync) |
-| `pkg/envconfig` | Environment-variable-based configuration for remote hosts |
-| `pkg/distribution` | Distribution orchestrator: schedule, deploy, failover |
 
 ## Key Interfaces
 
@@ -126,7 +146,7 @@ Distributor receives a batch of container requirements, asks Scheduler which hos
 This is what the consuming project's root `CLAUDE.md` Hard Stop #2 refers to. The flow is:
 
 1. **Build:** `make build` → `./bin/helixagent`.
-2. **Env load:** the consuming project reads `Containers/.env` via `envconfig.LoadFromFile()`:
+2. **Env load:** the consuming project reads this module's own `.env` file (wherever the consuming project checks out this submodule, e.g. `submodules/containers/.env` — never a hardcoded nested `Containers/.env` path) via `envconfig.LoadFromFile()`:
    - `CONTAINERS_REMOTE_ENABLED` (bool)
    - `CONTAINERS_REMOTE_HOST_N_*` (N = 1..100; loader stops at the first absent `_NAME`)
    - SSH pool, timeouts, scheduler strategy
@@ -203,3 +223,24 @@ See root `/CLAUDE.md` §6.R. No connection address, port, header field name, cre
 ## Commit Style
 
 Conventional Commits: `feat(runtime): add Kubernetes support`
+
+## Inherited universal covenant anchors (from HelixConstitution)
+
+This module inherits the full universal covenant from the Helix Constitution
+(https://github.com/HelixDevelopment/HelixConstitution). The anchors below apply
+directly — they are UNIVERSAL and project-agnostic (no consuming-project context,
+per §11.4.28), so this decoupled module carries them by reference to the
+constitution submodule's `Constitution.md`:
+
+- §11.4.66 — Blocker-resolution interactive-clarification mandate. When a blocker
+  cannot be resolved from evidence, ask a precise clarifying question rather than
+  guess. [full → constitution `Constitution.md` §11.4.66]
+- §11.4.67 — Shell-script target-shell-parseability mandate. Every shell script
+  MUST parse clean under its declared target shell (`sh -n` / `bash -n`).
+  [full → constitution `Constitution.md` §11.4.67]
+- §11.4.69 — Universal sink-side positive-evidence taxonomy. Every user-visible
+  feature PASS cites a captured-evidence artefact matching the taxonomy shape.
+  [full → constitution `Constitution.md` §11.4.69]
+- §11.4.85 — Stress + chaos test mandate. Every fix ships full-automation stress
+  AND chaos tests with captured-evidence proofs. [full → constitution
+  `Constitution.md` §11.4.85]

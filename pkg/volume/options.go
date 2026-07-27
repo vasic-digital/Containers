@@ -33,3 +33,21 @@ func WithRsyncFlags(flags []string) Option {
 func WithSyncInterval(d time.Duration) Option {
 	return func(o *MountOptions) { o.SyncInterval = d }
 }
+
+// WithLocalHostAddress sets this orchestrator's own address (or
+// "[user@]host"), as reachable FROM every remote host that mounts a local
+// path via NFS or SSHFS. Required for NFSMounter/SSHFSMounter to build a
+// valid mount source; without it those mounters fail loudly rather than
+// build a command from LocalPath alone (VOL-HIGH-1 / VOL-HIGH-2).
+func WithLocalHostAddress(addr string) Option {
+	return func(o *MountOptions) { o.LocalHostAddress = addr }
+}
+
+// WithCommandTimeout sets a local per-call deadline the DefaultVolumeManager
+// applies to Mount/Unmount/Sync's ctx before issuing remote commands. Zero
+// (the default) leaves the caller's ctx unmodified. Mirrors the local
+// deadline every sibling package in this module already applies to remote
+// calls (VOL-MED-8).
+func WithCommandTimeout(d time.Duration) Option {
+	return func(o *MountOptions) { o.CommandTimeout = d }
+}

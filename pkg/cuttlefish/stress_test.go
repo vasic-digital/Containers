@@ -289,13 +289,20 @@ func TestStress_Cleanup_ConcurrentReap_SeparateDeps(t *testing.T) {
 			pidCrosvm := 1000 + id*10
 			pidRun := pidCrosvm + 1
 			pidNoise := pidCrosvm + 2
-			wk := fakeWalker{comms: map[int]string{
-				pidCrosvm: "crosvm",
-				pidRun:    "run_cvd",
-				pidNoise:  "bash", // must NOT be reaped
-			}}
+			wk := fakeWalker{
+				comms: map[int]string{
+					pidCrosvm: "crosvm",
+					pidRun:    "run_cvd",
+					pidNoise:  "bash", // must NOT be reaped
+				},
+				cmdlines: map[int][]string{
+					pidCrosvm: {"crosvm", "--base_instance_num=1"},
+					pidRun:    {"run_cvd", "--base_instance_num=1"},
+					pidNoise:  {"bash"},
+				},
+			}
 			k := newFakeKiller()
-			report, err := cleanupWithDeps(context.Background(), wk, k)
+			report, err := cleanupWithDeps(context.Background(), "--base_instance_num=1", wk, k)
 			if err != nil {
 				errCh <- fmt.Errorf("worker %d: %w", id, err)
 				return

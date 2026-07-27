@@ -65,6 +65,19 @@ func NewCuttlefish(cfg Config) (*Cuttlefish, error) {
 	if len(cfg.Groups) == 0 {
 		cfg.Groups = DefaultGroups()
 	}
+	// CF2-1 (§11.4.108 documented-default-that-does-nothing): Config.NetworkHost
+	// is documented "default true" ("Cuttlefish requires it") yet was never
+	// defaulted anywhere — a caller that omits it (bool zero value = false)
+	// launched a container WITHOUT `--network host`, so cvd networking / the
+	// cvd-ebr bridge fails and the device never comes online, while Launch still
+	// reports Started=true (the SOURCE-says-default-true vs ARTIFACT-omits-the-
+	// flag gap). Default it to true here, alongside every other required default
+	// above and mirroring the Privileged reject-if-false precedent. A test that
+	// asserts the negative uses the pure buildContainerRunArgs builder directly,
+	// which still honours an explicit false.
+	if !cfg.NetworkHost {
+		cfg.NetworkHost = true
+	}
 	if cfg.ADBSerial == "" {
 		cfg.ADBSerial = DefaultADBSerial
 	}
@@ -99,13 +112,21 @@ func (c *Cuttlefish) Launch(ctx context.Context) (LaunchResult, error) {
 	startedAt := time.Now()
 	present, missing := FilterPresentDevices(c.cfg.Devices)
 	name := containerNameFor(c.cfg.InstanceName)
-	c.containerName = name
 
 	args := buildContainerRunArgs(name, c.cfg.Image, present, c.cfg.Groups,
 		c.cfg.Privileged, c.cfg.NetworkHost)
 
 	out, err := c.executor.Execute(ctx, c.cfg.RuntimeBinary, args...)
 	if err != nil {
+		// CF-2 (§11.4.174 ownership hazard): do NOT commit c.containerName
+		// on a failed run — no container was created. `name` is still
+		// returned in LaunchResult.ContainerName as the diagnostic name
+		// (unchanged public contract), but c.ContainerName() MUST report
+		// empty so a caller's natural `res, _ := c.Launch(ctx); defer
+		// c.Stop(ctx)` does not issue `<runtime> rm -f <name>` against a
+		// nonexistent container — or, since containerNameFor is a pure
+		// function of InstanceName, against a DIFFERENT concurrent
+		// instance's real container.
 		wrapped := fmt.Errorf("%s run: %w (output: %s)", c.cfg.RuntimeBinary, err, string(out))
 		return LaunchResult{
 			ContainerName:  name,
@@ -117,6 +138,7 @@ func (c *Cuttlefish) Launch(ctx context.Context) (LaunchResult, error) {
 			Error:          wrapped,
 		}, wrapped
 	}
+	c.containerName = name
 	return LaunchResult{
 		ContainerName:  name,
 		Target:         c.cfg.Target,
@@ -149,17 +171,50 @@ func (c *Cuttlefish) Status(ctx context.Context) (StatusResult, error) {
 // timeout elapses. Returns the elapsed duration. A non-nil error means the
 // device was NOT observed online within the budget — this function does
 // NOT report "probably ready" (composes §11.4.6 no-guessing).
+//
+// CF-1 (GENY-1 class, §11.4.108): every Status call is bound to a deadline
+// derived from `timeout`, NOT the raw caller ctx. Without this, a caller
+// passing context.Background() plus a wedged `adb devices` (stalled vsock
+// transport / crashed crosvm / hung adb-server) hangs WaitForReady FOREVER:
+// the underlying exec.CommandContext(ctx, ...) in Status->Execute never
+// gets cancelled because the raw ctx never fires, so the `timeout` argument
+// is silently not honored. Deriving cctx here (mirroring
+// genymotion.Tool.StartAndWait's GENY-1 fix) guarantees the deadline
+// cancels every in-flight Status exec even when the caller's ctx never
+// would.
+//
+// The poll select deliberately distinguishes CALLER cancellation from our
+// OWN internal deadline elapsing: cctx.Done() fires for either reason (it
+// is derived from ctx via context.WithDeadline, so it also fires the
+// instant the caller's own ctx is cancelled/expires — context.WithDeadline
+// takes the EARLIER of the two deadlines). When it fires we check ctx.Err()
+// directly — if the CALLER's ctx is what expired, we return that error
+// promptly (unchanged contract: an operator-cancelled wait fails fast with
+// the caller's own error, exercised by the WaitForReadyContextCancelled
+// chaos case). If ctx is still alive (context.Background() or any ctx
+// without its own earlier deadline never returns a non-nil Err()), only
+// OUR internal `timeout` budget elapsed — we fall through instead of
+// returning early, so the `for` loop condition below becomes false and the
+// existing friendly, named-serial "timed out" error is returned, exactly
+// as before this fix (exercised by the ProcessDeathDuringReadinessWait
+// chaos case, which asserts on that exact message).
 func (c *Cuttlefish) WaitForReady(ctx context.Context, timeout time.Duration) (time.Duration, error) {
 	startedAt := time.Now()
 	deadline := startedAt.Add(timeout)
+	cctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	for time.Now().Before(deadline) {
-		st, err := c.Status(ctx)
+		st, err := c.Status(cctx)
 		if err == nil && st.Ready {
 			return time.Since(startedAt), nil
 		}
 		select {
-		case <-ctx.Done():
-			return time.Since(startedAt), ctx.Err()
+		case <-cctx.Done():
+			if ctx.Err() != nil {
+				return time.Since(startedAt), ctx.Err()
+			}
+			// Our own internal deadline elapsed, not the caller's ctx —
+			// fall through; the loop condition below is now false.
 		case <-time.After(2 * time.Second):
 		}
 	}
@@ -169,11 +224,14 @@ func (c *Cuttlefish) WaitForReady(ctx context.Context, timeout time.Duration) (t
 }
 
 // Stop tears the instance down: it runs `stop_cvd` inside the container for
-// a graceful Cuttlefish shutdown, force-removes the container, then reaps
-// any orphan crosvm/run_cvd processes. A best-effort `stop_cvd` failure
-// does NOT abort the force-remove — the container MUST be cleaned up
-// regardless (§11.4.14 leave-the-target-quiescent). The first hard error
-// (container removal) is returned; reaping always runs.
+// a graceful Cuttlefish shutdown, then force-removes the container (`rm -f`),
+// which is the AUTHORITATIVE teardown — it tears down the container's PID
+// namespace and kills every cvd process inside. A best-effort `stop_cvd`
+// failure does NOT abort the force-remove — the container MUST be cleaned up
+// regardless (§11.4.14 leave-the-target-quiescent). Per §11.4.174 Stop does
+// NOT perform a host-wide cvd reap (no host-side ownership token exists); the
+// container removal is the only signal that reaches cvd processes. The hard
+// error (container removal) is returned.
 func (c *Cuttlefish) Stop(ctx context.Context) error {
 	if c.containerName == "" {
 		// Launch was never called on this instance — defensive no-op
@@ -186,20 +244,39 @@ func (c *Cuttlefish) Stop(ctx context.Context) error {
 	_, _ = c.executor.Execute(ctx, c.cfg.RuntimeBinary,
 		buildContainerExecArgs(c.containerName, buildStopCvdArgs())...)
 
-	// Force-remove the container — the authoritative teardown.
+	// Force-remove the container — the AUTHORITATIVE teardown. `rm -f` force-
+	// stops + removes the container, tearing down its OWN PID namespace (the
+	// container is launched WITHOUT `--pid host`, see buildContainerRunArgs),
+	// which kills every cvd process inside it (crosvm / run_cvd /
+	// cvd_internal_start).
 	out, rmErr := c.executor.Execute(ctx, c.cfg.RuntimeBinary, "rm", "-f", c.containerName)
 
-	// Reap orphan crosvm/run_cvd processes regardless of rm outcome.
-	graceCtx := ctx
-	_, reapErr := Cleanup(graceCtx)
+	// §11.4.174: do NOT reap cvd processes host-wide. The cvd processes run in
+	// the container's PID namespace and carry NO host-visible ownership token
+	// (the instance number is not plumbed from the host — buildLaunchCvdArgs is
+	// unused in production and CF_BASE_INSTANCE is never set here — and their
+	// argv references no container-name token). After `rm -f` above OUR cvd are
+	// already dead with the container's PID namespace, so a host-wide
+	// crosvm/run_cvd comm reap could ONLY hit a DIFFERENT (foreign / concurrent)
+	// instance's cvd — the exact §11.4.174 violation. We therefore hand the
+	// reaper an EMPTY ownership token, which makes it REFUSE (safe no-op); `rm
+	// -f` above is the sole teardown.
+	//
+	// CF-3 (§11.4.124): call CleanupWithGracePeriod (not the fixed-window
+	// Cleanup) so cfg.StopGracePeriod is genuinely threaded into the
+	// mechanism its own doc comment describes ("how long Stop waits after
+	// stop_cvd before reaping orphan crosvm/run_cvd processes"). The empty
+	// ownerToken still makes this an immediate no-op today (the §11.4.174
+	// safety property above is unchanged) — but the configured grace period
+	// is no longer a dead field: it is the value this call would honor the
+	// moment a host-visible ownership token is ever plumbed in, and it is
+	// directly exercised by cleanupWithDepsGrace's own unit coverage.
+	_, _ = CleanupWithGracePeriod(ctx, "", c.cfg.StopGracePeriod)
 
 	c.containerName = ""
 
 	if rmErr != nil {
 		return fmt.Errorf("%s rm: %w (output: %s)", c.cfg.RuntimeBinary, rmErr, string(out))
-	}
-	if reapErr != nil {
-		return fmt.Errorf("cuttlefish: orphan reaping after stop: %w", reapErr)
 	}
 	return nil
 }
@@ -252,6 +329,19 @@ func buildContainerRunArgs(
 	for _, g := range groups {
 		args = append(args, "--group-add", g)
 	}
+	// CF2-2 (security, argv flag-injection — direct mirror of pkg/emulator
+	// EMU2-1 (containerized.go) / pkg/crossbuild XBUILD2-2 (container_runner.go,
+	// apple_container.go) + the module OR-1/RM2/NET3 arg-injection hardenings,
+	// applied to the Cuttlefish container path those fixes never touched):
+	// terminate `podman/docker run` option parsing with an explicit
+	// end-of-options "--" BEFORE the image positional. `image` flows unsanitized
+	// from Config.Image; a crafted or typo'd reference beginning with '-' (e.g.
+	// "--privileged", "--network=host", "-v/:/host") would otherwise be parsed
+	// by the container CLI as a RUNTIME FLAG rather than the image name — a
+	// privilege/mount/network-escalation vector. The "--" forces it to be a
+	// positional, so the worst outcome of a hostile ref is an honest "no such
+	// image", never an escalation.
+	args = append(args, "--")
 	args = append(args, image)
 	return args
 }

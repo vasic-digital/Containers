@@ -2,7 +2,7 @@
 
 ## INHERITED FROM constitution/Constitution.md
 
-All rules in `constitution/Constitution.md` (and the `constitution/Constitution.md` it references) apply unconditionally. This file's rules below extend them — they MUST NOT weaken any inherited rule. See parent root `CLAUDE.md` §6.AD for the Lava-specific incorporation context (29th §6.L cycle, 2026-05-14) and §6.AD-debt for the implementation-gap inventory. Use `constitution/find_constitution.sh` from the parent project root to resolve the absolute path of the submodule from any nested location.
+All rules in `constitution/Constitution.md` (and the `constitution/Constitution.md` it references) apply unconditionally. This file's rules below extend them — they MUST NOT weaken any inherited rule. Use `constitution/find_constitution.sh` from the parent project root to resolve the absolute path of the submodule from any nested location.
 
 ## INHERITED FROM the Helix Constitution
 
@@ -22,7 +22,9 @@ distribution, and service discovery across Docker, Podman, and
 Kubernetes runtimes. It is the single integration point through which
 the consuming project's binary (and any other consumer) brings up its full
 container topology — local and remote — driven entirely by the
-consumer's `.env` file (`Containers/.env` for the consuming project).
+consumer's `.env` file (this module's own `.env` file, wherever the
+consuming project checks out this submodule — e.g. `submodules/containers/.env`,
+never a hardcoded nested `Containers/.env` path).
 
 This module is foundational: it has no upstream sibling modules and is
 consumed by `Challenges`, `HelixLLM`, `HelixQA`, and the consuming project itself.

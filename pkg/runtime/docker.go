@@ -59,7 +59,26 @@ func (e *defaultExecutor) Execute(
 ) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.WaitDelay = 2 * time.Second
-	return cmd.Output()
+	out, err := cmd.Output()
+	if err != nil {
+		// cmd.Output() already captures the child's stderr into
+		// (*exec.ExitError).Stderr internally (up to 32KiB, via Go's
+		// prefixSuffixSaver) when cmd.Stderr is nil — but ExitError.Error()
+		// only renders "exit status N" and never includes that captured
+		// text. Every caller across all six runtimes (Start/Stop/Remove/
+		// Status/List/Stats/Version) wraps this error with %w, so the real
+		// CLI diagnostic ("no such container", "permission denied", "daemon
+		// unreachable") was silently discarded. Surface it by appending the
+		// trimmed stderr text to the returned error while still preserving
+		// %w-wrapping of the original *exec.ExitError.
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" {
+				return out, fmt.Errorf("%w: %s", err, stderr)
+			}
+		}
+		return out, err
+	}
+	return out, nil
 }
 
 func (e *defaultExecutor) ExecuteWithStderr(
@@ -333,17 +352,36 @@ func parseDockerPSOutput(data []byte) ([]ContainerInfo, error) {
 		}
 		labels := parseLabelsString(ps.Labels)
 		containers = append(containers, ContainerInfo{
-			ID:     ps.ID,
-			Name:   ps.Names,
-			Image:  ps.Image,
-			State:  mapContainerState(ps.State),
-			Status: ps.Status,
-			Labels: labels,
+			ID:      ps.ID,
+			Name:    ps.Names,
+			Image:   ps.Image,
+			State:   mapContainerState(ps.State),
+			Status:  ps.Status,
+			Created: parseDockerCreatedAt(ps.Created),
+			Labels:  labels,
+			Ports:   parseDockerPortsMapping(ps.Ports),
 		})
 	}
 	return containers, nil
 }
 
+// parseLabelsString parses `docker ps --format json`'s "Labels" field, a
+// flat comma-joined "k1=v1,k2=v2" string.
+//
+// RT-LABEL-1 (§11.4.6 honest documentation, not a fix): a label VALUE
+// containing a literal comma (e.g. `description=hello, world`) is silently
+// truncated/split by this parser, because Docker's own `docker ps` JSON
+// formatter joins labels with "," and provides NO escaping mechanism for a
+// comma embedded in a value — this is a genuine upstream format limitation,
+// not a bug introduced here (confirmed: moby/moby#30575, "Unable to use
+// docker ps --filter when a label value has a comma", the same unescaped-
+// comma-join format). There is no `docker ps --format` variant that emits
+// Labels as a structured map instead of this flat string; obtaining
+// unambiguous label values would require a separate `docker inspect
+// --format '{{json .Config.Labels}}'` call per container, which changes
+// List()'s round-trip cost/contract and is out of scope for a surgical fix.
+// See wave20_rthard_test.go's RT-LABEL-1 case for a test that documents
+// (rather than "fixes") this known truncation behavior.
 func parseLabelsString(s string) map[string]string {
 	labels := make(map[string]string)
 	if s == "" {
@@ -357,6 +395,92 @@ func parseLabelsString(s string) map[string]string {
 		}
 	}
 	return labels
+}
+
+// parseDockerCreatedAt parses the `CreatedAt` field of `docker`/`nerdctl`
+// `ps --format json` output. Docker renders that field via Go's
+// time.Time.String() — captured evidence: this repo's own real-runtime
+// fixtures pkg/ctop/wave18_real_runtime_output_test.go and
+// pkg/ctop/ctop_test.go both carry the shape "2024-01-01 00:00:00 +0000 UTC"
+// (a `docker ps` sample). parseDockerPSOutput previously decoded this field
+// into dockerPSJSON.Created but never assigned it, so DockerRuntime.List AND
+// NerdctlRuntime.List (both route through parseDockerPSOutput) reported the
+// zero time for every listed container — while the sibling Podman/CRI-O/LXD/
+// Kubernetes List paths all populate Created. The String() layout is tried
+// first, then a fractional variant and RFC3339; any unrecognised/absent value
+// yields the zero time, so Created stays best-effort listing metadata and is
+// never a hard List() error.
+func parseDockerCreatedAt(s string) time.Time {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}
+	}
+	layouts := []string{
+		"2006-01-02 15:04:05 -0700 MST",
+		"2006-01-02 15:04:05.999999999 -0700 MST",
+		time.RFC3339Nano,
+		time.RFC3339,
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+// parseDockerPortsMapping parses the `Ports` field of `docker`/`nerdctl`
+// `ps --format json` output into structured PortMapping values. Docker emits
+// this as a flat string of published mappings, e.g.
+// "0.0.0.0:8080->80/tcp, :::8080->80/tcp" (captured evidence:
+// pkg/ctop/wave18_real_runtime_output_test.go's realDockerPSNDJSON carries
+// "0.0.0.0:8080->80/tcp"). parseDockerPSOutput decoded this field into
+// dockerPSJSON.Ports but never assigned it, so DockerRuntime.List /
+// NerdctlRuntime.List always returned an empty Ports slice even though the
+// container's published-port data was right there in the output. Only
+// published mappings (those with "->") carry a host binding worth reporting;
+// exposed-but-unpublished entries ("80/tcp") and any malformed segment are
+// skipped rather than fabricating a host port.
+func parseDockerPortsMapping(s string) []PortMapping {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	var ports []PortMapping
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		arrow := strings.Index(part, "->")
+		if arrow < 0 {
+			continue
+		}
+		hostSide := strings.TrimSpace(part[:arrow])
+		contSide := strings.TrimSpace(part[arrow+2:])
+
+		containerPort := contSide
+		proto := "tcp"
+		if slash := strings.LastIndexByte(contSide, '/'); slash >= 0 {
+			containerPort = contSide[:slash]
+			proto = contSide[slash+1:]
+		}
+
+		hostIP := ""
+		hostPort := hostSide
+		if colon := strings.LastIndexByte(hostSide, ':'); colon >= 0 {
+			hostIP = hostSide[:colon]
+			hostPort = hostSide[colon+1:]
+		}
+		hostPort = strings.TrimSpace(hostPort)
+		if hostPort == "" {
+			continue
+		}
+		ports = append(ports, PortMapping{
+			HostIP:        strings.TrimSpace(hostIP),
+			HostPort:      hostPort,
+			ContainerPort: strings.TrimSpace(containerPort),
+			Protocol:      strings.TrimSpace(proto),
+		})
+	}
+	return ports
 }
 
 func (d *DockerRuntime) Stats(

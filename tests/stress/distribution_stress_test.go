@@ -21,7 +21,7 @@ import (
 // or panics.
 func TestDistribution_ConcurrentStatus(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping stress test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping stress test in short mode") // SKIP-OK: #short-mode
 	}
 
 	dist := distribution.NewDistributor(
@@ -67,7 +67,7 @@ func TestDistribution_ConcurrentStatus(t *testing.T) {
 // can call ScheduleBatch simultaneously without race conditions.
 func TestScheduler_ConcurrentSchedule(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping stress test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping stress test in short mode") // SKIP-OK: #short-mode
 	}
 
 	executor, err := remote.NewSSHExecutor(

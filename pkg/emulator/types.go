@@ -58,6 +58,14 @@ type BootResult struct {
 	// Surfaced so the matrix runner can embed it in the attestation row per
 	// clause 6.I Group-B diag intent.
 	BootDiag *BootDiagnostic
+	// ResolvedAVDName records which AVD name ACTUALLY booted inside the
+	// container when it differs from AVD.Name (LVA-014 fix #1: the
+	// containerized runner resolves the requested name:api:form entry
+	// against the AVDs baked into the image; the §6.AE.2 matrix names
+	// are advisory and the baked name — e.g. "default" — wins on an
+	// api-level match). Empty when no substitution happened (exact name
+	// match or the host-direct runner).
+	ResolvedAVDName string
 }
 
 // DiagnosticInfo is the per-AVD forensic snapshot captured immediately

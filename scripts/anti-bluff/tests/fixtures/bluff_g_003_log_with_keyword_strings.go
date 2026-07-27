@@ -1,4 +1,5 @@
 package fixtures
+
 import "testing"
 
 // Regression fixture: prior to scanner iter 13 string-literal stripping,

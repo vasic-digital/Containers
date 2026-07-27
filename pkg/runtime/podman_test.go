@@ -307,17 +307,21 @@ func TestPodmanRuntime_Stats(t *testing.T) {
 		wantCPU float64
 	}{
 		{
-			name: "podman native format",
+			// §11.4.107(10): real `podman stats --format json` — a JSON array
+			// of objects whose fields are STRINGS, with combined net_io/block_io
+			// and a combined mem_usage "used / limit". The prior fixture fed a
+			// fabricated numeric shape no runtime emits (the fixture-bluff).
+			name: "podman native format (real string-array shape)",
 			output: `[{
-				"cpu_percent": 2.5,
-				"mem_percent": 10.0,
-				"mem_usage": 104857600,
-				"mem_limit": 1073741824,
-				"net_input": 1024,
-				"net_output": 2048,
-				"block_input": 512,
-				"block_output": 1024,
-				"pids": 5
+				"id": "abc123",
+				"name": "test-pod",
+				"cpu_percent": "2.50%",
+				"avg_cpu": "2.00%",
+				"mem_usage": "100MB / 1GB",
+				"mem_percent": "10.00%",
+				"net_io": "1kB / 2kB",
+				"block_io": "512B / 1kB",
+				"pids": "5"
 			}]`,
 			wantCPU: 2.5,
 		},

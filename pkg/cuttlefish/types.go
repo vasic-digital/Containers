@@ -191,7 +191,10 @@ type Config struct {
 
 	// StopGracePeriod is how long Stop waits after `stop_cvd` before
 	// reaping orphan crosvm/run_cvd processes. Zero defaults to
-	// defaultStopGracePeriod.
+	// defaultStopGracePeriod. CF-3: threaded into
+	// CleanupWithGracePeriod's SIGTERM-to-SIGKILL escalation window (see
+	// Cuttlefish.Stop) — this field genuinely controls that wait, it is
+	// not read-only-for-defaulting.
 	StopGracePeriod time.Duration
 }
 
@@ -271,7 +274,9 @@ type Lifecycle interface {
 	// Status runs `adb devices` and reports readiness.
 	Status(ctx context.Context) (StatusResult, error)
 
-	// Stop runs `stop_cvd` in the container, force-removes the container,
-	// and reaps any orphan crosvm/run_cvd processes.
+	// Stop runs `stop_cvd` in the container, then force-removes the container
+	// (`rm -f`) as the authoritative teardown — tearing down the container's PID
+	// namespace and killing every cvd process inside. Per §11.4.174 Stop performs
+	// NO host-wide cvd reap.
 	Stop(ctx context.Context) error
 }

@@ -33,7 +33,7 @@ type Options struct {
 // DefaultOptions returns Options with sensible defaults.
 func DefaultOptions() Options {
 	return Options{
-		ConnectTimeout:       10 * time.Second,
+		ConnectTimeout: 10 * time.Second,
 		// 30 minutes tolerates multi-GB image pulls and multi-layer
 		// builds during `compose up`. SSH keep-alive (KeepAlive *
 		// KeepAliveCountMax) detects genuinely dead connections
@@ -41,7 +41,7 @@ func DefaultOptions() Options {
 		// that simply take a long time to complete. The previous
 		// 300s / 5-minute default was too aggressive for cold-cache
 		// hosts building Dockerfiles from scratch.
-		CommandTimeout: 1800 * time.Second,
+		CommandTimeout:       1800 * time.Second,
 		MaxConnections:       5,
 		KeepAlive:            30 * time.Second,
 		KeepAliveCountMax:    10,

@@ -39,7 +39,7 @@ func newTestSSHExecutor(t *testing.T) *SSHExecutor {
 
 func TestSSHExecutor_Execute_InvalidHost(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping SSH executor test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping SSH executor test in short mode") // SKIP-OK: #short-mode
 	}
 
 	tests := []struct {
@@ -80,7 +80,7 @@ func TestSSHExecutor_Execute_InvalidHost(t *testing.T) {
 
 func TestSSHExecutor_Execute_EmptyCommand(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping SSH executor test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping SSH executor test in short mode") // SKIP-OK: #short-mode
 	}
 
 	tests := []struct {
@@ -118,7 +118,7 @@ func TestSSHExecutor_Execute_EmptyCommand(t *testing.T) {
 
 func TestSSHExecutor_CopyFile_InvalidHost(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping SSH executor test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping SSH executor test in short mode") // SKIP-OK: #short-mode
 	}
 
 	tests := []struct {
@@ -168,7 +168,7 @@ func TestSSHExecutor_CopyFile_InvalidHost(t *testing.T) {
 
 func TestSSHExecutor_CopyDir_InvalidHost(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping SSH executor test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping SSH executor test in short mode") // SKIP-OK: #short-mode
 	}
 
 	tests := []struct {
@@ -219,7 +219,7 @@ func TestSSHExecutor_CopyDir_InvalidHost(t *testing.T) {
 
 func TestSSHExecutor_IsReachable_Unreachable(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping SSH executor test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping SSH executor test in short mode") // SKIP-OK: #short-mode
 	}
 
 	tests := []struct {
@@ -272,7 +272,7 @@ func TestSSHExecutor_IsReachable_Unreachable(t *testing.T) {
 
 func TestSSHExecutor_ExecuteStream_InvalidHost(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping SSH executor test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping SSH executor test in short mode") // SKIP-OK: #short-mode
 	}
 
 	tests := []struct {
@@ -451,7 +451,8 @@ func TestSSHExecutor_SCPArgs_KeepAlive(t *testing.T) {
 	require.NoError(t, err)
 	defer exec.Close()
 
-	args := exec.scpArgs(unreachableHost())
+	args, err := exec.scpArgs(context.Background(), unreachableHost())
+	require.NoError(t, err)
 
 	assert.True(t,
 		containsSequence(args, "-o", "ServerAliveInterval=30"),

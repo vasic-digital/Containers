@@ -276,6 +276,17 @@ func TestBootManager_BootAll_ComposeFailure(t *testing.T) {
 	orch := &mockOrchestrator{
 		upErr: errors.New("compose up failed"),
 	}
+	// §11.4.120 reconciliation for BOOT-4: the ORIGINAL test set NO health
+	// checker, so Phase 3 never ran and the compose-failed endpoint was
+	// never re-probed — hiding the double-count/error-clobber bug. Wiring an
+	// unhealthy checker (the normal prod config: orchestrator + health
+	// checker) forces the compose-failed endpoint through Phase 3, where the
+	// pre-fix code re-recorded it (Failed==2) and replaced the compose
+	// root-cause with the health error. The fix skips already-"failed"
+	// endpoints in Phase 3.
+	hc := &mockHealthChecker{
+		results: map[string]bool{"svc": false},
+	}
 
 	endpoints := map[string]endpoint.ServiceEndpoint{
 		"svc": {
@@ -284,16 +295,24 @@ func TestBootManager_BootAll_ComposeFailure(t *testing.T) {
 			Enabled:     true,
 			Required:    true,
 			ComposeFile: "c.yml",
+			HealthType:  "tcp",
 		},
 	}
 
 	bm := boot.NewBootManager(endpoints,
 		boot.WithOrchestrator(orch),
+		boot.WithHealthChecker(hc),
 	)
 
 	summary, err := bm.BootAll(context.Background())
 	assert.Error(t, err)
+	// Exactly ONE failure counted for the single endpoint (not 2).
 	assert.Equal(t, 1, summary.Failed)
+	// The root-cause compose error is preserved, NOT clobbered by health.
+	require.NotNil(t, summary.Results["svc"])
+	require.Error(t, summary.Results["svc"].Error)
+	assert.Contains(t, summary.Results["svc"].Error.Error(), "compose up failed",
+		"compose-up root cause must survive Phase 3, not be replaced by health error")
 }
 
 func TestBootManager_BootAll_HealthFailRequired(t *testing.T) {

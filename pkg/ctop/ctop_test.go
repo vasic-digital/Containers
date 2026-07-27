@@ -35,8 +35,8 @@ func TestNewCollectorWithExecutor(t *testing.T) {
 }
 
 func TestCollector_Collect_Local(t *testing.T) {
-	psOutput := `[{"Id":"abc123def456ghi789","Names":["/test-container"],"Image":"nginx:latest","Created":"2024-01-01T00:00:00Z","State":{"Status":"running","StartedAt":"2024-01-01T00:00:00Z"},"Ports":[{"PublicPort":80,"Type":"tcp"}]}]`
-	statsOutput := `{"CPUPerc":"1.5%","MemUsage":"50MiB / 1GiB","MemPerc":"5.0%","NetIO":"1MiB / 500KiB","BlockIO":"10MiB / 5MiB","PIDs":"5"}`
+	psOutput := `[{"Id":"abc123def456ghi789","Names":["/test-container"],"Image":"nginx:latest","Created":1704067200,"State":"running","Status":"Up 5 days","StartedAt":1704067200,"Ports":[{"host_port":80,"protocol":"tcp"}]}]`
+	statsOutput := `[{"cpu_percent":"1.5%","mem_usage":"50MB / 1GB","mem_percent":"5.0%","net_io":"1MB / 500kB","block_io":"10MB / 5MB","pids":"5"}]`
 
 	exec := &mockExecutor{
 		responses: map[string][]byte{
@@ -69,7 +69,7 @@ func TestCollector_Collect_Local(t *testing.T) {
 }
 
 func TestCollector_Collect_FallbackToDocker(t *testing.T) {
-	psOutput := `[{"Id":"xyz789","Names":["/docker-container"],"Image":"redis:latest","Created":"2024-01-01T00:00:00Z","State":{"Status":"running","StartedAt":"2024-01-01T00:00:00Z"},"Ports":[]}]`
+	psOutput := `{"Command":"redis-server","CreatedAt":"2024-01-01 00:00:00 +0000 UTC","ID":"xyz789abcd","Image":"redis:latest","Labels":"","Names":"docker-container","Ports":"","State":"running","Status":"Up"}`
 
 	exec := &mockExecutor{
 		responses: map[string][]byte{
@@ -185,8 +185,8 @@ func TestContainerProcessList_Filter(t *testing.T) {
 func TestParseContainerList(t *testing.T) {
 	t.Run("Array", func(t *testing.T) {
 		data := []byte(`[
-			{"Id":"abc123","Names":["/test1"],"Image":"nginx","Created":"2024-01-01T00:00:00Z","State":{"Status":"running","StartedAt":"2024-01-01T00:00:00Z"}},
-			{"Id":"def456","Names":["/test2"],"Image":"redis","Created":"2024-01-01T00:00:00Z","State":{"Status":"exited"}}
+			{"Id":"abc123","Names":["/test1"],"Image":"nginx","Created":1704067200,"State":"running","Status":"Up","StartedAt":1704067200},
+			{"Id":"def456","Names":["/test2"],"Image":"redis","Created":1704067200,"State":"exited","Status":"Exited (0)"}
 		]`)
 
 		containers, err := parseContainerList(data, "podman", "local")
@@ -198,7 +198,7 @@ func TestParseContainerList(t *testing.T) {
 	})
 
 	t.Run("SingleObject", func(t *testing.T) {
-		data := []byte(`{"Id":"xyz789","Names":["/single"],"Image":"alpine","Created":"2024-01-01T00:00:00Z","State":{"Status":"running"}}`)
+		data := []byte(`{"Id":"xyz789","Names":["/single"],"Image":"alpine","Created":1704067200,"State":"running","Status":"Up"}`)
 
 		containers, err := parseContainerList(data, "docker", "local")
 		require.NoError(t, err)
@@ -207,7 +207,7 @@ func TestParseContainerList(t *testing.T) {
 	})
 
 	t.Run("WithRemoteLocation", func(t *testing.T) {
-		data := []byte(`[{"Id":"remote1","Names":["/remote-container"],"Image":"nginx","Created":"2024-01-01T00:00:00Z","State":{"Status":"running"}}]`)
+		data := []byte(`[{"Id":"remote1","Names":["/remote-container"],"Image":"nginx","Created":1704067200,"State":"running","Status":"Up"}]`)
 
 		containers, err := parseContainerList(data, "podman", "remote:thinker")
 		require.NoError(t, err)
@@ -271,8 +271,8 @@ func TestDefaultDisplayConfig(t *testing.T) {
 }
 
 func TestDisplay_RenderSnapshot(t *testing.T) {
-	psOutput := `[{"Id":"snap123","Names":["/snapshot-test"],"Image":"test:latest","Created":"2024-01-01T00:00:00Z","State":{"Status":"running","StartedAt":"2024-01-01T00:00:00Z"}}]`
-	statsOutput := `{"CPUPerc":"10.0%","MemUsage":"100MiB / 1GiB","MemPerc":"10.0%","NetIO":"1MiB / 1MiB","BlockIO":"10MiB / 10MiB","PIDs":"1"}`
+	psOutput := `[{"Id":"snap123","Names":["/snapshot-test"],"Image":"test:latest","Created":1704067200,"State":"running","Status":"Up","StartedAt":1704067200}]`
+	statsOutput := `[{"cpu_percent":"10.0%","mem_usage":"100MB / 1GB","mem_percent":"10.0%","net_io":"1MB / 1MB","block_io":"10MB / 10MB","pids":"1"}]`
 
 	exec := &mockExecutor{
 		responses: map[string][]byte{
@@ -293,8 +293,8 @@ func TestDisplay_RenderSnapshot(t *testing.T) {
 }
 
 func TestDisplay_RenderJSON(t *testing.T) {
-	psOutput := `[{"Id":"json123","Names":["/json-test"],"Image":"test:latest","Created":"2024-01-01T00:00:00Z","State":{"Status":"running","StartedAt":"2024-01-01T00:00:00Z"}}]`
-	statsOutput := `{"CPUPerc":"5.0%","MemUsage":"50MiB / 1GiB","MemPerc":"5.0%","NetIO":"0B / 0B","BlockIO":"0B / 0B","PIDs":"1"}`
+	psOutput := `[{"Id":"json123","Names":["/json-test"],"Image":"test:latest","Created":1704067200,"State":"running","Status":"Up","StartedAt":1704067200}]`
+	statsOutput := `[{"cpu_percent":"5.0%","mem_usage":"50MB / 1GB","mem_percent":"5.0%","net_io":"0B / 0B","block_io":"0B / 0B","pids":"1"}]`
 
 	exec := &mockExecutor{
 		responses: map[string][]byte{

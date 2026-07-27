@@ -2,6 +2,7 @@ package cuttlefish
 
 import (
 	"context"
+	"os"
 	"sync"
 	"syscall"
 	"testing"
@@ -10,13 +11,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeWalker returns a fixed pid→comm map.
+// fakeWalker returns a fixed pid→comm map (and pid→argv for the §11.4.174
+// ownership gate).
 type fakeWalker struct {
-	comms map[int]string
-	err   error
+	comms    map[int]string
+	cmdlines map[int][]string
+	err      error
 }
 
-func (f fakeWalker) PidComms() (map[int]string, error) { return f.comms, f.err }
+func (f fakeWalker) PidComms() (map[int]string, error)      { return f.comms, f.err }
+func (f fakeWalker) PidCmdlines() (map[int][]string, error) { return f.cmdlines, f.err }
 
 // fakeKiller records signals and simulates process liveness. A pid is
 // "alive" until it receives a signal in deadAfterSignal (then Exists
@@ -80,17 +84,27 @@ func (*signalError) Error() string { return "no such process" }
 // comm allowlist: only crosvm / run_cvd / cvd_internal_start are collected;
 // an unrelated process whose name shares a prefix is NOT.
 func TestCleanup_ExactNameMatch(t *testing.T) {
-	w := fakeWalker{comms: map[int]string{
-		101: "crosvm",             // matched (VMM)
-		102: "run_cvd",            // matched (supervisor)
-		103: "cvd_internal_start", // matched (supervisor)
-		104: "crontab",            // NOT matched (shares "cr" prefix)
-		105: "crosvm-helper",      // NOT matched (exact-match, not prefix)
-		106: "qemu-system-x86_64", // NOT matched (that is pkg/emulator's job)
-	}}
+	w := fakeWalker{
+		comms: map[int]string{
+			101: "crosvm",             // matched (VMM, OUR instance)
+			102: "run_cvd",            // matched (supervisor, OUR instance)
+			103: "cvd_internal_start", // matched (supervisor, OUR instance)
+			104: "crontab",            // NOT matched (shares "cr" prefix)
+			105: "crosvm-helper",      // NOT matched (exact-match, not prefix)
+			106: "qemu-system-x86_64", // NOT matched (that is pkg/emulator's job)
+		},
+		cmdlines: map[int][]string{
+			101: {"crosvm", "--base_instance_num=1"},
+			102: {"run_cvd", "--base_instance_num=1"},
+			103: {"cvd_internal_start", "--base_instance_num=1"},
+			104: {"crontab", "--base_instance_num=1"}, // token present but comm fails allowlist
+			105: {"crosvm-helper", "--base_instance_num=1"},
+			106: {"qemu-system-x86_64", "--base_instance_num=1"},
+		},
+	}
 	k := newFakeKiller()
 
-	report, err := cleanupWithDeps(context.Background(), w, k)
+	report, err := cleanupWithDeps(context.Background(), "--base_instance_num=1", w, k)
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []int{101, 102, 103}, report.Found,
 		"only exact Cuttlefish daemon names may be reaped; got %v", report.Found)
@@ -101,10 +115,13 @@ func TestCleanup_ExactNameMatch(t *testing.T) {
 }
 
 func TestCleanup_SIGTERMGracefulExit(t *testing.T) {
-	w := fakeWalker{comms: map[int]string{201: "crosvm", 202: "run_cvd"}}
+	w := fakeWalker{
+		comms:    map[int]string{201: "crosvm", 202: "run_cvd"},
+		cmdlines: map[int][]string{201: {"crosvm", "--base_instance_num=1"}, 202: {"run_cvd", "--base_instance_num=1"}},
+	}
 	k := newFakeKiller() // both mortal — die on SIGTERM
 
-	report, err := cleanupWithDeps(context.Background(), w, k)
+	report, err := cleanupWithDeps(context.Background(), "--base_instance_num=1", w, k)
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []int{201, 202}, report.TerminatedTERM)
 	assert.Empty(t, report.KilledKILL)
@@ -112,11 +129,14 @@ func TestCleanup_SIGTERMGracefulExit(t *testing.T) {
 }
 
 func TestCleanup_SIGKILLStraggler(t *testing.T) {
-	w := fakeWalker{comms: map[int]string{301: "crosvm"}}
+	w := fakeWalker{
+		comms:    map[int]string{301: "crosvm"},
+		cmdlines: map[int][]string{301: {"crosvm", "--base_instance_num=1"}},
+	}
 	k := newFakeKiller()
 	k.immortal[301] = true // survives SIGTERM → requires SIGKILL
 
-	report, err := cleanupWithDeps(context.Background(), w, k)
+	report, err := cleanupWithDeps(context.Background(), "--base_instance_num=1", w, k)
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []int{301}, report.KilledKILL)
 	assert.Contains(t, k.signals[301], syscall.SIGTERM)
@@ -126,7 +146,7 @@ func TestCleanup_SIGKILLStraggler(t *testing.T) {
 func TestCleanup_NothingFound(t *testing.T) {
 	w := fakeWalker{comms: map[int]string{401: "bash", 402: "sshd"}}
 	k := newFakeKiller()
-	report, err := cleanupWithDeps(context.Background(), w, k)
+	report, err := cleanupWithDeps(context.Background(), "--base_instance_num=1", w, k)
 	require.NoError(t, err)
 	assert.Empty(t, report.Found)
 	assert.Empty(t, k.signals)
@@ -135,10 +155,62 @@ func TestCleanup_NothingFound(t *testing.T) {
 func TestCleanup_EmptyCommSkipped(t *testing.T) {
 	w := fakeWalker{comms: map[int]string{501: ""}}
 	k := newFakeKiller()
-	report, err := cleanupWithDeps(context.Background(), w, k)
+	report, err := cleanupWithDeps(context.Background(), "--base_instance_num=1", w, k)
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []int{501}, report.SkippedReadErr)
 	assert.Empty(t, report.Found)
+}
+
+// TestCleanup_OwnershipScopedToOurInstance is the §11.4.174 ownership guard
+// (§11.4.115 polarity via RED_MODE):
+//
+//	RED_MODE unset/1 (default) = GREEN guard on the FIXED code: ONLY cvd
+//	  processes carrying OUR instance token are reaped; a foreign instance's
+//	  crosvm/run_cvd (different token) gets NO signal.
+//	RED_MODE=0 = reproduce the pre-fix comm-only defect (asserts the foreign
+//	  cvd is Found too). MUST FAIL on the fixed code; PASSES on the pre-fix
+//	  comm-only matcher.
+func TestCleanup_OwnershipScopedToOurInstance(t *testing.T) {
+	redMode := os.Getenv("RED_MODE") != "0"
+	w := fakeWalker{
+		comms: map[int]string{
+			801: "crosvm",  // OURS    (--base_instance_num=1)
+			802: "crosvm",  // FOREIGN (--base_instance_num=2)
+			803: "run_cvd", // OURS
+		},
+		cmdlines: map[int][]string{
+			801: {"crosvm", "--base_instance_num=1"},
+			802: {"crosvm", "--base_instance_num=2"},
+			803: {"run_cvd", "--base_instance_num=1"},
+		},
+	}
+	k := newFakeKiller()
+	report, err := cleanupWithDeps(context.Background(), "--base_instance_num=1", w, k)
+	require.NoError(t, err)
+	if redMode {
+		assert.ElementsMatch(t, []int{801, 803}, report.Found,
+			"only cvd carrying OUR instance token may be reaped (§11.4.174)")
+		assert.Empty(t, k.signals[802], "foreign cvd instance MUST receive NO signal")
+	} else {
+		assert.ElementsMatch(t, []int{801, 802, 803}, report.Found,
+			"RED: a comm-only matcher would reap the foreign cvd too")
+	}
+}
+
+// TestCleanup_EmptyTokenRefusesReap is the §11.4.174 refuse-guard: with no
+// ownership token (Cuttlefish Stop's production call), Cleanup reaps NOTHING
+// even when crosvm/run_cvd PIDs are present — it never falls back to a host-
+// wide comm match. Teardown relies on `rm -f <container>` instead.
+func TestCleanup_EmptyTokenRefusesReap(t *testing.T) {
+	w := fakeWalker{
+		comms:    map[int]string{901: "crosvm", 902: "run_cvd"},
+		cmdlines: map[int][]string{901: {"crosvm", "--base_instance_num=1"}, 902: {"run_cvd", "--base_instance_num=1"}},
+	}
+	k := newFakeKiller()
+	report, err := cleanupWithDeps(context.Background(), "", w, k)
+	require.NoError(t, err)
+	assert.Empty(t, report.Found, "empty ownerToken MUST refuse to reap (§11.4.174)")
+	assert.Empty(t, k.signals, "no signal may be sent when ownership cannot be established")
 }
 
 func TestNewOSProcWalker_DispatchTable(t *testing.T) {

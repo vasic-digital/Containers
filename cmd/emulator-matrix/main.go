@@ -7,14 +7,14 @@
 //
 // Usage:
 //
-//   emulator-matrix \
-//     --android-sdk-root /opt/android-sdk \
-//     --apk releases/1.2.1/android-debug/app-debug.apk \
-//     --test-class app.example.challenges.Challenge01AppLaunchAndTrackerSelectionTest \
-//     --evidence-dir .ci-evidence/App-1.2.2 \
-//     --avds CZ_API28_Phone,CZ_API30_Phone,CZ_API34_Phone,Pixel_9a \
-//     --cold-boot \
-//     --image-manifest tools/ci-containers/vm-images.json
+//	emulator-matrix \
+//	  --android-sdk-root /opt/android-sdk \
+//	  --apk releases/1.2.1/android-debug/app-debug.apk \
+//	  --test-class app.example.challenges.Challenge01AppLaunchAndTrackerSelectionTest \
+//	  --evidence-dir .ci-evidence/App-1.2.2 \
+//	  --avds CZ_API28_Phone,CZ_API30_Phone,CZ_API34_Phone,Pixel_9a \
+//	  --cold-boot \
+//	  --image-manifest tools/ci-containers/vm-images.json
 //
 // Each comma-separated AVD entry MAY include the API level after a
 // colon: `Pixel_9a:36:phone` (name:apiLevel:formFactor). The api level
@@ -22,10 +22,11 @@
 // clause 4.
 //
 // Exit codes:
-//   0 — every AVD booted, every test passed (matrix attestation green)
-//   1 — at least one AVD failed boot OR at least one test failed
-//   2 — invalid CLI arguments OR the runner errored before producing
-//       any attestation rows
+//
+//	0 — every AVD booted, every test passed (matrix attestation green)
+//	1 — at least one AVD failed boot OR at least one test failed
+//	2 — invalid CLI arguments OR the runner errored before producing
+//	    any attestation rows
 //
 // Anti-bluff posture (clauses 6.J/6.L): a CLI that exits 0 when ANY
 // AVD failed would be a bluff. The exit-code logic above means
@@ -204,22 +205,45 @@ func main() {
 	}
 
 	ctx := context.Background()
-	var emu emulator.Emulator
+	// EMU-2: build a per-invocation Emulator FACTORY rather than a single
+	// shared instance. Under Concurrent>1 the matrix runner hands each
+	// concurrent AVD its OWN fresh Emulator, so a per-AVD Teardown always
+	// acts on the container its own Boot created — a single shared
+	// Containerized would let AVD-B's Boot overwrite the shared
+	// containerName before AVD-A's Teardown, force-removing the wrong
+	// container. The factory also isolates gradleModule per invocation
+	// (EMU-3). Serial runs get a fresh instance per AVD too.
+	var newEmu func() emulator.Emulator
 	if resolvedRunner == emulator.RunnerContainerized {
-		c, ferr := emulator.NewContainerized(emulator.ContainerizedConfig{
+		cfg := emulator.ContainerizedConfig{
 			RuntimeBinary: *flagContainerRuntime,
 			Image:         *flagContainerImage,
 			GradleModule:  *flagGradleModule,
-		})
-		if ferr != nil {
+		}
+		// Validate the config ONCE up front (fail-loud) so the factory
+		// below operates on already-validated, constant inputs.
+		if _, ferr := emulator.NewContainerized(cfg); ferr != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: NewContainerized: %v\n", ferr)
 			os.Exit(2)
 		}
-		emu = c
+		newEmu = func() emulator.Emulator {
+			c, ferr := emulator.NewContainerized(cfg)
+			if ferr != nil {
+				// Unreachable: cfg was validated non-empty above and is
+				// constant, so NewContainerized cannot fail here. Fail loud
+				// on any invariant break rather than return a nil Emulator.
+				panic(fmt.Sprintf("emulator-matrix: NewContainerized unexpectedly failed on validated config: %v", ferr))
+			}
+			return c
+		}
 		fmt.Printf("[§6.X] runner=containerized image=%s runtime=%s\n",
 			*flagContainerImage, *flagContainerRuntime)
 	} else {
-		emu = emulator.NewAndroidEmulatorWithModule(*flagSdkRoot, *flagGradleModule)
+		sdkRoot := *flagSdkRoot
+		gradleModule := *flagGradleModule
+		newEmu = func() emulator.Emulator {
+			return emulator.NewAndroidEmulatorWithModule(sdkRoot, gradleModule)
+		}
 		// host-direct is OS-correct on macOS (HVF) and Windows (WHPX) —
 		// there it IS the accelerated, gate-eligible runner, not a
 		// workstation-iteration fallback. It is a workstation-iteration
@@ -233,7 +257,7 @@ func main() {
 			fmt.Println("[§6.X] runner=host-direct (workstation iteration mode; not gate-eligible on this OS — §6.X gate runs require containerized)")
 		}
 	}
-	runner := emulator.NewAndroidMatrixRunner(emu)
+	runner := emulator.NewAndroidMatrixRunnerWithFactory(newEmu)
 	result, err := runner.RunMatrix(ctx, emulator.MatrixConfig{
 		AVDs:              avds,
 		AndroidSdkRoot:    *flagSdkRoot,

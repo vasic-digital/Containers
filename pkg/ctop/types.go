@@ -27,6 +27,14 @@ type ContainerProcess struct {
 	MemoryLimit   uint64  `json:"memory_limit"`
 	MemoryPercent float64 `json:"memory_percent"`
 
+	// StatsUnavailable is true when the runtime's stats command failed (or
+	// returned nothing decodable) for this container (CT3-7, §11.4.108):
+	// CPUPercent/MemoryUsage/MemoryPercent above are the Go zero-value in
+	// this case — NOT a confirmed 0% reading — and renderers MUST show a
+	// distinct "N/A"-class marker rather than treating this identically to
+	// a genuinely-idle container.
+	StatsUnavailable bool `json:"stats_unavailable"`
+
 	// I/O
 	NetworkRx  uint64 `json:"network_rx"`
 	NetworkTx  uint64 `json:"network_tx"`

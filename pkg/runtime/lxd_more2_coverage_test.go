@@ -95,7 +95,7 @@ func TestLXD_Remove_Error(t *testing.T) {
 // TestParseLXDStatus_UnmarshalError exercises the JSON unmarshal error
 // branch of parseLXDStatus.
 func TestParseLXDStatus_UnmarshalError(t *testing.T) {
-	_, err := parseLXDStatus([]byte("invalid json"))
+	_, err := parseLXDStatus([]byte("invalid json"), "any")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "parsing lxc list output")
 }
@@ -103,7 +103,7 @@ func TestParseLXDStatus_UnmarshalError(t *testing.T) {
 // TestParseLXDStatus_EmptyList exercises the "no container found" branch
 // of parseLXDStatus when the JSON array is empty.
 func TestParseLXDStatus_EmptyList(t *testing.T) {
-	_, err := parseLXDStatus([]byte("[]"))
+	_, err := parseLXDStatus([]byte("[]"), "any")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no container found")
 }
@@ -113,7 +113,7 @@ func TestParseLXDStatus_EmptyList(t *testing.T) {
 // StartedAt field is left as the zero time.
 func TestParseLXDStatus_WithNilState(t *testing.T) {
 	data := `[{"name":"c1","status":"Running","status_code":103,"state":null}]`
-	status, err := parseLXDStatus([]byte(data))
+	status, err := parseLXDStatus([]byte(data), "c1")
 	require.NoError(t, err)
 	assert.Equal(t, "c1", status.Name)
 	assert.True(t, status.StartedAt.IsZero(),
@@ -127,7 +127,7 @@ func TestParseLXDStatus_WithNonNilState(t *testing.T) {
 	data := `[{"name":"c2","status":"Running","status_code":103,` +
 		`"last_used_at":"2024-06-01T12:00:00Z",` +
 		`"state":{"status":"Running","cpu":{"usage":0},"memory":{"usage":0,"limit":0},"network":{}}}]`
-	status, err := parseLXDStatus([]byte(data))
+	status, err := parseLXDStatus([]byte(data), "c2")
 	require.NoError(t, err)
 	assert.Equal(t, "c2", status.Name)
 	assert.False(t, status.StartedAt.IsZero(),

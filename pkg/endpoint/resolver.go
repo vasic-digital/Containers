@@ -1,7 +1,7 @@
 package endpoint
 
 import (
-	"fmt"
+	"net"
 	"strings"
 )
 
@@ -21,24 +21,37 @@ func ResolveHealthURL(ep *ServiceEndpoint) string {
 func ResolveHostPort(ep *ServiceEndpoint) string {
 	host := ep.Host
 	if host == "" {
-		host = "localhost"
+		host = defaultHost
 	}
 	if ep.Port == "" {
 		return host
 	}
-	return fmt.Sprintf("%s:%s", host, ep.Port)
+	// EP-1: net.JoinHostPort bracket-wraps an IPv6 literal ("[::1]:8080")
+	// and leaves IPv4/hostnames unchanged, unlike a manual "%s:%s" concat.
+	// EP2-1: unbracketHost first so an already-bracketed literal ("[::1]")
+	// is not double-wrapped into an invalid "[[::1]]:port".
+	return net.JoinHostPort(unbracketHost(host), ep.Port)
 }
 
-// ResolveScheme returns the URL scheme inferred from the
-// endpoint's explicit URL or defaults to "http".
+// ResolveScheme returns the URL scheme for the endpoint. It mirrors the
+// scheme ResolvedURL would produce: an explicit URL's prefix wins, then a
+// scheme prefix embedded in Host, otherwise the default scheme.
+//
+// EP-2: previously this ignored a scheme embedded in Host and always
+// returned the default when URL was empty, so a caller composing
+// ResolveScheme()+"://"+ResolveHostPort() disagreed with ResolvedURL()
+// for e.g. Host="https://secure.local".
 func ResolveScheme(ep *ServiceEndpoint) string {
 	if ep.URL != "" {
 		if strings.HasPrefix(ep.URL, "https://") {
 			return "https"
 		}
-		return "http"
+		return defaultScheme
 	}
-	return "http"
+	if strings.HasPrefix(ep.Host, "https://") {
+		return "https"
+	}
+	return defaultScheme
 }
 
 // IsLocalEndpoint returns true if the endpoint targets the local
@@ -47,7 +60,10 @@ func IsLocalEndpoint(ep *ServiceEndpoint) bool {
 	if ep.Remote {
 		return false
 	}
-	h := strings.ToLower(ep.Host)
+	// EP2-2: unbracketHost normalises an already-bracketed IPv6 literal
+	// ("[::1]") so the loopback comparison recognises it exactly like the
+	// bare "::1" form (otherwise "[::1]" is mis-classified as non-local).
+	h := strings.ToLower(unbracketHost(ep.Host))
 	return h == "" || h == "localhost" || h == "127.0.0.1" ||
 		h == "::1"
 }

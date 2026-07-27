@@ -35,8 +35,28 @@ func (m *NFSMounter) Mount(
 	host remote.RemoteHost,
 	mount VolumeMount,
 ) error {
+	// VOL-HIGH-1: the remote `mount -t nfs <server>:<export> <mountpoint>`
+	// command needs a real, network-reachable NFS SERVER address distinct
+	// from the export path. The pre-fix code used mount.LocalPath for BOTH
+	// — `mount.LocalPath:mount.LocalPath` — because VolumeMount carries no
+	// local-orchestrator-address field, so the "server" was always a bare
+	// filesystem path (e.g. "/local/data:/local/data"), which no NFS client
+	// can resolve; every NFS mount was categorically broken. Fail loudly
+	// when no address is configured rather than silently emit that known-
+	// broken command (§11.4.14 / §11.4.108) — configure via
+	// WithLocalHostAddress.
+	if m.opts.LocalHostAddress == "" {
+		return fmt.Errorf(
+			"nfs mount %q: no local host address configured (see "+
+				"WithLocalHostAddress); refusing to build a mount command "+
+				"using LocalPath (%s) as both the NFS server and the export "+
+				"path",
+			mount.Name, mount.LocalPath,
+		)
+	}
+
 	// Create the remote mount point.
-	mkdirCmd := fmt.Sprintf("mkdir -p %s", mount.RemotePath)
+	mkdirCmd := fmt.Sprintf("mkdir -p %s", shellQuote(mount.RemotePath))
 	result, err := m.executor.Execute(ctx, host, mkdirCmd)
 	if err != nil {
 		return fmt.Errorf(
@@ -50,15 +70,20 @@ func (m *NFSMounter) Mount(
 		)
 	}
 
-	// Mount NFS on remote host.
-	mountOpts := "nfs"
+	// Mount NFS on remote host. `ro` is a mount OPTION and must go under -o;
+	// welding it onto the -t filesystem type (`-t nfs,ro`) makes util-linux
+	// parse "nfs,ro" as a comma-separated type list and reject it with
+	// "unknown filesystem type 'ro'", silently breaking every read-only NFS
+	// mount. Read-write mounts (ReadOnly:false) emit a valid `mount -t nfs ...`.
+	mountFlags := "-t nfs"
 	if mount.ReadOnly {
-		mountOpts += ",ro"
+		mountFlags += " -o ro"
 	}
 	nfsCmd := fmt.Sprintf(
-		"mount -t %s %s:%s %s",
-		mountOpts, mount.LocalPath, mount.LocalPath,
-		mount.RemotePath,
+		"mount %s %s:%s %s",
+		mountFlags,
+		shellQuote(m.opts.LocalHostAddress), shellQuote(mount.LocalPath),
+		shellQuote(mount.RemotePath),
 	)
 
 	m.logger.Info("nfs mount on %s: %s",
@@ -87,7 +112,7 @@ func (m *NFSMounter) Unmount(
 	host remote.RemoteHost,
 	mount VolumeMount,
 ) error {
-	cmd := fmt.Sprintf("umount %s", mount.RemotePath)
+	cmd := fmt.Sprintf("umount %s", shellQuote(mount.RemotePath))
 	result, err := m.executor.Execute(ctx, host, cmd)
 	if err != nil {
 		return fmt.Errorf(

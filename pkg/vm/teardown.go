@@ -43,13 +43,48 @@ var teardownGracePeriod = 30 * time.Second
 // would silently lie about successful teardown of a stuck VM and
 // corrupt the matrix runner's row outcome.
 func (v *QEMUVM) Teardown(ctx context.Context, monitorPort, sshPort int) error {
-	// Stage 1: QMP powerdown — best-effort.
+	// Release our SSH client handle on every exit path. The guest is
+	// shut down via QMP / KillByQEMUMonitorPort, not via this connection,
+	// so closing it here only prevents a per-lifecycle SSH connection +
+	// goroutine leak (serial matrix runs reuse one QEMUVM across N
+	// targets). Resetting authedPort forces a fresh Authenticate on the
+	// next boot's port.
+	defer func() {
+		// Close the shared SSH client ONLY if this Teardown still owns
+		// the authenticated session (authedPort == this target's sshPort)
+		// or nobody owns it (authedPort == 0). Under --concurrent>1 a
+		// different, still-in-flight target may have re-authenticated the
+		// shared connection to ITS own port since this target ran; closing
+		// it here would kill a live connection that target is using. The
+		// `mine` check prevents that cross-target close. Guarded by
+		// guestMu (lock ordering guestMu → authMu, never reversed) so it
+		// cannot interleave with a concurrent guest op. See CT-HARDEN-VM-1.
+		v.guestMu.Lock()
+		v.authMu.Lock()
+		mine := v.authedPort == sshPort || v.authedPort == 0
+		v.authMu.Unlock()
+		if mine {
+			if v.ssh != nil {
+				_ = v.ssh.Close()
+			}
+			v.authMu.Lock()
+			v.authedPort = 0
+			v.authMu.Unlock()
+		}
+		v.guestMu.Unlock()
+	}()
+
+	// Stage 1: QMP powerdown — best-effort. Guarded by guestMu (bounded
+	// ~5s Dial timeout, NOT the 30s grace sleep below) so a concurrent
+	// target's screenshot capture can't race the shared qmp connection.
+	v.guestMu.Lock()
 	if v.qmp != nil {
 		if err := v.qmp.Dial(ctx, monitorPort, 5*time.Second); err == nil {
 			_ = v.qmp.SystemPowerdown(ctx)
 			_ = v.qmp.Close()
 		}
 	}
+	v.guestMu.Unlock()
 
 	// Stage 2: wait for graceful exit. We can't directly observe the
 	// QEMU process from here without a process handle; we sleep.

@@ -3,9 +3,10 @@ package ctop
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
+	"log"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -81,12 +82,17 @@ func (c *Collector) Collect(ctx context.Context) (*ContainerProcessList, error) 
 	}
 
 	if c.hostManager != nil {
-		remoteProcs, err := c.collectRemote(ctx)
+		remoteProcs, failedHosts, err := c.collectRemote(ctx)
 		if err != nil {
 			errors++
 		} else {
 			processes = append(processes, remoteProcs...)
 		}
+		// CT2-5: a per-host collection failure (host unreachable, SSH
+		// executor unavailable, remote command failure) must be visible in
+		// CollectorStats.Errors — silently dropping it made a total remote
+		// wipeout indistinguishable from a healthy zero-remote-hosts run.
+		errors += failedHosts
 	}
 
 	running, stopped := 0, 0
@@ -152,30 +158,44 @@ func (c *Collector) collectLocal(ctx context.Context) ([]ContainerProcess, error
 	}
 
 	for i := range containers {
-		stats, _ := c.getContainerStats(ctx, rt, containers[i].ID)
-		if stats != nil {
-			containers[i].CPUPercent = stats.CPUPercent
-			containers[i].MemoryUsage = stats.MemoryUsage
-			containers[i].MemoryLimit = stats.MemoryLimit
-			containers[i].MemoryPercent = stats.MemoryPercent
-			containers[i].NetworkRx = stats.NetworkRx
-			containers[i].NetworkTx = stats.NetworkTx
-			containers[i].BlockRead = stats.BlockRead
-			containers[i].BlockWrite = stats.BlockWrite
-			containers[i].PIDs = stats.PIDs
+		stats, statsErr := c.getContainerStats(ctx, rt, containers[i].ID)
+		if statsErr != nil || stats == nil {
+			// CT3-7 (§11.4.108): a failed/empty stats collection leaves
+			// CPUPercent/MemoryUsage at the Go zero-value, which renders
+			// identically to a genuinely-idle 0% container unless flagged —
+			// StatsUnavailable is the distinct signal the renderer needs to
+			// show "N/A" instead of a confirmed "0.0%".
+			containers[i].StatsUnavailable = true
+			continue
 		}
+		containers[i].CPUPercent = stats.CPUPercent
+		containers[i].MemoryUsage = stats.MemoryUsage
+		containers[i].MemoryLimit = stats.MemoryLimit
+		containers[i].MemoryPercent = stats.MemoryPercent
+		containers[i].NetworkRx = stats.NetworkRx
+		containers[i].NetworkTx = stats.NetworkTx
+		containers[i].BlockRead = stats.BlockRead
+		containers[i].BlockWrite = stats.BlockWrite
+		containers[i].PIDs = stats.PIDs
 	}
 
 	return containers, nil
 }
 
-func (c *Collector) collectRemote(ctx context.Context) ([]ContainerProcess, error) {
+// collectRemote fans out container collection to every registered remote
+// host in parallel. It returns the aggregated processes AND the count of
+// hosts that failed (CT2-5) — a failed host is no longer silently dropped;
+// its failure is counted so the caller can surface it via
+// CollectorStats.Errors instead of a total remote wipeout looking identical
+// to a healthy zero-remote-hosts run.
+func (c *Collector) collectRemote(ctx context.Context) ([]ContainerProcess, int, error) {
 	if c.hostManager == nil {
-		return nil, nil
+		return nil, 0, nil
 	}
 
 	hosts := c.hostManager.ListHosts()
 	var allProcesses []ContainerProcess
+	var failed int
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -186,6 +206,10 @@ func (c *Collector) collectRemote(ctx context.Context) ([]ContainerProcess, erro
 
 			processes, err := c.collectFromHost(ctx, host)
 			if err != nil {
+				log.Printf("ctop: collectRemote: host %s: %v", host.Name, err)
+				mu.Lock()
+				failed++
+				mu.Unlock()
 				return
 			}
 
@@ -196,7 +220,7 @@ func (c *Collector) collectRemote(ctx context.Context) ([]ContainerProcess, erro
 	}
 
 	wg.Wait()
-	return allProcesses, nil
+	return allProcesses, failed, nil
 }
 
 func (c *Collector) collectFromHost(ctx context.Context, host remote.RemoteHost) ([]ContainerProcess, error) {
@@ -209,7 +233,7 @@ func (c *Collector) collectFromHost(ctx context.Context, host remote.RemoteHost)
 		rt = "podman"
 	}
 
-	cmd := fmt.Sprintf("%s ps -a --format json", rt)
+	cmd := buildRemoteListCommand(rt)
 	result, err := c.sshExecutor.Execute(ctx, host, cmd)
 	if err != nil {
 		cmd = "docker ps -a --format json"
@@ -229,17 +253,38 @@ func (c *Collector) collectFromHost(ctx context.Context, host remote.RemoteHost)
 		containers[i].Host = host.Name
 		containers[i].Location = "remote:" + host.Name
 
-		statsCmd := fmt.Sprintf("%s stats --no-stream --format json %s", rt, containers[i].ID)
-		statsResult, err := c.sshExecutor.Execute(ctx, host, statsCmd)
-		if err == nil {
-			stats := parseContainerStats([]byte(statsResult.Stdout))
-			if stats != nil {
-				containers[i].CPUPercent = stats.CPUPercent
-				containers[i].MemoryUsage = stats.MemoryUsage
-				containers[i].MemoryLimit = stats.MemoryLimit
-				containers[i].MemoryPercent = stats.MemoryPercent
-			}
+		// CT3-9: containers[i].ID is dynamic data parsed from the PRIOR
+		// `ps -a --format json` command's output (see parseContainerList),
+		// not static configuration. buildRemoteStatsCommand refuses to
+		// interpolate anything outside the safe container-ID charset into a
+		// string that is about to be handed to sshExecutor.Execute — which
+		// runs it through a REMOTE SHELL with no argv-style escaping,
+		// unlike the LOCAL path (getContainerStats above), which passes the
+		// id as a discrete exec.CommandContext argv element (no shell
+		// involved at all).
+		statsCmd, cmdErr := buildRemoteStatsCommand(rt, containers[i].ID)
+		if cmdErr != nil {
+			log.Printf("ctop: collectFromHost: host %s: %v", host.Name, cmdErr)
+			containers[i].StatsUnavailable = true
+			continue
 		}
+
+		statsResult, err := c.sshExecutor.Execute(ctx, host, statsCmd)
+		if err != nil {
+			// CT3-7: distinguish a failed remote stats call from a
+			// genuinely-idle 0% container (see collectLocal above).
+			containers[i].StatsUnavailable = true
+			continue
+		}
+		stats := parseContainerStats([]byte(statsResult.Stdout))
+		if stats == nil {
+			containers[i].StatsUnavailable = true
+			continue
+		}
+		containers[i].CPUPercent = stats.CPUPercent
+		containers[i].MemoryUsage = stats.MemoryUsage
+		containers[i].MemoryLimit = stats.MemoryLimit
+		containers[i].MemoryPercent = stats.MemoryPercent
 	}
 
 	return containers, nil
@@ -253,94 +298,51 @@ func (c *Collector) getContainerStats(ctx context.Context, rt, id string) (*Cont
 	return parseContainerStats(out), nil
 }
 
-func parseContainerList(data []byte, rt, location string) ([]ContainerProcess, error) {
-	var containers []dockerContainerJSON
+// containerIDSafePattern is the safe charset for docker/podman container IDs
+// (hex digests and short IDs alike): letters, digits, underscore, dot, and
+// hyphen. Anything outside this set is refused by buildRemoteStatsCommand
+// rather than interpolated into a remote-shell command string (CT3-9).
+var containerIDSafePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
-	if err := json.Unmarshal(data, &containers); err != nil {
-		var single dockerContainerJSON
-		if err := json.Unmarshal(data, &single); err != nil {
-			return nil, fmt.Errorf("parsing container list: %w", err)
-		}
-		containers = []dockerContainerJSON{single}
-	}
-
-	result := make([]ContainerProcess, len(containers))
-	for i, c := range containers {
-		uptime := ""
-		if !c.State.StartedAt.IsZero() {
-			uptime = formatUptime(time.Since(c.State.StartedAt))
-		}
-
-		host := "local"
-		if strings.HasPrefix(location, "remote:") {
-			host = strings.TrimPrefix(location, "remote:")
-		}
-
-		result[i] = ContainerProcess{
-			ID:        shortenID(c.ID),
-			Name:      extractName(c.Names),
-			Image:     c.Image,
-			Runtime:   rt,
-			Host:      host,
-			Location:  location,
-			State:     c.State.Status,
-			Status:    c.State.String,
-			Created:   c.Created,
-			StartedAt: c.State.StartedAt,
-			Uptime:    uptime,
-			Labels:    c.Labels,
-			Ports:     extractPorts(c.Ports),
-		}
-	}
-
-	return result, nil
+// shellQuote wraps s in single quotes so the REMOTE login shell (which
+// sshExecutor.Execute hands the command string to, unlike the argv-based LOCAL
+// path that passes rt as a discrete exec.CommandContext argv[0]) treats every
+// byte of s literally. rt = host.Runtime is an unvalidated
+// CONTAINERS_REMOTE_HOST_N_RUNTIME env-config value; a value like
+// "docker;evilcmd" would inject a second remote command (CT3-ARGSWEEP,
+// §11.4.108). Single-quoting is the canonical POSIX neutralisation ('\” splice
+// for an embedded quote); it is functionally non-breaking because the remote
+// shell strips the quotes, so 'docker'/'podman' resolve identically.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-func parseContainerStats(data []byte) *ContainerProcess {
-	var stats dockerStatsJSON
-	if err := json.Unmarshal(data, &stats); err != nil {
-		return nil
-	}
-
-	return &ContainerProcess{
-		CPUPercent:    parsePercent(stats.CPUPerc),
-		MemoryUsage:   parseMemoryBytes(stats.MemUsage),
-		MemoryLimit:   parseMemoryLimit(stats.MemUsage),
-		MemoryPercent: parsePercent(stats.MemPerc),
-		NetworkRx:     parseNetIO(stats.NetIO, true),
-		NetworkTx:     parseNetIO(stats.NetIO, false),
-		BlockRead:     parseBlockIO(stats.BlockIO, true),
-		BlockWrite:    parseBlockIO(stats.BlockIO, false),
-		PIDs:          parsePIDs(stats.PIDs),
-	}
+// buildRemoteListCommand builds the `<runtime> ps -a --format json` command
+// handed to sshExecutor.Execute (remote shell, NO argv escaping). rt is
+// unvalidated host-config and MUST be shell quoted — leaving it raw was the
+// CT3-ARGSWEEP §11.4.108 injection sibling of buildRemoteStatsCommand's
+// (already-validated) id. Pure function so the built string is unit testable
+// without a live executor (§11.4.115).
+func buildRemoteListCommand(rt string) string {
+	return fmt.Sprintf("%s ps -a --format json", shellQuote(rt))
 }
 
-type dockerContainerJSON struct {
-	ID      string    `json:"Id"`
-	Names   []string  `json:"Names"`
-	Image   string    `json:"Image"`
-	Created time.Time `json:"Created"`
-	State   struct {
-		Status    string    `json:"Status"`
-		String    string    `json:"String"`
-		StartedAt time.Time `json:"StartedAt"`
-	} `json:"State"`
-	Labels map[string]string `json:"Labels"`
-	Ports  []struct {
-		IP          string `json:"IP"`
-		PrivatePort int    `json:"PrivatePort"`
-		PublicPort  int    `json:"PublicPort"`
-		Type        string `json:"Type"`
-	} `json:"Ports"`
-}
-
-type dockerStatsJSON struct {
-	CPUPerc  string `json:"CPUPerc"`
-	MemUsage string `json:"MemUsage"`
-	MemPerc  string `json:"MemPerc"`
-	NetIO    string `json:"NetIO"`
-	BlockIO  string `json:"BlockIO"`
-	PIDs     string `json:"PIDs"`
+// buildRemoteStatsCommand builds the `<runtime> stats --no-stream --format
+// json <id>` command line later handed to sshExecutor.Execute, which runs it
+// through the remote user's shell with NO argv-style escaping (CT3-9). The
+// id originates from a PRIOR command's parsed JSON output — dynamic data,
+// not static configuration — so it MUST be validated against the safe
+// container-ID charset before interpolation; an id outside that charset is
+// refused rather than silently escaped, since a rejected stats call is
+// vastly preferable to a shell-injection-shaped string ever reaching a
+// remote shell. rt (host.Runtime, unvalidated env config) is shell quoted for
+// the same reason (CT3-ARGSWEEP, §11.4.108) — the CT3-9 fix validated the id
+// but left rt raw.
+func buildRemoteStatsCommand(rt, id string) (string, error) {
+	if !containerIDSafePattern.MatchString(id) {
+		return "", fmt.Errorf("refusing to build remote stats command: unsafe container id %q", id)
+	}
+	return fmt.Sprintf("%s stats --no-stream --format json %s", shellQuote(rt), id), nil
 }
 
 func shortenID(id string) string {
@@ -357,21 +359,6 @@ func extractName(names []string) string {
 	name := names[0]
 	name = strings.TrimPrefix(name, "/")
 	return name
-}
-
-func extractPorts(ports []struct {
-	IP          string `json:"IP"`
-	PrivatePort int    `json:"PrivatePort"`
-	PublicPort  int    `json:"PublicPort"`
-	Type        string `json:"Type"`
-}) []string {
-	var result []string
-	for _, p := range ports {
-		if p.PublicPort > 0 {
-			result = append(result, fmt.Sprintf("%d/%s", p.PublicPort, p.Type))
-		}
-	}
-	return result
 }
 
 func parsePercent(s string) float64 {
@@ -456,6 +443,12 @@ func parsePIDs(s string) int {
 }
 
 func formatUptime(d time.Duration) string {
+	if d < 0 {
+		// CT3-11: clock skew (StartedAt slightly ahead of local wall-clock)
+		// otherwise yields a negative duration and renders a nonsensical
+		// "-5m" uptime; clamp to zero ("just started") instead.
+		d = 0
+	}
 	days := int(d.Hours()) / 24
 	hours := int(d.Hours()) % 24
 	mins := int(d.Minutes()) % 60

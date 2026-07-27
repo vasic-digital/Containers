@@ -83,15 +83,15 @@ func (e *EndpointEntry) toServiceEndpoint() ServiceEndpoint {
 	if e.Enabled != nil {
 		enabled = *e.Enabled
 	}
-	timeout := 10 * time.Second
+	timeout := defaultTimeout
 	if e.TimeoutSeconds > 0 {
 		timeout = time.Duration(e.TimeoutSeconds) * time.Second
 	}
-	retryCount := 3
+	retryCount := defaultRetryCount
 	if e.RetryCount > 0 {
 		retryCount = e.RetryCount
 	}
-	healthType := "http"
+	healthType := defaultHealthType
 	if e.HealthType != "" {
 		healthType = e.HealthType
 	}

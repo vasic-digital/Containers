@@ -3,11 +3,37 @@ package remote
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
 	"digital.vasic.containers/pkg/logging"
 )
+
+// composeCandidate is one entry in the priority-ordered list of compose
+// commands the detector probes.
+type composeCandidate struct {
+	binary     string
+	subcommand string
+	name       string
+}
+
+// pipxPodmanComposePath resolves the CURRENT process's real home directory
+// (via os.UserHomeDir(), which correctly handles Linux `/home/<user>`, macOS
+// `/Users/<user>`, and Windows `%USERPROFILE%`) and returns the path a pipx
+// install of podman-compose would land at: `~/.local/bin/podman-compose`.
+//
+// Returns "" when the home directory cannot be determined (e.g. $HOME unset)
+// so the caller can skip this candidate entirely rather than probing a
+// malformed path -- no guessing, per the project's no-hardcoding mandate.
+func pipxPodmanComposePath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".local", "bin", "podman-compose")
+}
 
 // ComposeCommand represents a detected compose command on a remote host.
 type ComposeCommand struct {
@@ -67,18 +93,22 @@ func (d *ComposeDetector) Detect(ctx context.Context, host RemoteHost) (*Compose
 
 	// Try each compose command in priority order
 	// Priority: ~/.local/bin/podman-compose > podman-compose > docker compose > podman compose > docker-compose
-	// ~/.local/bin/podman-compose is checked first for pipx installations
-	candidates := []struct {
-		binary     string
-		subcommand string
-		name       string
-	}{
-		{"/home/milosvasic/.local/bin/podman-compose", "", "podman-compose"}, // pipx installed podman-compose (highest priority)
-		{"podman-compose", "", "podman-compose"},                             // Native podman-compose (best for Podman)
-		{"docker", "compose", "docker compose"},                              // Docker v2 plugin
-		{"podman", "compose", "podman compose"},                              // Podman's wrapper (often delegates to docker-compose v1)
-		{"docker-compose", "", "docker-compose"},                             // Docker-compose v1 standalone
+	// ~/.local/bin/podman-compose is checked first for pipx installations,
+	// resolved to the CURRENT user's real home directory (never a hardcoded
+	// absolute path) so this candidate matches on every machine/user/OS.
+	candidates := make([]composeCandidate, 0, 5)
+	if pipxPath := pipxPodmanComposePath(); pipxPath != "" {
+		candidates = append(candidates, composeCandidate{
+			binary: pipxPath, // pipx installed podman-compose (highest priority)
+			name:   "podman-compose",
+		})
 	}
+	candidates = append(candidates,
+		composeCandidate{"podman-compose", "", "podman-compose"}, // Native podman-compose (best for Podman)
+		composeCandidate{"docker", "compose", "docker compose"},  // Docker v2 plugin
+		composeCandidate{"podman", "compose", "podman compose"},  // Podman's wrapper (often delegates to docker-compose v1)
+		composeCandidate{"docker-compose", "", "docker-compose"}, // Docker-compose v1 standalone
+	)
 
 	for _, candidate := range candidates {
 		cmd := &ComposeCommand{

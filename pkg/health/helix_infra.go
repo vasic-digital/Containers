@@ -3,8 +3,12 @@ package health
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -13,6 +17,15 @@ type HealthStatus struct {
 	Healthy bool
 	Message string
 }
+
+// defaultInfraCheckTimeout is the fallback per-attempt timeout applied by
+// checkOnce when a HelixServiceHealthChecker is constructed with an unset
+// (<=0) Timeout. It mirrors defaultTCPTimeout / defaultHTTPTimeout /
+// defaultGRPCTimeout in the sibling checkers so the whole pkg/health package
+// shares one "timeout <= 0 means use a default" convention. Without it,
+// context.WithTimeout(ctx, 0) is immediately-expired and every check against
+// a LIVE target fails with a false "deadline exceeded" (Wave-20 HEALTH2-1).
+const defaultInfraCheckTimeout = 5 * time.Second
 
 // HelixServiceHealthChecker implements HealthChecker for a Helix infrastructure service.
 type HelixServiceHealthChecker struct {
@@ -28,31 +41,68 @@ type HelixServiceHealthChecker struct {
 // NewHelixServiceHealthChecker creates a health checker for a named Helix service.
 func NewHelixServiceHealthChecker(serviceName string) *HelixServiceHealthChecker {
 	configs := map[string]*HelixServiceHealthChecker{
-		"postgres-primary":     {ServiceName: "postgres-primary", CheckType: "tcp", Host: "localhost", Port: 5432, Timeout: 5 * time.Second, Retries: 5},
-		"postgres-replica":     {ServiceName: "postgres-replica", CheckType: "tcp", Host: "localhost", Port: 5433, Timeout: 5 * time.Second, Retries: 5},
-		"redis-master-1":       {ServiceName: "redis-master-1", CheckType: "tcp", Host: "localhost", Port: 6379, Timeout: 3 * time.Second, Retries: 5},
-		"redis-master-2":       {ServiceName: "redis-master-2", CheckType: "tcp", Host: "localhost", Port: 6380, Timeout: 3 * time.Second, Retries: 5},
-		"redis-master-3":       {ServiceName: "redis-master-3", CheckType: "tcp", Host: "localhost", Port: 6381, Timeout: 3 * time.Second, Retries: 5},
-		"redis-replica-1":      {ServiceName: "redis-replica-1", CheckType: "tcp", Host: "localhost", Port: 6390, Timeout: 3 * time.Second, Retries: 5},
-		"redis-replica-2":      {ServiceName: "redis-replica-2", CheckType: "tcp", Host: "localhost", Port: 6391, Timeout: 3 * time.Second, Retries: 5},
-		"redis-replica-3":      {ServiceName: "redis-replica-3", CheckType: "tcp", Host: "localhost", Port: 6392, Timeout: 3 * time.Second, Retries: 5},
-		"etcd-1":               {ServiceName: "etcd-1", CheckType: "http", Host: "localhost", Port: 2379, Path: "/health", Timeout: 3 * time.Second, Retries: 5},
-		"etcd-2":               {ServiceName: "etcd-2", CheckType: "http", Host: "localhost", Port: 2381, Path: "/health", Timeout: 3 * time.Second, Retries: 5},
-		"etcd-3":               {ServiceName: "etcd-3", CheckType: "http", Host: "localhost", Port: 2382, Path: "/health", Timeout: 3 * time.Second, Retries: 5},
-		"nats":                 {ServiceName: "nats", CheckType: "http", Host: "localhost", Port: 8222, Path: "/healthz", Timeout: 3 * time.Second, Retries: 5},
-		"kafka-1":              {ServiceName: "kafka-1", CheckType: "tcp", Host: "localhost", Port: 9092, Timeout: 5 * time.Second, Retries: 5},
-		"kafka-2":              {ServiceName: "kafka-2", CheckType: "tcp", Host: "localhost", Port: 9093, Timeout: 5 * time.Second, Retries: 5},
-		"kafka-3":              {ServiceName: "kafka-3", CheckType: "tcp", Host: "localhost", Port: 9094, Timeout: 5 * time.Second, Retries: 5},
-		"rabbitmq":             {ServiceName: "rabbitmq", CheckType: "http", Host: "localhost", Port: 15672, Path: "/api/health/checks/virtual-hosts", Timeout: 5 * time.Second, Retries: 5},
-		"prometheus":           {ServiceName: "prometheus", CheckType: "http", Host: "localhost", Port: 9090, Path: "/-/healthy", Timeout: 5 * time.Second, Retries: 5},
-		"grafana":              {ServiceName: "grafana", CheckType: "http", Host: "localhost", Port: 3000, Path: "/api/health", Timeout: 5 * time.Second, Retries: 5},
-		"jaeger":               {ServiceName: "jaeger", CheckType: "http", Host: "localhost", Port: 16686, Path: "/", Timeout: 5 * time.Second, Retries: 5},
-		"vault":                {ServiceName: "vault", CheckType: "http", Host: "localhost", Port: 8200, Path: "/v1/sys/health", Timeout: 5 * time.Second, Retries: 5},
+		"postgres-primary": {ServiceName: "postgres-primary", CheckType: "tcp", Host: "localhost", Port: 5432, Timeout: 5 * time.Second, Retries: 5},
+		"postgres-replica": {ServiceName: "postgres-replica", CheckType: "tcp", Host: "localhost", Port: 5433, Timeout: 5 * time.Second, Retries: 5},
+		"redis-master-1":   {ServiceName: "redis-master-1", CheckType: "tcp", Host: "localhost", Port: 6379, Timeout: 3 * time.Second, Retries: 5},
+		"redis-master-2":   {ServiceName: "redis-master-2", CheckType: "tcp", Host: "localhost", Port: 6380, Timeout: 3 * time.Second, Retries: 5},
+		"redis-master-3":   {ServiceName: "redis-master-3", CheckType: "tcp", Host: "localhost", Port: 6381, Timeout: 3 * time.Second, Retries: 5},
+		"redis-replica-1":  {ServiceName: "redis-replica-1", CheckType: "tcp", Host: "localhost", Port: 6390, Timeout: 3 * time.Second, Retries: 5},
+		"redis-replica-2":  {ServiceName: "redis-replica-2", CheckType: "tcp", Host: "localhost", Port: 6391, Timeout: 3 * time.Second, Retries: 5},
+		"redis-replica-3":  {ServiceName: "redis-replica-3", CheckType: "tcp", Host: "localhost", Port: 6392, Timeout: 3 * time.Second, Retries: 5},
+		"etcd-1":           {ServiceName: "etcd-1", CheckType: "http", Host: "localhost", Port: 2379, Path: "/health", Timeout: 3 * time.Second, Retries: 5},
+		"etcd-2":           {ServiceName: "etcd-2", CheckType: "http", Host: "localhost", Port: 2381, Path: "/health", Timeout: 3 * time.Second, Retries: 5},
+		"etcd-3":           {ServiceName: "etcd-3", CheckType: "http", Host: "localhost", Port: 2382, Path: "/health", Timeout: 3 * time.Second, Retries: 5},
+		"nats":             {ServiceName: "nats", CheckType: "http", Host: "localhost", Port: 8222, Path: "/healthz", Timeout: 3 * time.Second, Retries: 5},
+		"kafka-1":          {ServiceName: "kafka-1", CheckType: "tcp", Host: "localhost", Port: 9092, Timeout: 5 * time.Second, Retries: 5},
+		"kafka-2":          {ServiceName: "kafka-2", CheckType: "tcp", Host: "localhost", Port: 9093, Timeout: 5 * time.Second, Retries: 5},
+		"kafka-3":          {ServiceName: "kafka-3", CheckType: "tcp", Host: "localhost", Port: 9094, Timeout: 5 * time.Second, Retries: 5},
+		"rabbitmq":         {ServiceName: "rabbitmq", CheckType: "http", Host: "localhost", Port: 15672, Path: "/api/health/checks/virtual-hosts", Timeout: 5 * time.Second, Retries: 5},
+		"prometheus":       {ServiceName: "prometheus", CheckType: "http", Host: "localhost", Port: 9090, Path: "/-/healthy", Timeout: 5 * time.Second, Retries: 5},
+		"grafana":          {ServiceName: "grafana", CheckType: "http", Host: "localhost", Port: 3000, Path: "/api/health", Timeout: 5 * time.Second, Retries: 5},
+		"jaeger":           {ServiceName: "jaeger", CheckType: "http", Host: "localhost", Port: 16686, Path: "/", Timeout: 5 * time.Second, Retries: 5},
+		"vault":            {ServiceName: "vault", CheckType: "http", Host: "localhost", Port: 8200, Path: "/v1/sys/health", Timeout: 5 * time.Second, Retries: 5},
 	}
-	if c, ok := configs[serviceName]; ok {
-		return c
+	c, ok := configs[serviceName]
+	if !ok {
+		return nil
 	}
-	return nil
+	applyHelixServiceEnvOverrides(c)
+	return c
+}
+
+// helixHealthEnvPrefix namespaces the per-service Host/Port/Path override
+// environment variables (Wave-20 HE-4, §6.R). No connection literal is
+// hardcoded here; the map above supplies documented FALLBACK DEFAULTS so
+// existing callers keep compiling and behaving identically when the
+// corresponding env var is unset — the override only takes effect when an
+// operator/deployment explicitly sets it.
+const helixHealthEnvPrefix = "HELIX_HEALTH_"
+
+// helixServiceEnvKey builds the env-var name for a given service + field
+// suffix, e.g. service "postgres-primary" + suffix "HOST" ->
+// "HELIX_HEALTH_POSTGRES_PRIMARY_HOST".
+func helixServiceEnvKey(serviceName, suffix string) string {
+	key := strings.ToUpper(strings.ReplaceAll(serviceName, "-", "_"))
+	return helixHealthEnvPrefix + key + "_" + suffix
+}
+
+// applyHelixServiceEnvOverrides overlays Host/Port/Path with values from
+// the service's namespaced env vars, when set and valid. The struct's
+// literal defaults (from the configs map) are left untouched — and thus
+// still in full effect — whenever the corresponding env var is absent,
+// empty, or (for Port) not a valid positive integer.
+func applyHelixServiceEnvOverrides(c *HelixServiceHealthChecker) {
+	if v := os.Getenv(helixServiceEnvKey(c.ServiceName, "HOST")); v != "" {
+		c.Host = v
+	}
+	if v := os.Getenv(helixServiceEnvKey(c.ServiceName, "PORT")); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 {
+			c.Port = p
+		}
+	}
+	if v := os.Getenv(helixServiceEnvKey(c.ServiceName, "PATH")); v != "" {
+		c.Path = v
+	}
 }
 
 // Check performs the health check.
@@ -100,14 +150,30 @@ func (h *HelixServiceHealthChecker) Check(ctx context.Context) (HealthStatus, er
 }
 
 func (h *HelixServiceHealthChecker) checkOnce(ctx context.Context) (HealthStatus, error) {
-	ctx, cancel := context.WithTimeout(ctx, h.Timeout)
+	// An unset (<=0) Timeout must fall back to a package default — every
+	// sibling checker (CheckTCP / CheckHTTP / DefaultChecker.Check) applies
+	// this convention. Without it, context.WithTimeout(ctx, 0) is
+	// immediately-expired, so the dial / HTTP request against a LIVE target
+	// fails with a false "deadline exceeded" and a genuinely-healthy service
+	// is reported UNHEALTHY — a §11.4.1 FAIL-bluff (Wave-20 HEALTH2-1).
+	timeout := h.Timeout
+	if timeout <= 0 {
+		timeout = defaultInfraCheckTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	addr := net.JoinHostPort(h.Host, fmt.Sprintf("%d", h.Port))
 
 	switch h.CheckType {
 	case "tcp":
-		conn, err := net.DialTimeout("tcp", addr, h.Timeout)
+		// Use a Dialer bound to ctx (not net.DialTimeout, which takes no
+		// context and cannot observe cancellation) so the ctx above
+		// (already timeout-bounded, and cancellable by the caller) can
+		// abort the dial promptly instead of always blocking for the
+		// full timeout (Wave-20 HE-1).
+		dialer := &net.Dialer{Timeout: timeout}
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			return HealthStatus{Healthy: false, Message: err.Error()}, err
 		}
@@ -120,12 +186,27 @@ func (h *HelixServiceHealthChecker) checkOnce(ctx context.Context) (HealthStatus
 		if err != nil {
 			return HealthStatus{Healthy: false, Message: err.Error()}, err
 		}
-		client := &http.Client{Timeout: h.Timeout}
+		client := &http.Client{
+			Timeout: timeout,
+			// Do not transparently follow redirects (HE-3): the message
+			// below reports the status as if it came from addr/url — a
+			// silently-followed redirect could hand back a DIFFERENT
+			// server's status code under the original target's name.
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			return HealthStatus{Healthy: false, Message: err.Error()}, err
 		}
-		defer resp.Body.Close()
+		defer func() {
+			// Drain (bounded) before Close so the shared
+			// http.DefaultTransport can pool/reuse the underlying
+			// connection (HE-2) instead of a fresh dial per check.
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes))
+			_ = resp.Body.Close()
+		}()
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return HealthStatus{Healthy: true, Message: fmt.Sprintf("http %d", resp.StatusCode)}, nil
 		}

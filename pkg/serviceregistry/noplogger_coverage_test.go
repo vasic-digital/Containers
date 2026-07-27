@@ -19,7 +19,7 @@ func TestNopLogger_AllMethods(t *testing.T) {
 
 // TestWithLabels_NilMap verifies WithLabels with a nil map does nothing bad.
 func TestWithLabels_NilMap(t *testing.T) {
-	r := New(WithRegistryDir(""))
+	r := New(WithRegistryDir(t.TempDir()))
 	// A nil label map should not panic.
 	err := r.Register("svc-nil-labels", 9999, WithLabels(nil))
 	assert.NoError(t, err)
@@ -76,7 +76,7 @@ func TestLoadFromDisk_UnmarshalFail(t *testing.T) {
 // TestFindAvailablePort_WithLogger exercises FindAvailablePort logging via
 // the logger for complete line coverage.
 func TestFindAvailablePort_FindsPort(t *testing.T) {
-	r := New(WithRegistryDir(""))
+	r := New(WithRegistryDir(t.TempDir()))
 	port := r.FindAvailablePort(40000)
 	assert.GreaterOrEqual(t, port, 40000)
 	assert.Less(t, port, 50000)

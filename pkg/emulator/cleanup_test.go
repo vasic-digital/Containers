@@ -3,6 +3,7 @@ package emulator
 import (
 	"context"
 	"errors"
+	"os"
 	"syscall"
 	"testing"
 
@@ -11,8 +12,9 @@ import (
 )
 
 type fakeProcWalker struct {
-	pids map[int]string
-	err  error
+	pids     map[int]string
+	cmdlines map[int][]string // pid -> argv (for the §11.4.174 -avd ownership gate)
+	err      error
 }
 
 func (f fakeProcWalker) PidComms() (map[int]string, error) {
@@ -22,15 +24,13 @@ func (f fakeProcWalker) PidComms() (map[int]string, error) {
 	return f.pids, nil
 }
 
-// PidCmdlines satisfies the extended procWalker interface (Group B).
-// The pre-Group-B Cleanup() tests only exercise PidComms(); returning
-// the same err here keeps error-propagation behaviour symmetric in case
-// future callers route through PidCmdlines.
+// PidCmdlines serves the argv fixtures the §11.4.174 ownership gate matches
+// against. Error is propagated symmetrically with PidComms.
 func (f fakeProcWalker) PidCmdlines() (map[int][]string, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
-	return nil, nil
+	return f.cmdlines, nil
 }
 
 type fakeKiller struct {
@@ -83,7 +83,7 @@ func TestCleanup_NoMatches(t *testing.T) {
 	}}
 	k := newFakeKiller()
 
-	report, err := cleanupWithDeps(context.Background(), w, k)
+	report, err := cleanupWithDeps(context.Background(), "helix_api_31", w, k)
 	require.NoError(t, err)
 	assert.Empty(t, report.Found)
 	assert.Empty(t, report.TerminatedTERM)
@@ -97,13 +97,18 @@ func TestCleanup_NoMatches(t *testing.T) {
 // the grace window (fakeKiller.Exists returns false after SIGTERM by
 // default), no SIGKILL needed.
 func TestCleanup_OneMatch_TerminatesOnSIGTERM(t *testing.T) {
-	w := fakeProcWalker{pids: map[int]string{
-		1234: "bash",
-		7777: "qemu-system-x86_64",
-	}}
+	w := fakeProcWalker{
+		pids: map[int]string{
+			1234: "bash",
+			7777: "qemu-system-x86_64",
+		},
+		cmdlines: map[int][]string{
+			7777: {"qemu-system-x86_64", "-avd", "helix_api_31", "-port", "5554"},
+		},
+	}
 	k := newFakeKiller()
 
-	report, err := cleanupWithDeps(context.Background(), w, k)
+	report, err := cleanupWithDeps(context.Background(), "helix_api_31", w, k)
 	require.NoError(t, err)
 	assert.Equal(t, []int{7777}, report.Found)
 	assert.Equal(t, []int{7777}, report.TerminatedTERM)
@@ -122,19 +127,78 @@ func TestCleanup_OneMatch_TerminatesOnSIGTERM(t *testing.T) {
 //
 // Reverted: yes.
 func TestCleanup_StrictPrefix(t *testing.T) {
-	w := fakeProcWalker{pids: map[int]string{
-		7777: "qemu-system-x86_64", // legitimate match
-		8888: "qemu-img",           // NOT a qemu-system process
-		9999: "qemu",               // NOT a qemu-system process
-	}}
+	w := fakeProcWalker{
+		pids: map[int]string{
+			7777: "qemu-system-x86_64", // legitimate match (OUR avd)
+			8888: "qemu-img",           // NOT a qemu-system process
+			9999: "qemu",               // NOT a qemu-system process
+		},
+		cmdlines: map[int][]string{
+			7777: {"qemu-system-x86_64", "-avd", "helix_api_31"},
+			8888: {"qemu-img", "-avd", "helix_api_31"}, // carries token but fails comm prefix
+			9999: {"qemu", "-avd", "helix_api_31"},
+		},
+	}
 	k := newFakeKiller()
 
-	report, err := cleanupWithDeps(context.Background(), w, k)
+	report, err := cleanupWithDeps(context.Background(), "helix_api_31", w, k)
 	require.NoError(t, err)
 	assert.Equal(t, []int{7777}, report.Found,
-		"STRICT prefix qemu-system- MUST NOT match qemu-img or qemu")
+		"STRICT prefix qemu-system- MUST NOT match qemu-img or qemu (even with the -avd token)")
 	assert.Empty(t, k.sent[8888])
 	assert.Empty(t, k.sent[9999])
+}
+
+// TestCleanup_OwnershipScopedToOurAVD is the §11.4.174 ownership guard
+// (§11.4.115 polarity via RED_MODE):
+//
+//	RED_MODE unset/1 (default) = GREEN guard on the FIXED code: ONLY the
+//	  qemu running OUR avd is reaped; a foreign qemu (different avd) gets NO
+//	  signal.
+//	RED_MODE=0 = reproduce the pre-fix comm-only defect (asserts BOTH the
+//	  ours + the foreign qemu are Found). This MUST FAIL on the fixed code
+//	  (which finds only ours), proving the GREEN flip comes from the fix;
+//	  it PASSES on the pre-fix comm-only matcher (which reaps both).
+func TestCleanup_OwnershipScopedToOurAVD(t *testing.T) {
+	redMode := os.Getenv("RED_MODE") != "0"
+	w := fakeProcWalker{
+		pids: map[int]string{
+			701: "qemu-system-x86_64", // OURS
+			702: "qemu-system-x86_64", // FOREIGN (different avd)
+		},
+		cmdlines: map[int][]string{
+			701: {"qemu-system-x86_64", "-avd", "helix_api_31", "-port", "5554"},
+			702: {"qemu-system-x86_64", "-avd", "someone_else", "-port", "5556"},
+		},
+	}
+	k := newFakeKiller()
+	report, err := cleanupWithDeps(context.Background(), "helix_api_31", w, k)
+	require.NoError(t, err)
+	if redMode {
+		assert.ElementsMatch(t, []int{701}, report.Found,
+			"only the qemu running OUR avd may be reaped (§11.4.174)")
+		assert.Empty(t, k.sent[702], "foreign qemu (different avd) MUST receive NO signal")
+	} else {
+		assert.ElementsMatch(t, []int{701, 702}, report.Found,
+			"RED: a comm-only matcher would reap the foreign qemu too")
+	}
+}
+
+// TestCleanup_EmptyAVDRefusesReap is the §11.4.174 refuse-guard: with no
+// ownership token, Cleanup reaps NOTHING even when qemu-system-* PIDs are
+// present — it never falls back to a host-wide name match.
+func TestCleanup_EmptyAVDRefusesReap(t *testing.T) {
+	w := fakeProcWalker{
+		pids: map[int]string{999: "qemu-system-x86_64"},
+		cmdlines: map[int][]string{
+			999: {"qemu-system-x86_64", "-avd", "whatever"},
+		},
+	}
+	k := newFakeKiller()
+	report, err := cleanupWithDeps(context.Background(), "", w, k)
+	require.NoError(t, err)
+	assert.Empty(t, report.Found, "empty avdName MUST refuse to reap (§11.4.174)")
+	assert.Empty(t, k.sent, "no signal may be sent when ownership cannot be established")
 }
 
 // TestCleanup_PropagatesProcReadErr confirms procWalker errors surface
@@ -143,7 +207,7 @@ func TestCleanup_PropagatesProcReadErr(t *testing.T) {
 	w := fakeProcWalker{err: errors.New("permission denied")}
 	k := newFakeKiller()
 
-	_, err := cleanupWithDeps(context.Background(), w, k)
+	_, err := cleanupWithDeps(context.Background(), "helix_api_31", w, k)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "permission denied")
 }
@@ -158,9 +222,14 @@ func TestCleanup_PropagatesProcReadErr(t *testing.T) {
 // Test fails: report.KilledKILL is empty when it should be []int{7777}.
 // Reverted: yes.
 func TestCleanup_StragglerRequiresSIGKILL(t *testing.T) {
-	w := fakeProcWalker{pids: map[int]string{
-		7777: "qemu-system-x86_64",
-	}}
+	w := fakeProcWalker{
+		pids: map[int]string{
+			7777: "qemu-system-x86_64",
+		},
+		cmdlines: map[int][]string{
+			7777: {"qemu-system-x86_64", "-avd", "helix_api_31"},
+		},
+	}
 	k := newFakeKiller()
 	k.aliveAfter[syscall.SIGTERM][7777] = true // survives SIGTERM grace window
 
@@ -169,7 +238,7 @@ func TestCleanup_StragglerRequiresSIGKILL(t *testing.T) {
 	// short-circuit faster). The fake's Exists() returns true for
 	// 7777 throughout the SIGTERM-poll window, so the loop exhausts
 	// its 5-second deadline naturally. Acceptable for a unit test.
-	report, err := cleanupWithDeps(context.Background(), w, k)
+	report, err := cleanupWithDeps(context.Background(), "helix_api_31", w, k)
 	require.NoError(t, err)
 	assert.Equal(t, []int{7777}, report.Found)
 	assert.Empty(t, report.TerminatedTERM,

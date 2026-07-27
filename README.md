@@ -261,7 +261,7 @@ ctop --once
 ctop --json
 
 # Filter by host
-ctop --host thinker
+ctop --host gpu-node-1
 
 # Sort by memory
 ctop --sort mem

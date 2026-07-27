@@ -2,7 +2,7 @@
 
 ## INHERITED FROM constitution/AGENTS.md
 
-All rules in `constitution/AGENTS.md` (and the `constitution/Constitution.md` it references) apply unconditionally. This file's rules below extend them — they MUST NOT weaken any inherited rule. See parent root `CLAUDE.md` §6.AD for the Lava-specific incorporation context (29th §6.L cycle, 2026-05-14) and §6.AD-debt for the implementation-gap inventory. Use `constitution/find_constitution.sh` from the parent project root to resolve the absolute path of the submodule from any nested location.
+All rules in `constitution/AGENTS.md` (and the `constitution/Constitution.md` it references) apply unconditionally. This file's rules below extend them — they MUST NOT weaken any inherited rule. Use `constitution/find_constitution.sh` from the parent project root to resolve the absolute path of the submodule from any nested location.
 
 ## INHERITED FROM the Helix Constitution
 
@@ -45,6 +45,20 @@ Canonical reference: https://github.com/HelixDevelopment/HelixConstitution
 | `envconfig` | `pkg/envconfig/` | Environment configuration: `CONTAINERS_REMOTE_*` env var parsing, `.env` file loading, numbered host definitions (`HOST_N_NAME/ADDRESS/PORT/...`), template generation. |
 | `distribution` | `pkg/distribution/` | Distribution orchestrator: `Distributor` composing scheduler + remote + network + volume. 7-phase workflow (probe → schedule → volumes → deploy → tunnels → health → events). Failover detection and rescheduling. |
 | `ctop` | `pkg/ctop/` | Container monitoring: top/htop-style display for local and remote containers. `Collector` gathers container data. `Display` provides interactive TUI, snapshot, and JSON output. Sorting, filtering, color-coded resource usage. |
+| `applesim` | `pkg/applesim/` | Apple iOS/iPadOS/tvOS/watchOS Simulator detection and lifecycle control (list, boot, install, launch, record, shutdown) by wrapping the host-native `xcrun simctl` toolchain. macOS-host-only (CoreSimulator cannot run inside a Linux container); sibling of `pkg/emulator` (Android-in-container) and `pkg/genymotion` (Android-in-VM). |
+| `brokertest` | `pkg/brokertest/` | Provisions ephemeral message-broker containers (etcd, Postgres, ...) for integration testing, built entirely on the `pkg/runtime` abstraction for runtime selection and lifecycle; shells the runtime CLI only for the single "run a new container from an image" step the interface doesn't expose. |
+| `cache` | `pkg/cache/` | Content-addressable store for image artifacts (qcow2 for VMs, Android system-images for emulators). SHA-256 verify-on-fetch rejects a downloaded image whose computed hash doesn't match its manifest entry. |
+| `crossbuild` | `pkg/crossbuild/` | Cross-platform binary builds inside container-bound or QEMU-bound build environments (Wine + JDK/Gradle for Windows `.msi`, Linux containers for `.deb`/`.rpm`, Apple container backend). Callers submit a minimal `BuildRequest`; the host-platform decision is internal. |
+| `cuttlefish` | `pkg/cuttlefish/` | Thin lifecycle wrapper (boot/health/teardown) for Google's Cuttlefish (`cvd`) virtual-Android device, run as a rootful + privileged container, exercising the real Android A/B `update_engine` + AVB/dm-verity + auto-rollback OTA apply path that the SDK emulator does not. |
+| `egress` | `pkg/egress/` | VPN-host egress routing and diagnosis: establishes a dynamic SSH SOCKS5 tunnel (`ssh -D ... -N <vpnhost>`) to reach upstreams that are network-level blocked from the local/datacenter host, and verifies the routing actually changes the observed egress IP. |
+| `emulator` | `pkg/emulator/` | Multi-target emulator orchestration for the container ecosystem; first supported target is Android (QEMU-backed via the SDK emulator), with non-Android/QEMU targets on the roadmap. |
+| `genymotion` | `pkg/genymotion/` | Detection and lifecycle control of Genymotion Desktop Android virtual devices (VM-based via VirtualBox/QEMU/Hypervisor.framework) through the `gmtool` CLI, macOS + Linux portable. |
+| `i18n` | `pkg/i18n/` | Defines the `Translator` contract for containers' user-facing error messages, status descriptions, and operator-visible text, so string literals can be externalized instead of hardcoded; imports nothing from any consuming project. |
+| `lazyservice` | `pkg/lazyservice/` | `LazyOrchestrator`: dependency-ordered service startup, alternative-service fallback, stop/stop-all bookkeeping, status mapping, and filter queries (`ListServices`/`ListByCategory`/`ListFreeServices`). |
+| `policy` | `pkg/policy/` | Resource-cap policy (`mem_limit`/`memswap_limit`/`pids_limit`/`oom_score_adj`) that keeps container stacks from exhausting host memory; the Go counterpart of `scripts/resource-policy/policy.yaml` (`VerifyAgainstYAML` keeps both in sync). |
+| `remoteexec` | `pkg/remoteexec/` | Durable remote (or local) execution of long-running jobs (QA matrices, builds, deploys) that survive the launching SSH/login session ending, via `loginctl enable-linger` + `systemd-run --user --unit=X --collect`. |
+| `serviceregistry` | `pkg/serviceregistry/` | Disk-persisted `ServiceRegistry`: register/discover services by name with host/port/protocol/health metadata, port allocation (`FindAvailablePort`), health tracking, and a process-wide `Global()` singleton. |
+| `vm` | `pkg/vm/` | QEMU full-system virtual machine orchestration; sibling of `pkg/emulator` sharing `pkg/cache` for image artifacts. API mirrors `pkg/emulator` (Boot/WaitForReady/Upload/Run/Download/Teardown + `MatrixRunner`). |
 
 ## Dependency Graph
 
@@ -377,3 +391,24 @@ CONTAINERS_REMOTE_HOST_1_LABELS=gpu=true,arch=amd64
 **Last Updated**: February 22, 2026
 **Version**: 2.1.0
 **Status**: Production Ready
+
+## Inherited universal covenant anchors (from HelixConstitution)
+
+This module inherits the full universal covenant from the Helix Constitution
+(https://github.com/HelixDevelopment/HelixConstitution). The anchors below apply
+directly — they are UNIVERSAL and project-agnostic (no consuming-project context,
+per §11.4.28), so this decoupled module carries them by reference to the
+constitution submodule's `Constitution.md`:
+
+- §11.4.66 — Blocker-resolution interactive-clarification mandate. When a blocker
+  cannot be resolved from evidence, ask a precise clarifying question rather than
+  guess. [full → constitution `Constitution.md` §11.4.66]
+- §11.4.67 — Shell-script target-shell-parseability mandate. Every shell script
+  MUST parse clean under its declared target shell (`sh -n` / `bash -n`).
+  [full → constitution `Constitution.md` §11.4.67]
+- §11.4.69 — Universal sink-side positive-evidence taxonomy. Every user-visible
+  feature PASS cites a captured-evidence artefact matching the taxonomy shape.
+  [full → constitution `Constitution.md` §11.4.69]
+- §11.4.85 — Stress + chaos test mandate. Every fix ships full-automation stress
+  AND chaos tests with captured-evidence proofs. [full → constitution
+  `Constitution.md` §11.4.85]

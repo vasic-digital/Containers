@@ -94,7 +94,7 @@ func (l *LXDRuntime) Status(ctx context.Context, id string) (*ContainerStatus, e
 	if err != nil {
 		return nil, fmt.Errorf("lxc list %s: %w", id, err)
 	}
-	return parseLXDStatus(out)
+	return parseLXDStatus(out, id)
 }
 
 type lxdContainerJSON struct {
@@ -134,16 +134,21 @@ type lxdStateJSON struct {
 	Pid int `json:"pid"`
 }
 
-func parseLXDStatus(data []byte) (*ContainerStatus, error) {
+// parseLXDStatus selects the container whose name EXACTLY matches id. `lxc
+// list <id>` is a substring/partial filter, so it can return several
+// containers (e.g. "web" also matches "web-staging" and "webapp"); taking
+// containers[0] blindly would report a DIFFERENT container's status than the
+// one asked for (§11.4.111 — resolve by stable name, never by loose match).
+func parseLXDStatus(data []byte, id string) (*ContainerStatus, error) {
 	var containers []lxdContainerJSON
 	if err := json.Unmarshal(data, &containers); err != nil {
 		return nil, fmt.Errorf("parsing lxc list output: %w", err)
 	}
-	if len(containers) == 0 {
-		return nil, fmt.Errorf("no container found")
-	}
 
-	c := containers[0]
+	c, ok := findLXDByName(containers, id)
+	if !ok {
+		return nil, fmt.Errorf("no container found named %q", id)
+	}
 	state := mapLXDStatusToState(c.Status, c.StatusCode)
 
 	var startedAt time.Time
@@ -158,6 +163,18 @@ func parseLXDStatus(data []byte) (*ContainerStatus, error) {
 		Health:    c.Status,
 		StartedAt: startedAt,
 	}, nil
+}
+
+// findLXDByName returns the container whose name exactly equals id.
+func findLXDByName(
+	containers []lxdContainerJSON, id string,
+) (lxdContainerJSON, bool) {
+	for _, c := range containers {
+		if c.Name == id {
+			return c, true
+		}
+	}
+	return lxdContainerJSON{}, false
 }
 
 func mapLXDStatusToState(status string, code int) ContainerState {

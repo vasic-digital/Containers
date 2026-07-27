@@ -65,16 +65,16 @@ func (s *stringSlice) Set(v string) error {
 
 func main() {
 	var (
-		flagEnv       = flag.String("env", "", "Path to env file holding CONTAINERS_REMOTE_HOST_<N>_* (required)")
-		flagHostIndex = flag.Int("host-index", 1, "Which CONTAINERS_REMOTE_HOST_<N> block to target")
-		flagCompose   = flag.String("compose", "", "Path to the local compose file to deploy (required)")
-		flagRemoteDir = flag.String("remote-dir", "helix-stack", "Remote directory (relative to the SSH login dir) to deploy into")
-		flagEnvUpload = flag.String("env-file", "", "Path to the secret env file the compose env_file: reads (uploaded, basename preserved)")
-		flagProject   = flag.String("project-name", "", "compose --project-name (default: compose file basename without extension)")
+		flagEnv        = flag.String("env", "", "Path to env file holding CONTAINERS_REMOTE_HOST_<N>_* (required)")
+		flagHostIndex  = flag.Int("host-index", 1, "Which CONTAINERS_REMOTE_HOST_<N> block to target")
+		flagCompose    = flag.String("compose", "", "Path to the local compose file to deploy (required)")
+		flagRemoteDir  = flag.String("remote-dir", "helix-stack", "Remote directory (relative to the SSH login dir) to deploy into")
+		flagEnvUpload  = flag.String("env-file", "", "Path to the secret env file the compose env_file: reads (uploaded, basename preserved)")
+		flagProject    = flag.String("project-name", "", "compose --project-name (default: compose file basename without extension)")
 		flagComposeCmd = flag.String("compose-cmd", "", "Force a compose command (e.g. podman-compose); empty = auto-detect")
-		flagTimeout   = flag.Duration("timeout", 30*time.Minute, "Overall deploy timeout (image build can take many minutes)")
-		flagStrictKey = flag.Bool("strict-host-key", false, "Enable SSH StrictHostKeyChecking")
-		flagHelp      = flag.Bool("help", false, "Show help")
+		flagTimeout    = flag.Duration("timeout", 30*time.Minute, "Overall deploy timeout (image build can take many minutes)")
+		flagStrictKey  = flag.Bool("strict-host-key", false, "Enable SSH StrictHostKeyChecking")
+		flagHelp       = flag.Bool("help", false, "Show help")
 	)
 	var artifacts stringSlice
 	var artifactDirs stringSlice

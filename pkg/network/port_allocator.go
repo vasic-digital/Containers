@@ -70,6 +70,25 @@ func (a *PortAllocator) Release(port int) {
 	delete(a.allocated, port)
 }
 
+// MarkAllocated directly records an externally-chosen port as reserved,
+// without scanning the range or requiring the port to fall inside
+// [start,end). It exists for callers that pick their own port outside the
+// normal Allocate() flow — e.g. an explicit TunnelSpec.LocalPort (NET2-4) —
+// so IsAllocated / AllocatedCount / ListAllocations reflect that port too,
+// instead of only ever seeing ports this allocator itself chose. Idempotent:
+// calling it again for an already-recorded port just refreshes the
+// description and timestamp. Release(port) undoes it exactly like any
+// Allocate()-assigned port.
+func (a *PortAllocator) MarkAllocated(port int, description string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.allocated[port] = &PortAllocation{
+		Port:        port,
+		Description: description,
+		AllocatedAt: time.Now(),
+	}
+}
+
 // IsAllocated checks whether a port is currently reserved.
 func (a *PortAllocator) IsAllocated(port int) bool {
 	a.mu.Lock()

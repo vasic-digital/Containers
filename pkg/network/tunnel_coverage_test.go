@@ -209,15 +209,10 @@ func TestTunnelArgs_LocalDirection(t *testing.T) {
 
 	args := mgr.tunnelArgs(host, spec)
 	assert.Contains(t, args, "-N")
-	// Check the forward argument contains -L
-	found := false
-	for _, a := range args {
-		if len(a) > 2 && a[:2] == "-L" {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found, "expected -L forward argument")
+	// NET2-1: the -L flag and its forward spec are two independent argv
+	// elements (never one combined "-L host:port:port" string).
+	assert.Contains(t, args, "-L")
+	assert.Contains(t, args, "8080:db-server:5432")
 }
 
 // TestTunnelArgs_RemoteDirection verifies the SSH args for remote forwarding.
@@ -239,15 +234,10 @@ func TestTunnelArgs_RemoteDirection(t *testing.T) {
 	}
 
 	args := mgr.tunnelArgs(host, spec)
-	// Check the forward argument contains -R
-	found := false
-	for _, a := range args {
-		if len(a) > 2 && a[:2] == "-R" {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found, "expected -R forward argument")
+	// NET2-1: the -R flag and its forward spec are two independent argv
+	// elements (never one combined "-R host:port:port" string).
+	assert.Contains(t, args, "-R")
+	assert.Contains(t, args, "9090:localhost:8080")
 	assert.Contains(t, args, "/home/user/.ssh/id_rsa")
 }
 
@@ -268,24 +258,8 @@ func TestTunnelArgs_RemoteHost_DefaultsToLocalhost(t *testing.T) {
 	}
 
 	args := mgr.tunnelArgs(host, spec)
-	found := false
-	for _, a := range args {
-		if len(a) > 2 && a[:2] == "-L" && containsStr(a, "localhost") {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found, "expected localhost in forward argument")
-}
-
-func containsStr(s, sub string) bool {
-	return len(s) >= len(sub) &&
-		func() bool {
-			for i := 0; i <= len(s)-len(sub); i++ {
-				if s[i:i+len(sub)] == sub {
-					return true
-				}
-			}
-			return false
-		}()
+	// NET2-1: the -L flag and its forward spec (with the defaulted
+	// "localhost" target) are two independent argv elements.
+	assert.Contains(t, args, "-L")
+	assert.Contains(t, args, "8080:localhost:5432")
 }

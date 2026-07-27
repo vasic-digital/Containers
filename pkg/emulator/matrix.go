@@ -20,7 +20,26 @@ import (
 // avoids cross-AVD interference (a parallel runner would be a future
 // optimisation gated on its own falsifiability rehearsal).
 type AndroidMatrixRunner struct {
+	// emulator is the single shared Emulator used by the SERIAL path and,
+	// for backward compatibility, by the concurrent path when newEmulator
+	// is nil (legacy shared-instance construction via
+	// NewAndroidMatrixRunner). It is nil when the runner was built with a
+	// factory. Sharing one instance across the Concurrent>1 worker pool is
+	// safe ONLY if the concrete Emulator is itself concurrency-safe
+	// (stateless per Boot); Containerized is NOT.
 	emulator Emulator
+
+	// newEmulator, when non-nil, yields a FRESH Emulator instance for EACH
+	// runOne invocation (the EMU-2 fix). This is the concurrency-safe
+	// construction: every goroutine in the Concurrent>1 worker pool owns
+	// its own instance, so no per-Boot mutable state — Containerized's
+	// containerName / hostADBPort / adbKeyTmpDir, or either emulator's
+	// gradleModule — is shared across goroutines. Without it, AVD-B's
+	// Boot() overwrote the shared c.containerName between AVD-A's Boot()
+	// and AVD-A's Teardown(), so AVD-A's `rm -f` force-removed AVD-B's
+	// container. Constructing a fresh instance per invocation also fixes
+	// EMU-3 (gradleModule cross-write) by construction.
+	newEmulator func() Emulator
 }
 
 // adbAccessor is the seam runOne uses to issue side-effects against the
@@ -48,11 +67,52 @@ func (a *AndroidEmulator) executorAndAdb() (CommandExecutor, string) {
 	return a.executor, a.adbBinary()
 }
 
-// NewAndroidMatrixRunner constructs a runner backed by the supplied
-// [Emulator]. Callers typically pass [NewAndroidEmulator] for
-// production runs and [NewAndroidEmulatorWithExecutor] for tests.
+// NewAndroidMatrixRunner constructs a runner backed by a SINGLE shared
+// [Emulator]. Callers typically pass [NewAndroidEmulator] for production
+// runs and [NewAndroidEmulatorWithExecutor] for tests.
+//
+// This is the serial-safe constructor. In a Concurrent>1 run the single
+// instance is shared across the worker pool, which is safe ONLY when the
+// concrete Emulator is itself concurrency-safe (stateless per Boot). For
+// any Emulator with per-Boot mutable state ([Containerized] in
+// particular), use [NewAndroidMatrixRunnerWithFactory] instead — sharing
+// one Containerized across goroutines is the EMU-2 defect (a per-AVD
+// Teardown tears down whichever container the most-recent Boot named).
 func NewAndroidMatrixRunner(emulator Emulator) *AndroidMatrixRunner {
 	return &AndroidMatrixRunner{emulator: emulator}
+}
+
+// NewAndroidMatrixRunnerWithFactory constructs a runner that builds a
+// FRESH [Emulator] for EACH runOne invocation via factory — the
+// concurrency-safe construction REQUIRED for any Concurrent>1 run whose
+// Emulator carries per-Boot mutable state ([Containerized]:
+// containerName/hostADBPort/adbKeyTmpDir; both emulators: gradleModule).
+// Each goroutine owns its own instance, so a per-AVD Teardown always acts
+// on the container its own Boot created (fixes EMU-2), and gradleModule is
+// never cross-written (fixes EMU-3). Serial runs likewise get a fresh
+// instance per AVD, additionally isolating per-AVD state bleed.
+//
+// factory MUST return a ready-to-use, independent Emulator on every call
+// (no mutable state shared between returned instances) — otherwise the
+// isolation guarantee, and with it the EMU-2/EMU-3 fixes, do not hold. A
+// nil factory is a programming error: the runner then falls back to the
+// (serial-only-safe) shared path with a nil shared instance, which panics
+// on first use; callers wanting the safe path MUST pass a non-nil factory.
+func NewAndroidMatrixRunnerWithFactory(factory func() Emulator) *AndroidMatrixRunner {
+	return &AndroidMatrixRunner{newEmulator: factory}
+}
+
+// emulatorForInvocation returns the [Emulator] a single runOne invocation
+// operates on. With a factory (NewAndroidMatrixRunnerWithFactory) every
+// call yields a FRESH, independent instance — the concurrency-safe path
+// (EMU-2/EMU-3). Without a factory it returns the single shared instance,
+// safe only in the serial path OR when the Emulator implementation is
+// itself concurrency-safe (stateless per Boot).
+func (r *AndroidMatrixRunner) emulatorForInvocation() Emulator {
+	if r.newEmulator != nil {
+		return r.newEmulator()
+	}
+	return r.emulator
 }
 
 func defaultIfZero(d, fallback time.Duration) time.Duration {
@@ -77,13 +137,28 @@ func filepathGlob(pattern string) ([]string, error) {
 // MatrixResult.Boots / .Tests. Captures diag pre-test and parses JUnit
 // XML post-test per Group B.
 //
-// runOne is invoked sequentially in serial mode and concurrently from
-// a worker pool when MatrixConfig.Concurrent > 1. Each invocation owns
-// its own emulator instance, so concurrent calls are safe as long as
-// the underlying Emulator implementation is too (AndroidEmulator
-// satisfies that — Boot()'s discovery picks an unused console port).
+// runOne is invoked sequentially in serial mode and concurrently from a
+// worker pool when MatrixConfig.Concurrent > 1. It operates ONLY on the
+// em parameter it is handed — never on r.emulator directly — so RunMatrix
+// decides per invocation whether that is a fresh instance (factory
+// construction) or the shared instance (legacy construction).
+//
+// Concurrency contract: concurrent calls are safe iff each concurrent
+// invocation is handed its OWN Emulator instance. RunMatrix guarantees
+// that for a factory-constructed runner
+// ([NewAndroidMatrixRunnerWithFactory]) by calling emulatorForInvocation
+// per invocation. For a shared-instance runner
+// ([NewAndroidMatrixRunner]) every concurrent invocation is handed the
+// SAME instance, which is safe only when that Emulator is itself
+// concurrency-safe (stateless per Boot) — [Containerized] is NOT, because
+// Boot mutates c.containerName/c.hostADBPort and Teardown acts on
+// c.containerName, so two concurrent AVDs would cross-attribute their
+// containers (EMU-2). The prior claim that "each invocation owns its own
+// emulator instance" was FALSE for the shared-instance path and is now
+// mechanically true only via the factory path.
 func (r *AndroidMatrixRunner) runOne(
 	ctx context.Context,
+	em Emulator,
 	avd AVD,
 	config MatrixConfig,
 	bootTimeout time.Duration,
@@ -110,7 +185,7 @@ func (r *AndroidMatrixRunner) runOne(
 	// the matrix row — the subsequent Boot will discover the new
 	// emulator's serial via dynamic discovery regardless of stale
 	// processes.
-	if _, cleanupErr := Cleanup(ctx); cleanupErr != nil {
+	if _, cleanupErr := Cleanup(ctx, avd.Name); cleanupErr != nil {
 		fmt.Fprintf(os.Stderr,
 			"[matrix] pre-boot cleanup warning for %s: %v\n",
 			avd.Name, cleanupErr,
@@ -122,7 +197,7 @@ func (r *AndroidMatrixRunner) runOne(
 	// a remove failure is not fatal.
 	clearAVDLock(avd.Name)
 
-	if ae, ok := r.emulator.(*AndroidEmulator); ok && config.ImageManifestPath != "" {
+	if ae, ok := em.(*AndroidEmulator); ok && config.ImageManifestPath != "" {
 		if cacheErr := ae.ensureSystemImageViaCache(ctx, avd, config.ImageManifestPath); cacheErr != nil {
 			return BootResult{
 					AVD:   avd,
@@ -138,7 +213,7 @@ func (r *AndroidMatrixRunner) runOne(
 		}
 	}
 
-	boot, err := r.emulator.Boot(ctx, avd, config.ColdBoot)
+	boot, err := em.Boot(ctx, avd, config.ColdBoot)
 	if err != nil {
 		return boot, TestResult{
 			AVD:        avd,
@@ -149,7 +224,7 @@ func (r *AndroidMatrixRunner) runOne(
 			Concurrent: maxInt(config.Concurrent, 1),
 		}
 	}
-	waitDuration, err := r.emulator.WaitForBoot(ctx, boot.ADBPort, bootTimeout)
+	waitDuration, err := em.WaitForBoot(ctx, boot.ADBPort, bootTimeout)
 	boot.BootDuration += waitDuration
 	if err != nil {
 		boot.Error = err
@@ -163,12 +238,12 @@ func (r *AndroidMatrixRunner) runOne(
 			avdEvidenceDir = filepath.Join(config.EvidenceDir, avd.Name)
 		}
 		var adbBin string
-		if ae, ok := r.emulator.(*AndroidEmulator); ok {
+		if ae, ok := em.(*AndroidEmulator); ok {
 			adbBin = ae.adbBinary()
 		}
 		if adbBin != "" {
 			var execForDiag CommandExecutor
-			if ae, ok := r.emulator.(*AndroidEmulator); ok {
+			if ae, ok := em.(*AndroidEmulator); ok {
 				execForDiag = ae.executor
 			}
 			if execForDiag != nil {
@@ -177,7 +252,7 @@ func (r *AndroidMatrixRunner) runOne(
 			}
 		}
 
-		_ = r.emulator.Teardown(ctx, boot.ADBPort)
+		_ = em.Teardown(ctx, boot.ADBPort)
 		return boot, TestResult{
 			AVD:        avd,
 			TestClass:  config.TestClass,
@@ -189,8 +264,8 @@ func (r *AndroidMatrixRunner) runOne(
 	}
 	boot.BootCompleted = true
 
-	if err := r.emulator.Install(ctx, boot.ADBPort, config.APKPath); err != nil {
-		_ = r.emulator.Teardown(ctx, boot.ADBPort)
+	if err := em.Install(ctx, boot.ADBPort, config.APKPath); err != nil {
+		_ = em.Teardown(ctx, boot.ADBPort)
 		return boot, TestResult{
 			AVD:        avd,
 			TestClass:  config.TestClass,
@@ -214,7 +289,7 @@ func (r *AndroidMatrixRunner) runOne(
 			// it as a row failure rather than a silent skip. The row
 			// still carries the AVD identity so the operator can map
 			// the typo to its source.
-			_ = r.emulator.Teardown(ctx, boot.ADBPort)
+			_ = em.Teardown(ctx, boot.ADBPort)
 			return boot, TestResult{
 				AVD:        avd,
 				TestClass:  config.TestClass,
@@ -225,9 +300,9 @@ func (r *AndroidMatrixRunner) runOne(
 			}
 		}
 		conditions := MergeNetworkConditions(profile, config.NetworkOverride)
-		if accessor, ok := r.emulator.(adbAccessor); ok {
+		if accessor, ok := em.(adbAccessor); ok {
 			executor, adbPath := accessor.executorAndAdb()
-			serial := fmt.Sprintf("emulator-%d", boot.ConsolePort)
+			serial := fmt.Sprintf("emulator-%d", boot.ADBPort)
 			if applyErr := applyNetworkConditions(ctx, executor, adbPath, serial, conditions); applyErr != nil {
 				fmt.Fprintf(os.Stderr,
 					"[matrix] warning: applyNetworkConditions failed for %s (profile=%q): %v\n",
@@ -241,19 +316,19 @@ func (r *AndroidMatrixRunner) runOne(
 	// after Android is up and the APK is installed (so the emulator is
 	// stable) and before the test runs (so the diag reflects the
 	// state the test will encounter).
-	diag := r.captureDiagnostic(ctx, boot.ADBPort, avd)
+	diag := r.captureDiagnostic(ctx, em, boot.ADBPort, avd)
 
 	// Propagate the consumer's gradle module onto the emulator so
 	// RunInstrumentation targets `:<module>:connectedDebugAndroidTest`.
 	// Empty GradleModule is a no-op (the emulator's construction-time
 	// default "app" stands). An Emulator implementation that does not
 	// satisfy gradleModuleSetter is run with its constructed module.
-	if setter, ok := r.emulator.(gradleModuleSetter); ok {
+	if setter, ok := em.(gradleModuleSetter); ok {
 		setter.setGradleModule(config.GradleModule)
 	}
 
 	startedTest := time.Now()
-	out, passed, runErr := r.emulator.RunInstrumentation(
+	out, passed, runErr := em.RunInstrumentation(
 		ctx, boot.ADBPort, config.TestClass, testTimeout,
 	)
 	test := TestResult{
@@ -275,9 +350,9 @@ func (r *AndroidMatrixRunner) runOne(
 	// to stderr only — they do NOT flip the row (Sixth Law clause 3:
 	// the gating signal stays on the test outcome).
 	if !test.Passed && config.CaptureScreenshotOnFailure {
-		if accessor, ok := r.emulator.(adbAccessor); ok {
+		if accessor, ok := em.(adbAccessor); ok {
 			executor, adbPath := accessor.executorAndAdb()
-			serial := fmt.Sprintf("emulator-%d", boot.ConsolePort)
+			serial := fmt.Sprintf("emulator-%d", boot.ADBPort)
 			screenshotPath := filepath.Join(config.EvidenceDir, avd.Name, "screenshot-on-failure.png")
 			if scErr := CaptureScreenshot(ctx, executor, adbPath, serial, screenshotPath); scErr == nil {
 				// Stored relative to EvidenceDir so a packaged
@@ -331,16 +406,16 @@ func (r *AndroidMatrixRunner) runOne(
 	if test.FailureSummaries == nil {
 		test.FailureSummaries = []FailureSummary{}
 	}
-	_ = r.emulator.Teardown(ctx, boot.ADBPort)
+	_ = em.Teardown(ctx, boot.ADBPort)
 	return boot, test
 }
 
 // captureDiagnostic gathers the per-AVD forensic snapshot used by Group
 // B's clause 6.I extension. Best-effort: missing fields default to zero
 // values so a partial diag is recorded rather than no diag at all.
-func (r *AndroidMatrixRunner) captureDiagnostic(ctx context.Context, port int, avd AVD) DiagnosticInfo {
+func (r *AndroidMatrixRunner) captureDiagnostic(ctx context.Context, em Emulator, port int, avd AVD) DiagnosticInfo {
 	d := DiagnosticInfo{}
-	if ae, ok := r.emulator.(*AndroidEmulator); ok {
+	if ae, ok := em.(*AndroidEmulator); ok {
 		target := fmt.Sprintf("localhost:%d", port)
 		if sdkOut, err := ae.executor.Execute(ctx, ae.adbBinary(), "-s", target, "shell", "getprop", "ro.build.version.sdk"); err == nil {
 			if sdk, perr := strconv.Atoi(strings.TrimSpace(string(sdkOut))); perr == nil {
@@ -456,9 +531,13 @@ func (r *AndroidMatrixRunner) RunMatrix(
 	}
 
 	if concurrent == 1 {
-		// Serial path — preserves existing behaviour.
+		// Serial path — preserves existing behaviour. emulatorForInvocation
+		// yields a fresh instance per AVD under factory construction, or the
+		// shared instance under legacy construction (serial is safe either
+		// way).
 		for _, avd := range config.AVDs {
-			boot, test := r.runOne(ctx, avd, config, bootTimeout, testTimeout)
+			em := r.emulatorForInvocation()
+			boot, test := r.runOne(ctx, em, avd, config, bootTimeout, testTimeout)
 			result.Boots = append(result.Boots, boot)
 			result.Tests = append(result.Tests, test)
 		}
@@ -478,7 +557,14 @@ func (r *AndroidMatrixRunner) RunMatrix(
 			go func() {
 				defer wg.Done()
 				for avd := range queue {
-					boot, test := r.runOne(ctx, avd, config, bootTimeout, testTimeout)
+					// EMU-2: obtain the emulator instance PER invocation,
+					// INSIDE the range loop, so a factory-constructed runner
+					// hands each concurrent AVD its OWN fresh Emulator. Hoisting
+					// this out of the loop (or before the worker goroutines)
+					// would re-introduce the shared-instance defect — the exact
+					// cross-container-teardown bug this fix removes.
+					em := r.emulatorForInvocation()
+					boot, test := r.runOne(ctx, em, avd, config, bootTimeout, testTimeout)
 					results <- pair{boot: boot, test: test}
 				}
 			}()

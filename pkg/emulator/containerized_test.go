@@ -117,8 +117,30 @@ func TestContainerized_Boot_InvokesRuntimeRunWithKvmAndPortForward(t *testing.T)
 		t.Errorf("ContainerName() must contain AVD name; got %q", c.ContainerName())
 	}
 
-	// §6.J primary assertion: the wire-observable command line.
-	call := firstCallMatching(t, fake.calls, "podman")
+	// §6.J primary assertion: the wire-observable command line. Since
+	// LVA-014 fix #1, Boot issues a baked-AVD listing call
+	// (`podman run --rm --entrypoint avdmanager …`) BEFORE the boot call
+	// — locate the boot call specifically by its `-d` (detach) flag.
+	var call fakeCall
+	foundBootCall := false
+	for _, c := range fake.calls {
+		if c.Name != "podman" {
+			continue
+		}
+		for _, a := range c.Args {
+			if a == "-d" {
+				call = c
+				foundBootCall = true
+				break
+			}
+		}
+		if foundBootCall {
+			break
+		}
+	}
+	if !foundBootCall {
+		t.Fatalf("no `podman run -d` boot call found in %d recorded calls: %+v", len(fake.calls), fake.calls)
+	}
 	hasKvm := false
 	hasADBPort := false
 	hasConsolePort := false

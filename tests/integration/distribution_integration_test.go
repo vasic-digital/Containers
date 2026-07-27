@@ -22,7 +22,7 @@ import (
 // WorkflowPhases are defined and returned by AllPhases.
 func TestDistributionWorkflow_AllPhases(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping integration test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping integration test in short mode") // SKIP-OK: #short-mode
 	}
 
 	phases := distribution.AllPhases()
@@ -64,7 +64,7 @@ func TestDistributionWorkflow_AllPhases(t *testing.T) {
 // error when no scheduler is configured.
 func TestDistributor_WithMockHosts(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping integration test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping integration test in short mode") // SKIP-OK: #short-mode
 	}
 
 	// Create a distributor without a scheduler to test the
@@ -99,7 +99,7 @@ func TestDistributor_WithMockHosts(t *testing.T) {
 // and verifies that LoadFromEnv reads the value correctly.
 func TestEnvConfig_LoadFromEnv(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping integration test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping integration test in short mode") // SKIP-OK: #short-mode
 	}
 
 	// Save and restore environment.
@@ -137,7 +137,7 @@ func TestEnvConfig_LoadFromEnv(t *testing.T) {
 // keys.
 func TestEnvConfig_GenerateExample(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping integration test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping integration test in short mode") // SKIP-OK: #short-mode
 	}
 
 	example := envconfig.GenerateEnvExample()
@@ -167,7 +167,7 @@ func TestEnvConfig_GenerateExample(t *testing.T) {
 // empty batch of requirements returns an empty placement plan.
 func TestScheduler_ScheduleBatch_Empty(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping integration test in short mode")  // SKIP-OK: #short-mode
+		t.Skip("skipping integration test in short mode") // SKIP-OK: #short-mode
 	}
 
 	// Create a host manager with no hosts to keep the test

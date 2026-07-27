@@ -16,7 +16,7 @@ See `../../docs/RESOURCE_LIMITS.md` for the full design rationale.
 | `apply-report.md` | Generated report from the last `apply_caps.py` run. |
 
 The Go counterpart of `policy.yaml` lives at
-`Containers/pkg/policy/policy.go`. The two should always agree.
+`pkg/policy/policy.go` (relative to this module's own root). The two should always agree.
 
 ## Quick start
 
@@ -37,7 +37,7 @@ Add the service to its compose file and run `apply_caps.py`. If the
 service name matches an existing pattern in `policy.yaml`, you're done.
 Otherwise, add a more-specific rule near the top of `patterns:` in
 `policy.yaml`, **and** add the equivalent entry in
-`Containers/pkg/policy/policy.go::Default()`.
+`pkg/policy/policy.go::Default()` (relative to this module's own root).
 
 ## What it does NOT touch
 

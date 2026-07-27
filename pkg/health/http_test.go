@@ -34,8 +34,10 @@ func TestCheckHTTP_Healthy_200(t *testing.T) {
 	assert.Equal(t, "200", result.Details["status_code"])
 }
 
-func TestCheckHTTP_Healthy_404(t *testing.T) {
-	// 404 is < 500, so the server is running and considered healthy.
+func TestCheckHTTP_Unhealthy_404(t *testing.T) {
+	// CT-HARDEN-60: a 404 means the health path is wrong / the service is
+	// mis-pointed — it is UNHEALTHY, not "running so healthy". (Reconciled
+	// from the prior TestCheckHTTP_Healthy_404 which asserted 404<500=healthy.)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
@@ -51,8 +53,9 @@ func TestCheckHTTP_Healthy_404(t *testing.T) {
 	ctx := context.Background()
 	result := CheckHTTP(ctx, target)
 
-	assert.True(t, result.Healthy)
+	assert.False(t, result.Healthy)
 	assert.Equal(t, "404", result.Details["status_code"])
+	assert.Contains(t, result.Error, "unhealthy status code: 404")
 }
 
 func TestCheckHTTP_Unhealthy_500(t *testing.T) {
@@ -100,8 +103,9 @@ func TestCheckHTTP_TableDriven(t *testing.T) {
 		{"201 Created", http.StatusCreated, true},
 		{"204 No Content", http.StatusNoContent, true},
 		{"301 Redirect", http.StatusMovedPermanently, true},
-		{"400 Bad Request", http.StatusBadRequest, true},
-		{"403 Forbidden", http.StatusForbidden, true},
+		// CT-HARDEN-60: 4xx is UNHEALTHY (was healthy under the old <500).
+		{"400 Bad Request", http.StatusBadRequest, false},
+		{"403 Forbidden", http.StatusForbidden, false},
 		{"500 Internal Server Error", http.StatusInternalServerError, false},
 		{"502 Bad Gateway", http.StatusBadGateway, false},
 		{"503 Service Unavailable", http.StatusServiceUnavailable, false},
@@ -127,6 +131,45 @@ func TestCheckHTTP_TableDriven(t *testing.T) {
 			result := CheckHTTP(ctx, target)
 			assert.Equal(t, tt.healthy, result.Healthy)
 		})
+	}
+}
+
+// TestCheckHTTP_Regression_4xx_Unhealthy_CT60 is the permanent §11.4.135
+// regression guard for CT-HARDEN-60: an HTTP health check must NOT report a
+// 4xx response (auth failure / wrong path / rate-limited) as healthy, while
+// 2xx/3xx stay healthy and 5xx stays unhealthy. Mutating the production
+// predicate back to `< 500` (or to 2xx-only) flips one of these rows and
+// FAILs this guard — a real polarity oracle, not a test that agrees with the
+// fix.
+func TestCheckHTTP_Regression_4xx_Unhealthy_CT60(t *testing.T) {
+	cases := []struct {
+		code    int
+		healthy bool
+	}{
+		{http.StatusOK, true},                  // 200
+		{http.StatusMovedPermanently, true},    // 301 — reachable/redirect
+		{http.StatusUnauthorized, false},       // 401
+		{http.StatusForbidden, false},          // 403
+		{http.StatusNotFound, false},           // 404
+		{http.StatusTooManyRequests, false},    // 429
+		{http.StatusServiceUnavailable, false}, // 503
+	}
+	for _, c := range cases {
+		code := c.code
+		srv := httptest.NewServer(http.HandlerFunc(
+			func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) },
+		))
+		target := HealthTarget{
+			Name: "ct60", URL: srv.URL, Type: HealthHTTP, Timeout: 2 * time.Second,
+		}
+		result := CheckHTTP(context.Background(), target)
+		assert.Equal(t, c.healthy, result.Healthy,
+			"status %d: expected healthy=%v", code, c.healthy)
+		if !c.healthy {
+			assert.Contains(t, result.Error, "unhealthy status code",
+				"status %d: unhealthy result must carry an honest error", code)
+		}
+		srv.Close()
 	}
 }
 
