@@ -1,8 +1,9 @@
 package endpoint
 
 import (
-	"fmt"
 	"strings"
+
+	"digital.vasic.containers/internal/netaddr"
 )
 
 // ResolveHealthURL returns the full health check URL for the
@@ -26,7 +27,8 @@ func ResolveHostPort(ep *ServiceEndpoint) string {
 	if ep.Port == "" {
 		return host
 	}
-	return fmt.Sprintf("%s:%s", host, ep.Port)
+	// Callers dial this string, so an IPv6 literal must arrive bracketed.
+	return netaddr.JoinHostPort(host, ep.Port)
 }
 
 // ResolveScheme returns the URL scheme inferred from the

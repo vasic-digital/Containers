@@ -1,8 +1,9 @@
 package health
 
 import (
-	"fmt"
 	"time"
+
+	"digital.vasic.containers/internal/netaddr"
 )
 
 // HealthType identifies the mechanism used to verify a target's health.
@@ -50,7 +51,11 @@ func (t *HealthTarget) ResolvedAddress() string {
 	if t.Host == "" && t.Port == "" {
 		return ""
 	}
-	return fmt.Sprintf("%s:%s", t.Host, t.Port)
+	// An IPv6 literal must be bracketed or the resolver rejects the
+	// authority outright ("too many colons in address"). netaddr.JoinHostPort
+	// brackets only a bare IPv6 literal, so IPv4 hosts, hostnames and
+	// already-bracketed literals pass through byte-for-byte unchanged.
+	return netaddr.JoinHostPort(t.Host, t.Port)
 }
 
 // HealthResult captures the outcome of a single health check.

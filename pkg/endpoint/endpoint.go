@@ -1,9 +1,10 @@
 package endpoint
 
 import (
-	"fmt"
 	"strings"
 	"time"
+
+	"digital.vasic.containers/internal/netaddr"
 )
 
 // ServiceEndpoint holds the configuration for a single service
@@ -80,9 +81,12 @@ func resolveURL(host, port, path string) string {
 	if host == "" {
 		host = "localhost"
 	}
-	base := host
+	// Bracket in both branches: an IPv6 literal is just as malformed inside
+	// "http://::1" as it is inside "http://::1:9000". A host that is already
+	// a full URL is left untouched, so the scheme check below still sees it.
+	base := netaddr.BracketHost(host)
 	if port != "" {
-		base = fmt.Sprintf("%s:%s", host, port)
+		base = netaddr.JoinHostPort(host, port)
 	}
 	if !strings.HasPrefix(base, "http://") &&
 		!strings.HasPrefix(base, "https://") {

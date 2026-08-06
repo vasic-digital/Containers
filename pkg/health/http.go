@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"digital.vasic.containers/internal/netaddr"
 )
 
 const defaultHTTPTimeout = 10 * time.Second
@@ -23,7 +25,16 @@ func CheckHTTP(ctx context.Context, target HealthTarget) *HealthResult {
 		if path == "" {
 			path = "/"
 		}
-		url = fmt.Sprintf("%s://%s:%s%s", scheme, target.Host, target.Port, path)
+		// The host half must be bracketed when it is an IPv6 literal.
+		// net/http happens to recover from the unbracketed form whenever a
+		// numeric port is present (url.Parse splits at the last colon), but
+		// the URL it produces is still malformed: it fails url.Parse outright
+		// when the port is absent or non-numeric, and it is emitted verbatim
+		// into Details["url"], where any stricter consumer rejects it.
+		url = fmt.Sprintf(
+			"%s://%s%s", scheme,
+			netaddr.JoinHostPort(target.Host, target.Port), path,
+		)
 	}
 
 	timeout := target.Timeout
