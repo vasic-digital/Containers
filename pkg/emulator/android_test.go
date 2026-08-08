@@ -150,11 +150,11 @@ func (f *fakeExecutor) Start(_ context.Context, name string, args ...string) err
 // the production code path passes the documented flags to the SDK's
 // emulator binary. Falsifiability:
 //
-//   Mutation: in android.go Boot, replace `-no-snapshot` with
-//             `-snapshot-load`. Re-run this test.
-//   Observed-Failure: assertion on the args slice fires because the
-//             flag string changes.
-//   Reverted: yes (see git log).
+//	Mutation: in android.go Boot, replace `-no-snapshot` with
+//	          `-snapshot-load`. Re-run this test.
+//	Observed-Failure: assertion on the args slice fires because the
+//	          flag string changes.
+//	Reverted: yes (see git log).
 func TestAndroidEmulator_Boot_PassesExpectedFlagsToEmulatorBinary(t *testing.T) {
 	// Disable the pre-boot ADB hygiene reset so it doesn't consume the first
 	// entry in the sequenced "adb devices" script before Boot's pre-snapshot
@@ -197,10 +197,10 @@ func TestAndroidEmulator_Boot_PassesExpectedFlagsToEmulatorBinary(t *testing.T) 
 // TestAndroidEmulator_Boot_WithoutColdBoot_OmitsNoSnapshotFlag pins
 // the ColdBoot=false branch. Falsifiability:
 //
-//   Mutation: in Boot, always append `-no-snapshot` regardless of
-//             coldBoot. Re-run.
-//   Observed-Failure: this test fails because -no-snapshot would be
-//             present even though ColdBoot was false.
+//	Mutation: in Boot, always append `-no-snapshot` regardless of
+//	          coldBoot. Re-run.
+//	Observed-Failure: this test fails because -no-snapshot would be
+//	          present even though ColdBoot was false.
 func TestAndroidEmulator_Boot_WithoutColdBoot_OmitsNoSnapshotFlag(t *testing.T) {
 	disableADBHygiene(t)
 
@@ -322,11 +322,12 @@ func TestAndroidEmulator_Teardown_InvokesAdbEmuKill(t *testing.T) {
 // only AFTER the second poll, NOT after the first.
 //
 // Falsifiability:
-//   Mutation: revert Teardown to the pre-fix form (return immediately
-//             after kill, no polling).
-//   Observed-Failure: this test would fail because the call count
-//             would be 1 (kill only), not 2+ (kill + at least one poll).
-//   Reverted: yes — post-revert this test passes.
+//
+//	Mutation: revert Teardown to the pre-fix form (return immediately
+//	          after kill, no polling).
+//	Observed-Failure: this test would fail because the call count
+//	          would be 1 (kill only), not 2+ (kill + at least one poll).
+//	Reverted: yes — post-revert this test passes.
 func TestAndroidEmulator_Teardown_WaitsForEmulatorToActuallyExit(t *testing.T) {
 	exec := &fakeExecutor{
 		scripts: map[string]fakeScript{},
@@ -377,16 +378,16 @@ func init() {
 // Forensic anchor (verbatim from the diagnostic output captured this
 // session):
 //
-//   [matrix-diag] target=localhost:5555 adb-devices=
-//     "List of devices attached\nemulator-5554\tdevice\nlocalhost:5555\tdevice"
-//     ro.product.model="Android SDK built for x86_64"
-//   [matrix-diag] target=localhost:5555 adb-devices=
-//     "...emulator-5554\tdevice\nemulator-5556\toffline..."
-//     ro.product.model="Android SDK built for x86_64"
-//   ... (5 iterations, all targeting localhost:5555, all reporting
-//        the same model — every iteration tested the FIRST AVD's
-//        emulator while the matrix attestation file claimed each row
-//        was a different AVD)
+//	[matrix-diag] target=localhost:5555 adb-devices=
+//	  "List of devices attached\nemulator-5554\tdevice\nlocalhost:5555\tdevice"
+//	  ro.product.model="Android SDK built for x86_64"
+//	[matrix-diag] target=localhost:5555 adb-devices=
+//	  "...emulator-5554\tdevice\nemulator-5556\toffline..."
+//	  ro.product.model="Android SDK built for x86_64"
+//	... (5 iterations, all targeting localhost:5555, all reporting
+//	     the same model — every iteration tested the FIRST AVD's
+//	     emulator while the matrix attestation file claimed each row
+//	     was a different AVD)
 //
 // Pre-fix Boot() hardcoded ADBPort=5555 unconditionally. When the
 // previous AVD's Teardown left the first emulator alive on 5554/5555
@@ -403,11 +404,11 @@ func init() {
 //
 // Falsifiability rehearsal (clause 6.I clause 5 + Sixth Law clause 2):
 //
-//   Mutation: revert this commit's Boot() to the pre-fix form
-//             (hardcoded ConsolePort=5554, ADBPort=5555).
-//   Observed-Failure: this test fails with
-//             "expected 5557 but got 5555" — the assertion below.
-//   Reverted: yes, post-revert this test passes again.
+//	Mutation: revert this commit's Boot() to the pre-fix form
+//	          (hardcoded ConsolePort=5554, ADBPort=5555).
+//	Observed-Failure: this test fails with
+//	          "expected 5557 but got 5555" — the assertion below.
+//	Reverted: yes, post-revert this test passes again.
 func TestAndroidEmulator_Boot_DiscoversNewSerial_WhenPriorEmulatorPersists(t *testing.T) {
 	disableADBHygiene(t)
 
@@ -786,9 +787,19 @@ func TestBootResult_AttestationSchemaUnchanged(t *testing.T) {
 	// appear in attestation rows for passing runs. Its presence here is
 	// intentional: adding a nil-safe diagnostic field is not a breaking
 	// schema change for existing consumers.
+	//
+	// ResolvedAVDName was added 2026-07-26 (LVA-014 fix #1): it records
+	// which baked AVD actually booted when the containerized runner
+	// substitutes the requested matrix name (e.g. CZ_API34_Phone → the
+	// image's baked "default"). Empty on exact-match and host-direct
+	// boots. Like BootDiag it is NOT marshalled into the attestation
+	// JSON — matrix.go writeAttestation builds its own rowJSON struct —
+	// so downstream attestation consumers (scripts/tag.sh) see no schema
+	// change. Additive, nil-safe, attestation-invisible: same contract
+	// class as BootDiag.
 	expectedFields := []string{
 		"AVD", "ADBPort", "BootCompleted", "BootDiag", "BootDuration",
-		"ConsolePort", "Error", "Started",
+		"ConsolePort", "Error", "ResolvedAVDName", "Started",
 	}
 	bootResultType := reflect.TypeOf(BootResult{})
 	require.Equal(t, len(expectedFields), bootResultType.NumField(),

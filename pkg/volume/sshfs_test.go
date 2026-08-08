@@ -15,10 +15,14 @@ import (
 func newTestSSHFSMounter(
 	exec remote.RemoteExecutor,
 ) *SSHFSMounter {
+	// testMountOptionsWithAddress (see VOL-HIGH-2, manager_test.go)
+	// configures a placeholder LocalHostAddress so these tests keep
+	// exercising their mkdir/mount executor-error paths rather than the
+	// unconfigured-address fail-loud path.
 	return NewSSHFSMounter(
 		exec,
 		logging.NopLogger{},
-		DefaultMountOptions(),
+		testMountOptionsWithAddress(),
 	)
 }
 

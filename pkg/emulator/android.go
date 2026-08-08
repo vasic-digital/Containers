@@ -681,8 +681,18 @@ func (a *AndroidEmulator) discoverNewSerial(
 	timeout time.Duration,
 ) (int, error) {
 	deadline := time.Now().Add(timeout)
+	// EMU-1 (GENY-1/CF-1 class, §11.4.108): bind every emulatorSerials exec
+	// (adb devices) to a context derived from `timeout`, NOT the raw caller
+	// ctx. Real callers (Boot, via cmd/emulator-matrix + cmd/emulator-canary)
+	// pass context.Background(); without a derived deadline, a wedged `adb
+	// devices` (stalled adb server — a real observed failure mode per
+	// adb_hygiene.go) hangs discoverNewSerial FOREVER because the underlying
+	// exec.CommandContext(ctx, ...) inside emulatorSerials->Execute never
+	// gets cancelled — the `timeout` argument is silently not honored.
+	cctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	for time.Now().Before(deadline) {
-		current, err := a.emulatorSerials(ctx)
+		current, err := a.emulatorSerials(cctx)
 		if err == nil {
 			for port := range current {
 				if !before[port] {
@@ -691,8 +701,13 @@ func (a *AndroidEmulator) discoverNewSerial(
 			}
 		}
 		select {
-		case <-ctx.Done():
-			return 0, fmt.Errorf("emulator port discovery cancelled: %w", ctx.Err())
+		case <-cctx.Done():
+			if ctx.Err() != nil {
+				return 0, fmt.Errorf("emulator port discovery cancelled: %w", ctx.Err())
+			}
+			// Our own internal `timeout` budget elapsed, not the caller's
+			// ctx — fall through; the loop condition below becomes false
+			// and the friendly "no new serial" error below is returned.
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
@@ -801,9 +816,10 @@ func (a *AndroidEmulator) Boot(
 		//
 		// We use Cleanup() here (not KillByPort) because we don't know the
 		// port — the discovery timeout means we never learned which port the
-		// emulator bound to. Cleanup() uses the strict "qemu-system-" comm
-		// prefix so only Android emulator processes are targeted.
-		cleanupReport, cleanupErr := Cleanup(ctx)
+		// emulator bound to. Cleanup(avd.Name) is ownership-scoped: it reaps
+		// ONLY the qemu-system-* carrying `-avd <avd.Name>` in its argv
+		// (§11.4.174), never every host qemu-system-*.
+		cleanupReport, cleanupErr := Cleanup(ctx, avd.Name)
 		if cleanupErr != nil {
 			fmt.Fprintf(os.Stderr,
 				"[boot] cleanup after port-discovery timeout: %v\n",
@@ -856,6 +872,16 @@ func (a *AndroidEmulator) WaitForBoot(
 	deadline := startedAt.Add(timeout)
 	target := fmt.Sprintf("localhost:%d", port)
 
+	// EMU-1 (GENY-1/CF-1 class, §11.4.108): bind every underlying adb exec
+	// in this wait (the per-iteration `adb connect` + `adb shell getprop`)
+	// to a context derived from `timeout`, NOT the raw caller ctx. Real
+	// callers pass context.Background(); without this, a wedged adb
+	// (stalled adb server) hangs WaitForBoot FOREVER past the stated
+	// timeout, because the underlying exec.CommandContext(ctx, ...) never
+	// gets cancelled.
+	cctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
 	// Forensic anchor (2026-05-04 evening): the previous form called
 	// `adb connect localhost:<port>` ONCE before the poll loop.
 	// On cold boot the emulator's ADB socket is not ready for ~30-60s
@@ -874,7 +900,7 @@ func (a *AndroidEmulator) WaitForBoot(
 	// socket comes up actually establishes the connection; subsequent
 	// `-s` calls then succeed and the boot-completed prop is read.
 	for time.Now().Before(deadline) {
-		connectOut, connectErr := a.executor.Execute(ctx, a.adbBinary(), "connect", target)
+		connectOut, connectErr := a.executor.Execute(cctx, a.adbBinary(), "connect", target)
 		// Classify the transport state returned by `adb connect` so we can
 		// surface offline vs not-yet-visible in the diagnostic log.
 		connectOutStr := strings.TrimSpace(string(connectOut))
@@ -887,15 +913,21 @@ func (a *AndroidEmulator) WaitForBoot(
 		}
 
 		out, err := a.executor.Execute(
-			ctx, a.adbBinary(), "-s", target,
+			cctx, a.adbBinary(), "-s", target,
 			"shell", "getprop", "sys.boot_completed",
 		)
 		if err == nil && strings.TrimSpace(string(out)) == "1" {
 			return time.Since(startedAt), nil
 		}
 		select {
-		case <-ctx.Done():
-			return time.Since(startedAt), ctx.Err()
+		case <-cctx.Done():
+			if ctx.Err() != nil {
+				return time.Since(startedAt), ctx.Err()
+			}
+			// Our own internal `timeout` budget elapsed, not the caller's
+			// ctx — fall through; the loop condition below becomes false
+			// and the timeout-reap-and-error path below runs, exactly as
+			// before this fix.
 		case <-time.After(5 * time.Second):
 		}
 	}
@@ -925,24 +957,20 @@ func (a *AndroidEmulator) WaitForBoot(
 			killReport.Surviving,
 		)
 	} else {
-		// Matched=0 means KillByPort found no process with "-port <consolePort>".
-		// This is possible if the emulator used a different port or if the
-		// process already exited on its own. Fall back to Cleanup() which uses
-		// the broader "qemu-system-" comm prefix.
-		cleanupReport, cleanupErr := Cleanup(ctx)
-		if cleanupErr != nil {
-			fmt.Fprintf(os.Stderr,
-				"[wait-for-boot] Cleanup() fallback after KillByPort matched=0: %v\n",
-				cleanupErr,
-			)
-		} else if len(cleanupReport.Found) > 0 {
-			fmt.Fprintf(os.Stderr,
-				"[wait-for-boot] Cleanup() fallback: found=%v terminated=%v killed=%v\n",
-				cleanupReport.Found,
-				cleanupReport.TerminatedTERM,
-				cleanupReport.KilledKILL,
-			)
-		}
+		// Matched=0 means KillByPort found no process with "-port <consolePort>":
+		// either our emulator on this port already exited (nothing OURS to reap)
+		// or its qemu child does not carry "-port <consolePort>" adjacently. Per
+		// §11.4.174 we do NOT fall back to a host-wide "qemu-system-" comm reap
+		// here — that would SIGKILL foreign / concurrent emulators (and, in
+		// concurrent-matrix mode, sibling emulators mid-test) that merely share
+		// the process name. avd is not in this method's scope, so there is no
+		// ownership token to scope a reap by; a genuinely-stuck OUR emulator that
+		// KillByPort could not match is a KillByPort port-signature gap to fix at
+		// its source, never a host-wide name-kill.
+		fmt.Fprintf(os.Stderr,
+			"[wait-for-boot] KillByPort(%d) matched 0; not falling back to host-wide reap (§11.4.174 ownership scoping)\n",
+			consolePort,
+		)
 	}
 
 	return time.Since(startedAt),
@@ -1074,9 +1102,18 @@ func (a *AndroidEmulator) Teardown(ctx context.Context, port int) error {
 	// means: the localhost:<port> entry is no longer in `adb devices`
 	// output as "device" (it may briefly show "offline" while
 	// disconnecting; that's fine — we treat that as gone).
+	//
+	// EMU-1 (GENY-1/CF-1 class, §11.4.108): bind every `adb devices` poll
+	// exec to a context derived from teardownGracePeriod, NOT the raw
+	// caller ctx. Real callers pass context.Background(); without this, a
+	// wedged `adb devices` hangs Teardown FOREVER past teardownGracePeriod
+	// because the underlying exec.CommandContext(ctx, ...) never gets
+	// cancelled.
 	deadline := time.Now().Add(teardownGracePeriod)
+	cctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	for time.Now().Before(deadline) {
-		devicesOut, derr := a.executor.Execute(ctx, a.adbBinary(), "devices")
+		devicesOut, derr := a.executor.Execute(cctx, a.adbBinary(), "devices")
 		if derr != nil {
 			// Best effort; if adb itself fails, treat as kill-success
 			// so we don't deadlock the matrix runner.
@@ -1099,8 +1136,14 @@ func (a *AndroidEmulator) Teardown(ctx context.Context, port int) error {
 			return nil
 		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-cctx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// Our own internal teardownGracePeriod elapsed, not the
+			// caller's ctx — fall through; the loop condition below
+			// becomes false and the KillByPort fast-path below runs,
+			// exactly as before this fix.
 		case <-time.After(1 * time.Second):
 		}
 	}
@@ -1129,9 +1172,15 @@ func (a *AndroidEmulator) Teardown(ctx context.Context, port int) error {
 		)
 	}
 	// Re-poll briefly for /proc clearing.
+	//
+	// EMU-1 (GENY-1/CF-1 class, §11.4.108): same deadline-binding fix as
+	// the first poll loop above, scoped to this shorter post-KillByPort
+	// grace window.
 	postDeadline := time.Now().Add(5 * time.Second)
+	postCctx, postCancel := context.WithDeadline(ctx, postDeadline)
+	defer postCancel()
 	for time.Now().Before(postDeadline) {
-		devicesOut, derr := a.executor.Execute(ctx, a.adbBinary(), "devices")
+		devicesOut, derr := a.executor.Execute(postCctx, a.adbBinary(), "devices")
 		if derr != nil {
 			return nil
 		}
@@ -1150,8 +1199,14 @@ func (a *AndroidEmulator) Teardown(ctx context.Context, port int) error {
 			return nil
 		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-postCctx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// Our own internal post-KillByPort grace elapsed, not the
+			// caller's ctx — fall through; the loop condition below
+			// becomes false and the final "did not exit" error is
+			// returned, exactly as before this fix.
 		case <-time.After(500 * time.Millisecond):
 		}
 	}

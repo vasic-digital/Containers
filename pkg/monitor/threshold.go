@@ -69,10 +69,26 @@ func resolveMetric(
 ) (float64, bool) {
 	switch {
 	case metric == "system.cpu":
+		// SW2-1: a broken CPU probe (CPUError) cannot be RESOLVED — return
+		// ok=false so Evaluate's `if !ok { continue }` skips the rule instead of
+		// comparing a genuine-looking 0 that silently never fires.
+		if snap.System.CPUError {
+			return 0, false
+		}
 		return snap.System.CPUPercent, true
 	case metric == "system.memory":
+		// SW2-1: broken memory probe — unresolvable, see system.cpu above.
+		if snap.System.MemoryError {
+			return 0, false
+		}
 		return snap.System.MemoryPercent, true
 	case metric == "system.disk":
+		// SW2-1: broken disk probe — unresolvable. This is the load-bearing
+		// case: `system.disk > 90 → page` must NOT silently pass on a 0 when
+		// statfs failed while the disk is actually full.
+		if snap.System.DiskError {
+			return 0, false
+		}
 		return snap.System.DiskPercent, true
 	case strings.HasPrefix(metric, "container."):
 		return resolveContainerMetric(snap, metric)

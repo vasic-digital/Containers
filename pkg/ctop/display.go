@@ -43,6 +43,7 @@ type Display struct {
 }
 
 func NewDisplay(collector *Collector, config DisplayConfig) *Display {
+	config.RefreshRate = sanitizeRefreshRate(config.RefreshRate)
 	return &Display{
 		collector: collector,
 		config:    config,
@@ -53,6 +54,7 @@ func NewDisplay(collector *Collector, config DisplayConfig) *Display {
 }
 
 func NewDisplayWithWriter(collector *Collector, config DisplayConfig, w io.Writer) *Display {
+	config.RefreshRate = sanitizeRefreshRate(config.RefreshRate)
 	return &Display{
 		collector: collector,
 		config:    config,
@@ -60,6 +62,18 @@ func NewDisplayWithWriter(collector *Collector, config DisplayConfig, w io.Write
 		sortBy:    config.SortBy,
 		sortOrder: config.SortOrder,
 	}
+}
+
+// sanitizeRefreshRate clamps a configured refresh rate (milliseconds) to a
+// usable positive value. CT2-4: `time.NewTicker` panics on a duration <= 0,
+// so a zero-value (or negative) `DisplayConfig.RefreshRate` — e.g. from a
+// partial `DisplayConfig{}` literal — must never reach `time.NewTicker`
+// directly; fall back to `DefaultDisplayConfig()`'s rate instead.
+func sanitizeRefreshRate(ms int) int {
+	if ms <= 0 {
+		return DefaultDisplayConfig().RefreshRate
+	}
+	return ms
 }
 
 func (d *Display) Run(ctx context.Context) error {
@@ -80,11 +94,20 @@ func (d *Display) Run(ctx context.Context) error {
 	}()
 
 	ctx, cancel := context.WithCancel(ctx)
+	// CT2-3: publish d.cancel under d.mu — Stop() reads it under d.mu, and an
+	// unsynchronized write here is a data race against a concurrent Stop()
+	// call in the canonical `go d.Run(ctx)` + `d.Stop()` pattern.
+	d.mu.Lock()
 	d.cancel = cancel
+	d.mu.Unlock()
 	defer cancel()
 
+	// CT2-2: SIGWINCH (terminal resize) MUST NOT be treated as a quit signal.
+	// It shares no channel with the quit signals below; `render()` already
+	// calls `d.updateSize()` on every refresh tick, so a resize is picked up
+	// at the next tick without any dedicated redraw plumbing.
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigChan)
 
 	d.hideCursor()
@@ -92,10 +115,13 @@ func (d *Display) Run(ctx context.Context) error {
 
 	d.updateSize()
 
-	ticker := time.NewTicker(time.Duration(d.config.RefreshRate) * time.Millisecond)
+	refreshRate := sanitizeRefreshRate(d.config.RefreshRate)
+	renderTimeout := boundedRenderTimeout(refreshRate)
+
+	ticker := time.NewTicker(time.Duration(refreshRate) * time.Millisecond)
 	defer ticker.Stop()
 
-	d.render(ctx)
+	d.renderBounded(ctx, renderTimeout)
 
 	for {
 		select {
@@ -104,9 +130,45 @@ func (d *Display) Run(ctx context.Context) error {
 		case <-sigChan:
 			return nil
 		case <-ticker.C:
-			d.render(ctx)
+			d.renderBounded(ctx, renderTimeout)
 		}
 	}
+}
+
+// renderBounded runs render() under a per-refresh timeout derived from the
+// display's refresh rate (CT2-1). Without this bound, `render()` calls
+// `collector.Collect(ctx)` synchronously, which can block on a wedged
+// subprocess (podman/docker ps|stats); while blocked, Run()'s single
+// goroutine is NOT in its `select`, so a SIGINT/SIGTERM sitting in the
+// (unread) `sigChan` cannot be translated into a `cancel()` call and the
+// whole TUI — including Ctrl+C — freezes. Bounding each refresh guarantees
+// Run() returns to its `select` (and can react to `sigChan`/`ctx.Done()`)
+// within `timeout` regardless of how long the underlying command wedges.
+// Cancelling the parent ctx (via Stop() or an already-cancelled caller
+// context) still unblocks it immediately, since renderCtx is a child of ctx.
+func (d *Display) renderBounded(ctx context.Context, timeout time.Duration) {
+	renderCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	d.render(renderCtx)
+}
+
+// boundedRenderTimeout derives a per-refresh Collect timeout from the
+// configured refresh rate, with a floor (a very fast refresh rate must not
+// starve a legitimately-slow but healthy collector call) and a ceiling (a
+// very slow refresh rate must not let a wedged call block the render loop —
+// and hence Ctrl+C — for an unreasonable duration).
+func boundedRenderTimeout(refreshRateMS int) time.Duration {
+	const floor = 500 * time.Millisecond
+	const ceiling = 10 * time.Second
+
+	timeout := time.Duration(refreshRateMS) * time.Millisecond
+	if timeout < floor {
+		timeout = floor
+	}
+	if timeout > ceiling {
+		timeout = ceiling
+	}
+	return timeout
 }
 
 func (d *Display) Stop() {
@@ -272,10 +334,20 @@ func (d *Display) renderRow(p ContainerProcess) string {
 	sb.WriteString(d.colorize(d.hostColor(p.Host), padRight(truncate(p.Host, 12), 12)))
 	sb.WriteString(d.colorize(stateColor, padRight(p.State, 8)))
 
-	cpuColor := d.cpuColor(p.CPUPercent)
-	sb.WriteString(d.colorize(cpuColor, padRight(fmt.Sprintf("%.1f%%", p.CPUPercent), 7)))
-	sb.WriteString(d.colorize(d.memColor(p.MemoryPercent), padRight(formatBytes(p.MemoryUsage), 10)))
-	sb.WriteString(d.colorize(d.memColor(p.MemoryPercent), padRight(fmt.Sprintf("%.1f%%", p.MemoryPercent), 7)))
+	if p.StatsUnavailable {
+		// CT3-7 (§11.4.108): a failed/empty stats collection must be
+		// visually distinct from a confirmed 0% reading — colorPurple/"N/A"
+		// never appears in the genuine-reading cpuColor/memColor palette
+		// (green/yellow/red), so it cannot be mistaken for a real value.
+		sb.WriteString(d.colorize(colorPurple, padRight("N/A", 7)))
+		sb.WriteString(d.colorize(colorPurple, padRight("N/A", 10)))
+		sb.WriteString(d.colorize(colorPurple, padRight("N/A", 7)))
+	} else {
+		cpuColor := d.cpuColor(p.CPUPercent)
+		sb.WriteString(d.colorize(cpuColor, padRight(fmt.Sprintf("%.1f%%", p.CPUPercent), 7)))
+		sb.WriteString(d.colorize(d.memColor(p.MemoryPercent), padRight(formatBytes(p.MemoryUsage), 10)))
+		sb.WriteString(d.colorize(d.memColor(p.MemoryPercent), padRight(fmt.Sprintf("%.1f%%", p.MemoryPercent), 7)))
+	}
 	sb.WriteString(d.colorize(colorWhite, padRight(formatNetIO(p.NetworkRx, p.NetworkTx), 12)))
 	sb.WriteString(d.colorize(colorWhite, padRight(formatBlockIO(p.BlockRead, p.BlockWrite), 12)))
 	sb.WriteString(d.colorize(colorWhite, padRight(fmt.Sprintf("%d", p.PIDs), 5)))
@@ -392,18 +464,40 @@ func (d *Display) updateSize() {
 	d.height = height
 }
 
+// padRight pads (or byte-unsafely-truncates, pre-fix) s to width. CT3-10:
+// slicing the raw string by BYTE offset (the old `s[:width]`) can cut a
+// multi-byte UTF-8 rune in half for non-ASCII container/image names,
+// corrupting the rendered cell. Operating on []rune instead makes every
+// slice/count a rune count, so the cut always lands on a rune boundary and
+// the padded width matches the actual number of displayed characters.
 func padRight(s string, width int) string {
-	if len(s) >= width {
-		return s[:width]
+	runes := []rune(s)
+	if len(runes) >= width {
+		if width < 0 {
+			width = 0
+		}
+		return string(runes[:width])
 	}
-	return s + strings.Repeat(" ", width-len(s))
+	return s + strings.Repeat(" ", width-len(runes))
 }
 
+// truncate shortens s to at most maxLen displayed characters, appending "..."
+// when it actually cuts content. CT3-10: the old `s[:maxLen-3]` byte slice
+// could split a multi-byte UTF-8 rune (accented / CJK characters) at the
+// truncation boundary, producing an invalid/corrupted rune in the output.
+// Slicing []rune(s) instead guarantees every cut lands on a rune boundary.
 func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
 		return s
 	}
-	return s[:maxLen-3] + "..."
+	if maxLen <= 3 {
+		if maxLen < 0 {
+			maxLen = 0
+		}
+		return string(runes[:maxLen])
+	}
+	return string(runes[:maxLen-3]) + "..."
 }
 
 func formatBytes(b uint64) string {

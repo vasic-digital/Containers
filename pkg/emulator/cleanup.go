@@ -47,9 +47,11 @@ func (osKiller) Exists(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
 }
 
-// Cleanup finds processes whose comm has the prefix "qemu-system-",
-// sends SIGTERM, waits up to 5 seconds for graceful exit, then
-// SIGKILLs stragglers. Returns a CleanupReport.
+// Cleanup reaps ONLY the qemu-system-* process(es) that belong to the
+// emulator running avdName — ownership established by a strict-adjacent argv
+// match on `-avd <avdName>` (§11.4.174: never a bare comm name-match). It
+// sends SIGTERM, waits up to 5 seconds for graceful exit, then SIGKILLs
+// stragglers. Returns a CleanupReport. An empty avdName is a safe no-op.
 //
 // On Linux the process list is walked via /proc (procFSWalker); on
 // macOS and other POSIX systems it is obtained via `ps -A` (psWalker).
@@ -70,15 +72,30 @@ func (osKiller) Exists(pid int) bool {
 //	          fixture containing "qemu-img" is NOT collected;
 //	          the loosened matcher would include it, failing the test.
 //	Reverted: yes
-func Cleanup(ctx context.Context) (CleanupReport, error) {
-	return cleanupWithDeps(ctx, newOSProcWalker(runtime.GOOS), osKiller{})
+func Cleanup(ctx context.Context, avdName string) (CleanupReport, error) {
+	return cleanupWithDeps(ctx, avdName, newOSProcWalker(runtime.GOOS), osKiller{})
 }
 
 // cleanupWithDeps is the testable core. Production uses Cleanup; tests
 // inject synthetic procWalker + killer.
-func cleanupWithDeps(ctx context.Context, w procWalker, k killer) (CleanupReport, error) {
+//
+// §11.4.174 ownership scoping: the "qemu-system-" comm prefix is ONLY a
+// process-CLASS pre-filter; the LOAD-BEARING ownership proof is the strict-
+// adjacent argv pair `-avd <avdName>` (the exact token Boot passes to the
+// emulator launcher). A qemu-system-* running a DIFFERENT avd — a concurrent
+// matrix instance, another track's emulator, a developer VM — is NEVER
+// signalled. An empty avdName is REFUSED (safe no-op): we never fall back to
+// a bare host-wide name match.
+func cleanupWithDeps(ctx context.Context, avdName string, w procWalker, k killer) (CleanupReport, error) {
 	var report CleanupReport
+	if avdName == "" {
+		return report, nil
+	}
 	pidComms, err := w.PidComms()
+	if err != nil {
+		return report, err
+	}
+	cmdlines, err := w.PidCmdlines()
 	if err != nil {
 		return report, err
 	}
@@ -87,9 +104,12 @@ func cleanupWithDeps(ctx context.Context, w procWalker, k killer) (CleanupReport
 			report.SkippedReadErr = append(report.SkippedReadErr, pid)
 			continue
 		}
-		// STRICT prefix: "qemu-system-" with trailing dash. NOT "qemu-".
-		// Falsifiability mutation target — see TestCleanup_StrictPrefix.
-		if strings.HasPrefix(comm, "qemu-system-") {
+		// STRICT prefix pre-filter ("qemu-system-", trailing dash, NOT
+		// "qemu-") AND the argv ownership gate. Falsifiability targets:
+		// TestCleanup_StrictPrefix (prefix) + TestCleanup_OwnershipScopedToOurAVD
+		// (argv -avd ownership).
+		if strings.HasPrefix(comm, "qemu-system-") &&
+			argvHasAdjacent(cmdlines[pid], "-avd", avdName) {
 			report.Found = append(report.Found, pid)
 		}
 	}
@@ -141,6 +161,19 @@ func cleanupWithDeps(ctx context.Context, w procWalker, k killer) (CleanupReport
 		}
 	}
 	return report, nil
+}
+
+// argvHasAdjacent reports whether argv contains flag immediately followed by
+// val as adjacent tokens — the same strict-adjacent discipline KillByPort's
+// "-port <n>" matcher uses. Substring matches are intentionally NOT honoured
+// (that is the §11.4.174 name-match bluff vector this gate exists to prevent).
+func argvHasAdjacent(argv []string, flag, val string) bool {
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] == flag && argv[i+1] == val {
+			return true
+		}
+	}
+	return false
 }
 
 // KillReport summarises the outcome of a KillByPort invocation.

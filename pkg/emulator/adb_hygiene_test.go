@@ -165,8 +165,8 @@ func TestResetADBHygiene_NoPhantomEntries(t *testing.T) {
 	adbPath := "/sdk/platform-tools/adb"
 	fake := &fakeExecutor{
 		scripts: map[string]fakeScript{
-			adbPath + " devices":     {Out: []byte("List of devices attached\nemulator-5554\tdevice\n")},
-			adbPath + " kill-server": {Out: []byte("")},
+			adbPath + " devices":      {Out: []byte("List of devices attached\nemulator-5554\tdevice\n")},
+			adbPath + " kill-server":  {Out: []byte("")},
 			adbPath + " start-server": {Out: []byte("* daemon started successfully\n")},
 		},
 	}
@@ -214,7 +214,7 @@ func TestCaptureBootDiagnostic_CapturesADBDevices(t *testing.T) {
 	devicesOutput := "List of devices attached\nemulator-5554\tdevice"
 	fake := &fakeExecutor{
 		scripts: map[string]fakeScript{
-			adbPath + " devices":                                {Out: []byte(devicesOutput + "\n")},
+			adbPath + " devices":                         {Out: []byte(devicesOutput + "\n")},
 			adbPath + " -s localhost:5555 shell getprop": {Out: []byte("[ro.build.version.sdk]: [34]\n")},
 		},
 	}
@@ -240,7 +240,7 @@ func TestCaptureBootDiagnostic_CapturesGetProp(t *testing.T) {
 	adbPath := "/sdk/platform-tools/adb"
 	fake := &fakeExecutor{
 		scripts: map[string]fakeScript{
-			adbPath + " devices":                                {Out: []byte("List of devices attached\n")},
+			adbPath + " devices":                         {Out: []byte("List of devices attached\n")},
 			adbPath + " -s localhost:5555 shell getprop": {Out: []byte("[ro.build.version.sdk]: [34]\n")},
 		},
 	}
@@ -282,7 +282,7 @@ func TestCaptureBootDiagnostic_WritesEvidenceFile(t *testing.T) {
 	adbPath := "/sdk/platform-tools/adb"
 	fake := &fakeExecutor{
 		scripts: map[string]fakeScript{
-			adbPath + " devices":                                {Out: []byte("List of devices attached\n")},
+			adbPath + " devices":                         {Out: []byte("List of devices attached\n")},
 			adbPath + " -s localhost:5556 shell getprop": {Out: []byte("[ro.product.name]: [sdk_gphone_x86]\n")},
 		},
 	}

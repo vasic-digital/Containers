@@ -8,7 +8,17 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// TestDefaultDiscoveryTimeout_Value locks the single hoisted default probe
+// timeout shared by the DNS and TCP discoverers (§6.R de-duplication). This
+// is a HYGIENE test pinning the const's value — NOT a §11.4.115 RED->GREEN
+// behavioural guard: hoisting the two duplicate literals into this const
+// preserves the identical 5s value, there is no defect to reproduce.
+func TestDefaultDiscoveryTimeout_Value(t *testing.T) {
+	assert.Equal(t, 5*time.Second, defaultDiscoveryTimeout)
+}
 
 // mockHostLookup is a test double for DNS lookups.
 type mockHostLookup struct {
@@ -109,6 +119,73 @@ func TestDNSDiscoverer_Discover_NilLookup(t *testing.T) {
 	found, err := d.Discover(ctx, target)
 	assert.True(t, found)
 	assert.NoError(t, err)
+}
+
+// TestDNSDiscoverer_Discover_DistinguishesIndeterminateFromNotFound is the
+// §11.4.115 regression guard for DISC-3: a bare found==false conflates a
+// genuinely-absent name (NXDOMAIN-class) with an indeterminate probe outcome
+// (context cancel/timeout). Discover's doc comment promises this IS
+// distinguishable by inspecting the wrapped error's class
+// (errors.Is(err, context.Canceled/DeadlineExceeded), a net.Error.Timeout()
+// assertion) — this test proves that promise holds for all three canonical
+// classes, rather than trusting the doc comment alone.
+//
+// §11.4.115 surgical-revert evidence: changing the trailing "%w" verb to
+// "%v" in DNSDiscoverer.Discover's lookup-error wrap (dns.go) breaks the
+// Unwrap chain these assertions depend on. That revert was performed,
+// confirmed `--- FAIL` on this test, and reverted back to "%w" — see the
+// DISC-3 finding note in the containers pkg/discovery work log for the
+// captured command + output.
+func TestDNSDiscoverer_Discover_DistinguishesIndeterminateFromNotFound(t *testing.T) {
+	target := DiscoveryTarget{
+		Name:    "distinguish",
+		Host:    "example.invalid",
+		Method:  "dns",
+		Timeout: time.Second,
+	}
+
+	t.Run("cancelled context is indeterminate", func(t *testing.T) {
+		d := &DNSDiscoverer{lookup: &mockHostLookup{err: context.Canceled}}
+		found, err := d.Discover(context.Background(), target)
+		assert.False(t, found)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, context.Canceled),
+			"a cancelled probe MUST be classifiable as indeterminate via errors.Is(err, context.Canceled)")
+	})
+
+	t.Run("resolver timeout is indeterminate, not absence", func(t *testing.T) {
+		d := &DNSDiscoverer{lookup: &mockHostLookup{
+			err: &net.DNSError{Err: "i/o timeout", Name: target.Host, IsTimeout: true},
+		}}
+		found, err := d.Discover(context.Background(), target)
+		assert.False(t, found)
+		require.Error(t, err)
+		assert.False(t, errors.Is(err, context.Canceled),
+			"an indeterminate timeout MUST NOT be misclassified as the cancelled-context case")
+		var netErr net.Error
+		require.True(t, errors.As(err, &netErr), "wrapped cause must unwrap to a net.Error")
+		assert.True(t, netErr.Timeout(),
+			"an indeterminate resolver timeout MUST report Timeout()==true")
+	})
+
+	t.Run("NXDOMAIN-class not-found is definitive, not indeterminate", func(t *testing.T) {
+		d := &DNSDiscoverer{lookup: &mockHostLookup{
+			err: &net.DNSError{Err: "no such host", Name: target.Host, IsNotFound: true},
+		}}
+		found, err := d.Discover(context.Background(), target)
+		assert.False(t, found)
+		require.Error(t, err)
+		assert.False(t, errors.Is(err, context.Canceled),
+			"a definitive not-found MUST NOT be misclassified as the cancelled-context case")
+		var netErr net.Error
+		require.True(t, errors.As(err, &netErr))
+		assert.False(t, netErr.Timeout(),
+			"a definitive not-found MUST NOT report Timeout()==true (that signature is reserved for the indeterminate case)")
+		var dnsErr *net.DNSError
+		require.True(t, errors.As(err, &dnsErr))
+		assert.True(t, dnsErr.IsNotFound,
+			"the definitive-absence detail must survive the wrap so callers can tell it apart from an indeterminate probe failure")
+	})
 }
 
 // TestDefaultHostLookup tests the default host lookup implementation.

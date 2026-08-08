@@ -16,6 +16,21 @@ type ResourceSnapshot struct {
 	// Containers holds per-container resource metrics keyed by
 	// container name.
 	Containers map[string]ContainerResources
+	// ListError is true when the container runtime's List call failed
+	// during this collection. When set, Containers is NOT authoritative:
+	// a runtime outage must not read as "0 containers, all healthy". A
+	// consumer distinguishes a genuinely empty host (ListError=false,
+	// len(Containers)==0) from a probe failure (ListError=true) via this
+	// flag (CT-HARDEN-MON-HARD MON-3). It does not change that a listed
+	// container whose Stats probe fails is still dropped from Containers.
+	ListError bool
+	// StatsFailures counts containers that WERE listed but whose
+	// per-container Stats probe failed and were therefore dropped from
+	// Containers. A non-zero value means Containers under-reports the
+	// running set — the drop itself is preserved (existing intended
+	// behavior); this only surfaces that it happened
+	// (CT-HARDEN-MON-HARD MON-3).
+	StatsFailures int
 }
 
 // SystemResources holds host-level CPU, memory, and disk metrics.
@@ -27,6 +42,20 @@ type SystemResources struct {
 	MemoryUsed    uint64
 	DiskTotal     uint64
 	DiskUsed      uint64
+	// SW2-1: per-metric collection-failure signals. When a host-metric probe
+	// FAILS, the corresponding *Percent field is left at the Go zero (0.0),
+	// which is indistinguishable from a genuinely-idle host — so an operator
+	// rule like `system.disk > 90 → page` would NEVER fire when the probe is
+	// broken while the disk is actually full. These flags let a consumer (and
+	// resolveMetric) distinguish a probe FAILURE from a genuine-zero reading,
+	// mirroring ResourceSnapshot.ListError one layer up (CT-HARDEN-MON-HARD
+	// MON-3). CPUError is set when /proc/stat is unreadable/malformed;
+	// MemoryError when /proc/meminfo is unreadable OR carries no usable
+	// available-memory figure; DiskError when the statfs probe errors. On the
+	// SUCCESS path each stays false and the *Percent value is authoritative.
+	CPUError    bool
+	MemoryError bool
+	DiskError   bool
 }
 
 // ContainerResources holds resource usage for a single container.
@@ -81,17 +110,36 @@ func NewClusterSnapshot(
 	local *ResourceSnapshot,
 	remoteHosts map[string]*remote.HostResources,
 ) *ClusterSnapshot {
+	// Count the local host ONLY when a local snapshot is actually present. The
+	// `if local != nil` guard below proves nil-local is an anticipated input,
+	// and the sibling nil-REMOTE path (`if hr == nil { continue }`, CT-HARDEN-MON-2)
+	// established the intent "a host with no resource data is NOT counted". A nil
+	// local is exactly such a host, so seeding HostCount=1 unconditionally
+	// over-reported the cluster size and skewed per-host averages when the local
+	// probe was absent (CT-HARDEN-MON2HARD MON2-2).
+	localHostCount := 0
+	if local != nil {
+		localHostCount = 1
+	}
 	cs := &ClusterSnapshot{
 		Timestamp:   time.Now(),
 		Local:       local,
 		RemoteHosts: remoteHosts,
-		HostCount:   1, // local host
+		HostCount:   localHostCount,
 	}
 	if local != nil {
 		cs.TotalMemoryMB = local.System.MemoryTotal / (1024 * 1024)
 		cs.TotalDiskMB = local.System.DiskTotal / (1024 * 1024)
 	}
 	for _, hr := range remoteHosts {
+		// Skip a nil host-resources value: the map values are pointers, so a
+		// caller may legitimately map a host name to nil (a host with no
+		// resource data). This mirrors the `if local != nil` guard above and
+		// avoids a nil deref on hr's fields (CT-HARDEN-MON-2). A nil host
+		// contributes nothing and is not counted toward HostCount.
+		if hr == nil {
+			continue
+		}
 		cs.HostCount++
 		cs.TotalCPUCores += hr.CPUCores
 		cs.TotalMemoryMB += hr.MemoryTotalMB

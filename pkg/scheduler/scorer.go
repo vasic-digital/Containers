@@ -1,6 +1,9 @@
 package scheduler
 
 import (
+	"strconv"
+	"strings"
+
 	"digital.vasic.containers/pkg/remote"
 )
 
@@ -105,7 +108,10 @@ func (s *ResourceScorer) CanFit(
 	if req.GPU != nil {
 		matches := matchingGPUs(resources.GPU, *req.GPU)
 		need := req.GPU.Count
-		if need == 0 {
+		// A negative Count is nonsensical; treat it (like zero) as the
+		// documented "defaults to 1", so it cannot make len(matches) < need
+		// vacuously false and bypass the availability check (CT-HARDEN-SCHED-1).
+		if need <= 0 {
 			need = 1
 		}
 		if len(matches) < need {
@@ -221,7 +227,12 @@ func (s *ResourceScorer) scoreGPU(
 			best = g
 		}
 	}
-	if best.VRAMFreeMB == 0 {
+	// Non-positive free VRAM (0, or negative from an over-subscribed / bad
+	// telemetry reading) scores 0 (worst), never a false maximum: with
+	// MinVRAMMB==0 a negative best.VRAMFreeMB would give negative/negative ==
+	// 1.0. This matches the `<= 0` headroom guards in scoreCPU/scoreMemory/
+	// scoreDisk (CT-HARDEN-SCHED-2).
+	if best.VRAMFreeMB <= 0 {
 		return 0
 	}
 	ratio := float64(best.VRAMFreeMB-req.GPU.MinVRAMMB) /
@@ -236,23 +247,31 @@ func matchingGPUs(
 ) []remote.GPUDevice {
 	out := make([]remote.GPUDevice, 0, len(host))
 	for _, g := range host {
-		if req.Vendor != "" && g.Vendor != req.Vendor {
-			continue
+		if gpuMatchesReq(g, req) {
+			out = append(out, g)
 		}
-		if req.MinVRAMMB > 0 && g.VRAMFreeMB < req.MinVRAMMB {
-			continue
-		}
-		if req.MinCompute != "" && g.ComputeCapability < req.MinCompute {
-			// string compare works for "8.6" vs "8.0"; for 10.x+ a
-			// proper parse may be needed later.
-			continue
-		}
-		if !capabilitiesMatch(g, req.Capabilities) {
-			continue
-		}
-		out = append(out, g)
 	}
 	return out
+}
+
+// gpuMatchesReq reports whether a single host GPU satisfies req. Extracted from
+// matchingGPUs (behavior byte-identical) so the within-batch GPU deduction
+// (deductGPU in scheduler.go, CT-HARDEN-SCHED-1/Wave-20) reuses the same match
+// predicate rather than re-implementing (and risking divergence from) it.
+func gpuMatchesReq(g remote.GPUDevice, req GPURequirement) bool {
+	if req.Vendor != "" && g.Vendor != req.Vendor {
+		return false
+	}
+	if req.MinVRAMMB > 0 && g.VRAMFreeMB < req.MinVRAMMB {
+		return false
+	}
+	if req.MinCompute != "" && computeCapabilityLess(g.ComputeCapability, req.MinCompute) {
+		return false
+	}
+	if !capabilitiesMatch(g, req.Capabilities) {
+		return false
+	}
+	return true
 }
 
 func capabilitiesMatch(g remote.GPUDevice, req []string) bool {
@@ -287,4 +306,44 @@ func capabilitiesMatch(g remote.GPUDevice, req []string) bool {
 		}
 	}
 	return true
+}
+
+// computeCapabilityLess reports whether compute-capability a is less than b,
+// comparing "major.minor" version strings (e.g. "8.6", "10.0") numerically
+// component-by-component. A pure lexicographic string compare breaks the moment
+// either side reaches a double-digit major version — "10.0" < "8.0" is true
+// lexicographically but false numerically — which is real on current-generation
+// GPU hardware (compute capability 10.x/12.x). Falls back to the original
+// lexicographic compare when either string does not parse as numeric
+// major[.minor], so malformed input keeps its prior (already-documented)
+// behavior rather than panicking or guessing (CT-HARDEN-SCHED-3).
+func computeCapabilityLess(a, b string) bool {
+	aMajor, aMinor, aOK := parseComputeCapability(a)
+	bMajor, bMinor, bOK := parseComputeCapability(b)
+	if !aOK || !bOK {
+		return a < b
+	}
+	if aMajor != bMajor {
+		return aMajor < bMajor
+	}
+	return aMinor < bMinor
+}
+
+// parseComputeCapability parses a "major.minor" or bare "major" version string
+// into integer components. ok is false if the string does not parse cleanly, so
+// the caller can fall back to a lexicographic compare instead of guessing.
+func parseComputeCapability(v string) (major, minor int, ok bool) {
+	parts := strings.SplitN(v, ".", 2)
+	m, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, false
+	}
+	if len(parts) == 1 {
+		return m, 0, true
+	}
+	n, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, false
+	}
+	return m, n, true
 }

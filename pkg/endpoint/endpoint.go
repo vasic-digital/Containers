@@ -1,11 +1,43 @@
 package endpoint
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"digital.vasic.containers/internal/netaddr"
 )
+
+// Package-wide defaults. Centralised as named constants (§6.R) so the
+// same value is not spelled as a literal across builder.go, config.go,
+// endpoint.go, and resolver.go. These are the WithHost/WithHealthType/
+// scheme-overridable defaults, not hardcoded connection targets.
+const (
+	// defaultHost is the fallback host when an endpoint specifies none.
+	defaultHost = "localhost"
+	// defaultScheme is the URL scheme applied when the host/URL carries
+	// no explicit http://|https:// prefix.
+	defaultScheme = "http"
+	// defaultHealthType is the health-check type applied when unset.
+	defaultHealthType = "http"
+	// defaultRetryCount is the health-check retry count applied when unset.
+	defaultRetryCount = 3
+)
+
+// defaultTimeout is the health-check timeout applied when unset.
+const defaultTimeout = 10 * time.Second
+
+// knownHealthTypes is the closed set of health-check mechanisms the
+// health package recognises (see pkg/health/types.go). Validate rejects
+// any other non-empty value. Empty is permitted (defaulted downstream).
+var knownHealthTypes = map[string]struct{}{
+	"http":   {},
+	"tcp":    {},
+	"grpc":   {},
+	"custom": {},
+}
 
 // ServiceEndpoint holds the configuration for a single service
 // endpoint, including connectivity, health checking, and discovery
@@ -77,24 +109,119 @@ func (e *ServiceEndpoint) ResolvedURL() string {
 }
 
 // resolveURL builds a URL from host, port, and an optional path.
+//
+// EP-1 / HXC-218: host:port assembly brackets an IPv6 literal ("[::1]:8080")
+// so the result is url.Parse-able, while IPv4/hostnames are left unchanged.
+// Any scheme prefix embedded in host is preserved and split off first, so the
+// join only ever sees the bare host authority (a scheme's "://" colon must not
+// trigger bracketing). The bracketing rule is netaddr's, not net's — see the
+// body for why, and internal/netaddr for the rule itself.
 func resolveURL(host, port, path string) string {
 	if host == "" {
-		host = "localhost"
+		host = defaultHost
 	}
-	// Bracket in both branches: an IPv6 literal is just as malformed inside
-	// "http://::1" as it is inside "http://::1:9000". A host that is already
-	// a full URL is left untouched, so the scheme check below still sees it.
-	base := netaddr.BracketHost(host)
+	scheme := defaultScheme + "://"
+	bareHost := host
+	switch {
+	case strings.HasPrefix(host, "https://"):
+		scheme = "https://"
+		bareHost = strings.TrimPrefix(host, "https://")
+	case strings.HasPrefix(host, "http://"):
+		scheme = "http://"
+		bareHost = strings.TrimPrefix(host, "http://")
+	}
+	// Bracket in BOTH branches. An IPv6 literal is just as malformed inside
+	// "http://::1" as inside "http://::1:9000": with no port, url.Parse reads
+	// the literal's final group AS a port. Splitting the scheme off first (the
+	// upstream half of this merge) is kept because it additionally repairs
+	// Host="https://::1", where a scheme-preserving check alone cannot see the
+	// bare literal underneath; bracketing before the port test is kept because
+	// the upstream no-port branch left the authority unbracketed.
+	//
+	// netaddr.JoinHostPort replaces net.JoinHostPort(unbracketHost(...)): it
+	// brackets only what net.ParseIP confirms is an IPv6 literal, so an
+	// already-bracketed "[::1]" passes straight through rather than being
+	// unwrapped and re-wrapped — EP2-1's outcome without the round trip — and
+	// the v4-mapped and zoned forms are covered too.
+	authority := netaddr.BracketHost(bareHost)
 	if port != "" {
-		base = netaddr.JoinHostPort(host, port)
+		authority = netaddr.JoinHostPort(bareHost, port)
 	}
-	if !strings.HasPrefix(base, "http://") &&
-		!strings.HasPrefix(base, "https://") {
-		base = "http://" + base
-	}
+	base := scheme + authority
 	if path != "" {
 		path = "/" + strings.TrimLeft(path, "/")
 		return base + path
 	}
 	return base
+}
+
+// Validate reports whether the endpoint is internally consistent.
+//
+// EP-3/EP-4: Validate is ADDITIVE — it does NOT change the Build()
+// contract. A plain Build() still returns the value unchecked for
+// backward compatibility; callers opt into checking via Validate() (or
+// the BuildValidated helper). It catches: a non-numeric or out-of-range
+// port; a host containing whitespace/control characters; an unknown
+// health type; and an enabled-or-required endpoint that specifies no
+// host and no url (the empty-host case that resolveURL would otherwise
+// silently mask to localhost).
+func (e *ServiceEndpoint) Validate() error {
+	if e.Port != "" {
+		n, err := strconv.Atoi(e.Port)
+		if err != nil {
+			return fmt.Errorf(
+				"endpoint: invalid port %q: not numeric", e.Port,
+			)
+		}
+		if n < 1 || n > 65535 {
+			return fmt.Errorf(
+				"endpoint: port %d out of range 1-65535", n,
+			)
+		}
+	}
+	if e.Host != "" && hasSpaceOrControl(e.Host) {
+		return fmt.Errorf(
+			"endpoint: host %q contains whitespace or control characters",
+			e.Host,
+		)
+	}
+	if e.HealthType != "" {
+		if _, ok := knownHealthTypes[strings.ToLower(e.HealthType)]; !ok {
+			return fmt.Errorf(
+				"endpoint: unknown health type %q", e.HealthType,
+			)
+		}
+	}
+	if (e.Enabled || e.Required) && e.Host == "" && e.URL == "" {
+		return fmt.Errorf(
+			"endpoint: enabled/required endpoint needs a host or url",
+		)
+	}
+	return nil
+}
+
+// hasSpaceOrControl reports whether s contains any Unicode whitespace or
+// control character — an invalid host/authority component.
+func hasSpaceOrControl(s string) bool {
+	for _, r := range s {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// unbracketHost removes a single surrounding "[" "]" pair from an
+// already-bracketed IPv6 host literal (e.g. "[::1]" -> "::1"). A downstream
+// net.JoinHostPort re-adds exactly one bracket layer for a colon-bearing
+// host, so without this an already-bracketed input double-wraps into an
+// invalid "[[::1]]:port" (rejected by url.Parse). Only a bracketed literal
+// whose inner text contains a colon (a genuine IPv6 address) is unwrapped;
+// IPv4 / hostname / bare-IPv6 / other bracketed text is returned unchanged.
+func unbracketHost(h string) string {
+	if len(h) >= 2 && h[0] == '[' && h[len(h)-1] == ']' &&
+		strings.Contains(h[1:len(h)-1], ":") {
+		return h[1 : len(h)-1]
+	}
+	return h
 }

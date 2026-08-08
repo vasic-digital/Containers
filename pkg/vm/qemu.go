@@ -1,10 +1,13 @@
 package vm
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -17,16 +20,65 @@ type processRunner interface {
 
 type osProcessRunner struct{}
 
+// livenessCheckWindow bounds how long StartDetached waits after a
+// successful Start() before deciding the process is "alive" (returns
+// nil — normal detached success) vs "dead on arrival" (returns a
+// diagnostic error citing captured stderr).
+//
+// VM2-2: Boot (see Boot below) previously returned BootResult{Started:
+// true} from cmd.Start() alone, with Stdout/Stderr both discarded
+// (=nil). A dead-on-arrival qemu-system (bad QCowPath, monitor/ssh port
+// already bound, -enable-kvm permission denied) throws away every
+// diagnostic in that world, and WaitForReady only fails after burning
+// the ENTIRE BootTimeout with a generic "did not become ready" message
+// — the real cause is invisible. Capturing stderr AND giving the
+// process a short window to crash-and-report closes that gap while
+// staying proportionate: a genuinely-booting QEMU is unaffected (it is
+// still running past the window, so StartDetached returns nil exactly
+// as before, merely livenessCheckWindow later — negligible next to a
+// multi-second VM boot).
+var livenessCheckWindow = 300 * time.Millisecond
+
+// qemuDriveFile builds the `-drive file=<path>,if=virtio` value, escaping any
+// comma in the path as `,,` per QEMU's -drive option grammar (comma is the
+// key=value delimiter, so an unescaped comma in the path would split the option
+// and misparse the drive). QCowPath is a content-addressed cache path, so a
+// comma is not expected in practice — this is defense-in-depth (Wave-20
+// SITE-10b ARGSWEEP) for a path that ever carries one. Pure function, unit
+// testable without a live QEMU.
+func qemuDriveFile(qcowPath string) string {
+	return "file=" + strings.ReplaceAll(qcowPath, ",", ",,") + ",if=virtio"
+}
+
 func (osProcessRunner) StartDetached(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
+	var stderrBuf bytes.Buffer
 	cmd.Stdout = nil
-	cmd.Stderr = nil
+	cmd.Stderr = &stderrBuf
 	cmd.Stdin = nil
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	go func() { _ = cmd.Wait() }()
-	return nil
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	select {
+	case waitErr := <-waitDone:
+		// Dead on arrival: the process exited within the liveness
+		// window. Surface whatever it wrote to stderr as the real
+		// diagnostic instead of letting the caller burn the entire
+		// BootTimeout on an uninformative "did not become ready".
+		stderrOut := strings.TrimSpace(stderrBuf.String())
+		if stderrOut != "" {
+			return fmt.Errorf("%s exited immediately (%v); stderr: %s", name, waitErr, truncate(stderrOut, 4096))
+		}
+		return fmt.Errorf("%s exited immediately (%v); no stderr captured", name, waitErr)
+	case <-time.After(livenessCheckWindow):
+		// Still running past the liveness window — detach as before.
+		// Keep draining Wait() in the background so the child never
+		// becomes a zombie.
+		go func() { <-waitDone }()
+		return nil
+	}
 }
 
 // sshClient abstracts SSH session + SCP operations.
@@ -68,6 +120,23 @@ type QEMUVM struct {
 	kvmAvailable bool
 	nextSSHPort  atomic.Int32 // starts at 10022
 	nextMonPort  atomic.Int32 // starts at 14444
+
+	authMu     sync.Mutex
+	authedPort int // sshPort already authenticated; 0 = not authenticated
+
+	// guestMu serializes every guest-facing operation (Upload / Run /
+	// Download / Teardown's QMP+SSH-close stage / ApplyNetworkConditions
+	// / CaptureScreenshot) across the FULL authenticate-then-execute
+	// sequence of a single call. v.ssh and v.qmp are ONE shared
+	// connection per *QEMUVM, but cmd/vm-matrix/main.go wires exactly one
+	// *QEMUVM into NewQEMUMatrixRunner and --concurrent>1 dispatches N
+	// worker goroutines against it concurrently. Without this lock,
+	// ensureAuthenticated releases authMu before the caller's guest op
+	// executes, so target A's op can silently run against a session a
+	// concurrent target B just re-authenticated (cross-target session
+	// contamination) — see CT-HARDEN-VM-1. Lock ordering is always
+	// guestMu → authMu (never the reverse).
+	guestMu sync.Mutex
 }
 
 // NewQEMUVM constructs a production QEMUVM.
@@ -82,9 +151,22 @@ func newQEMUVMWithDeps(p processRunner, s sshClient, q qmpClient, kvm bool) *QEM
 	return v
 }
 
+// kvmAvailable reports whether /dev/kvm is genuinely usable — not merely
+// present. A stat-only check (the pre-fix implementation) can report
+// "available" when /dev/kvm exists but the current user lacks
+// read/write permission on it (a common host-config gap), which then
+// leads Boot to pass -enable-kvm to a qemu-system that immediately
+// fails with a permission error — one of the VM2-2 dead-on-arrival
+// scenarios. Actually opening (and immediately closing) the device is
+// the low-risk fix: it fails exactly when qemu-system's own
+// KVM_CREATE_VM open would fail, and succeeds exactly when it would.
 func kvmAvailable() bool {
-	_, err := os.Stat("/dev/kvm")
-	return err == nil
+	f, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return true
 }
 
 func qemuBinary(arch string) string {
@@ -115,7 +197,7 @@ func (v *QEMUVM) Boot(ctx context.Context, config VMConfig) (BootResult, error) 
 		"-smp", "2",
 		"-nographic",
 		"-no-reboot",
-		"-drive", "file=" + config.QCowPath + ",if=virtio",
+		"-drive", qemuDriveFile(config.QCowPath),
 		"-netdev", fmt.Sprintf("user,id=net0,hostfwd=tcp:127.0.0.1:%d-:22", sshPort),
 		"-device", "virtio-net-pci,netdev=net0",
 		"-monitor", fmt.Sprintf("tcp:127.0.0.1:%d,server,nowait", monPort),
@@ -177,14 +259,81 @@ func (v *QEMUVM) WaitForReady(ctx context.Context, sshPort int, timeout time.Dur
 	return fmt.Errorf("vm on ssh port %d did not become ready within %s", sshPort, timeout)
 }
 
+// ensureAuthenticated performs the SSH handshake + userauth for sshPort
+// exactly once per port before any guest interaction. The I4 split
+// (see the sshClient interface doc) deliberately makes WaitForReady a
+// listener-up-only probe; the actual authentication MUST happen here,
+// before Upload/Run/Download, or every real guest call fails with
+// "not authenticated". Re-authenticating on every op would re-dial and
+// leak the prior *ssh.Client, so the authenticated port is cached and
+// reset on Teardown.
+func (v *QEMUVM) ensureAuthenticated(ctx context.Context, sshPort int) error {
+	v.authMu.Lock()
+	defer v.authMu.Unlock()
+	if v.authedPort == sshPort {
+		return nil
+	}
+	if err := v.ssh.Authenticate(ctx, sshPort, 30*time.Second); err != nil {
+		return err
+	}
+	v.authedPort = sshPort
+	return nil
+}
+
 func (v *QEMUVM) Upload(ctx context.Context, sshPort int, hostPath, vmPath string) error {
+	v.guestMu.Lock()
+	defer v.guestMu.Unlock()
+	if err := v.ensureAuthenticated(ctx, sshPort); err != nil {
+		return fmt.Errorf("qemu upload: authenticate ssh port %d: %w", sshPort, err)
+	}
 	return v.ssh.Upload(ctx, hostPath, vmPath)
 }
 
 func (v *QEMUVM) Run(ctx context.Context, sshPort int, script string, env map[string]string, timeout time.Duration) (string, string, int, error) {
+	v.guestMu.Lock()
+	defer v.guestMu.Unlock()
+	if err := v.ensureAuthenticated(ctx, sshPort); err != nil {
+		return "", "", -1, fmt.Errorf("qemu run: authenticate ssh port %d: %w", sshPort, err)
+	}
 	return v.ssh.Run(ctx, script, env, timeout)
 }
 
 func (v *QEMUVM) Download(ctx context.Context, sshPort int, vmPath, hostPath string) error {
+	v.guestMu.Lock()
+	defer v.guestMu.Unlock()
+	if err := v.ensureAuthenticated(ctx, sshPort); err != nil {
+		return fmt.Errorf("qemu download: authenticate ssh port %d: %w", sshPort, err)
+	}
 	return v.ssh.Download(ctx, vmPath, hostPath)
+}
+
+// ApplyNetworkConditions authenticates sshPort (if it is not already the
+// currently-authenticated session) and then applies the in-guest tc-qdisc
+// network shaping, all under guestMu. This replaces the raw-client
+// exposer (sshClientForNetwork) the matrix runner previously used: that
+// path called applyNetworkConditionsVM directly on an UNAUTHENTICATED
+// v.ssh (nothing had authenticated for this VM's port yet at network-
+// shaping time), so against the real client the tc command always failed
+// with "not authenticated" (CT-HARDEN-VM-2). Folding ensureAuthenticated
+// in — and holding guestMu across it — closes both the ordering bug and
+// the CT-HARDEN-VM-1 race where a concurrent target's Authenticate could
+// land between this authentication and the tc-qdisc execution.
+func (v *QEMUVM) ApplyNetworkConditions(ctx context.Context, sshPort int, conditions NetworkConditions) error {
+	v.guestMu.Lock()
+	defer v.guestMu.Unlock()
+	if err := v.ensureAuthenticated(ctx, sshPort); err != nil {
+		return fmt.Errorf("apply network conditions: authenticate ssh port %d: %w", sshPort, err)
+	}
+	return applyNetworkConditionsVM(ctx, v.ssh, conditions)
+}
+
+// CaptureScreenshot serializes forensic QMP screendump capture under
+// guestMu so a concurrent target cannot Dial/read the shared qmp
+// connection against another target's monitor socket mid-capture
+// (corrupting a forensic evidence artifact). This replaces the raw-qmp
+// exposer (qmpClientForScreenshot). See CT-HARDEN-VM-1.
+func (v *QEMUVM) CaptureScreenshot(ctx context.Context, monitorPort int, dstPath string) error {
+	v.guestMu.Lock()
+	defer v.guestMu.Unlock()
+	return CaptureScreenshotVM(ctx, v.qmp, monitorPort, dstPath)
 }

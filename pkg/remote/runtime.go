@@ -70,7 +70,7 @@ func (r *RemoteRuntime) Start(
 	id string,
 	opts ...runtime.StartOption,
 ) error {
-	cmd := fmt.Sprintf("start %s", id)
+	cmd := fmt.Sprintf("start %s", shellEscape(id))
 	_, err := r.exec(ctx, cmd)
 	return err
 }
@@ -81,7 +81,7 @@ func (r *RemoteRuntime) Stop(
 	id string,
 	opts ...runtime.StopOption,
 ) error {
-	cmd := fmt.Sprintf("stop %s", id)
+	cmd := fmt.Sprintf("stop %s", shellEscape(id))
 	_, err := r.exec(ctx, cmd)
 	return err
 }
@@ -92,20 +92,33 @@ func (r *RemoteRuntime) Remove(
 	id string,
 	opts ...runtime.RemoveOption,
 ) error {
-	cmd := fmt.Sprintf("rm -f %s", id)
+	cmd := fmt.Sprintf("rm -f %s", shellEscape(id))
 	_, err := r.exec(ctx, cmd)
 	return err
 }
+
+// statusInspectFormat is the Go template passed to `<runtime> inspect
+// --format` by Status. The health field is GUARDED with
+// `{{if .State.Health}}...{{end}}`: a container created WITHOUT a
+// HEALTHCHECK (the common case) has a nil .State.Health pointer (docker
+// *types.Health / podman *define.HealthCheckResults). An unguarded
+// `{{.State.Health.Status}}` makes the runtime abort the ENTIRE inspect
+// with "nil pointer evaluating ...HealthCheckResults.Status" (exit 125),
+// so Status returns that error and reports nothing at all. The guard emits
+// an empty health field for a no-healthcheck container while still
+// reporting a real health status when a healthcheck IS defined. Every
+// field stays `|`-separated so parseRemoteStatus still sees 7 fields.
+const statusInspectFormat = "{{.Id}}|{{.Name}}|{{.State.Status}}|" +
+	"{{if .State.Health}}{{.State.Health.Status}}{{end}}|" +
+	"{{.State.StartedAt}}|{{.State.FinishedAt}}|{{.State.ExitCode}}"
 
 // Status returns the status of a container on the remote host.
 func (r *RemoteRuntime) Status(
 	ctx context.Context, id string,
 ) (*runtime.ContainerStatus, error) {
 	cmd := fmt.Sprintf(
-		"inspect --format '{{.Id}}|{{.Name}}|{{.State.Status}}|"+
-			"{{.State.Health.Status}}|{{.State.StartedAt}}|"+
-			"{{.State.FinishedAt}}|{{.State.ExitCode}}' %s",
-		id,
+		"inspect --format '%s' %s",
+		statusInspectFormat, shellEscape(id),
 	)
 	result, err := r.exec(ctx, cmd)
 	if err != nil {
@@ -124,14 +137,15 @@ func (r *RemoteRuntime) List(
 		args += " -a"
 	}
 	for k, v := range filter.Labels {
-		args += fmt.Sprintf(" --filter label=%s=%s", k, v)
+		args += fmt.Sprintf(" --filter label=%s=%s",
+			shellEscape(k), shellEscape(v))
 	}
 	for _, name := range filter.Names {
-		args += fmt.Sprintf(" --filter name=%s", name)
+		args += fmt.Sprintf(" --filter name=%s", shellEscape(name))
 	}
 	for _, status := range filter.Status {
 		args += fmt.Sprintf(
-			" --filter status=%s", string(status),
+			" --filter status=%s", shellEscape(string(status)),
 		)
 	}
 
@@ -151,7 +165,7 @@ func (r *RemoteRuntime) Stats(
 		"stats --no-stream --format "+
 			"'{{.CPUPerc}}|{{.MemPerc}}|{{.MemUsage}}|"+
 			"{{.NetIO}}|{{.BlockIO}}|{{.PIDs}}' %s",
-		id,
+		shellEscape(id),
 	)
 	result, err := r.exec(ctx, cmd)
 	if err != nil {
@@ -172,7 +186,7 @@ func (r *RemoteRuntime) Exec(
 		)
 	}
 	command := fmt.Sprintf(
-		"exec %s %s", id, strings.Join(escapedCmd, " "),
+		"exec %s %s", shellEscape(id), strings.Join(escapedCmd, " "),
 	)
 
 	result, err := r.exec(ctx, command)
@@ -193,7 +207,7 @@ func (r *RemoteRuntime) Logs(
 	id string,
 	opts ...runtime.LogOption,
 ) (io.ReadCloser, error) {
-	cmd := fmt.Sprintf("logs %s", id)
+	cmd := fmt.Sprintf("logs %s", shellEscape(id))
 	return r.executor.ExecuteStream(
 		ctx, r.host, r.runtimeCmd(cmd),
 	)
@@ -217,7 +231,15 @@ func (r *RemoteRuntime) runtimeCmd(args string) string {
 	if rt == "" {
 		rt = "docker"
 	}
-	return fmt.Sprintf("%s %s", rt, args)
+	// RM3 (SECURITY): host.Runtime is verbatim env config
+	// (CONTAINERS_REMOTE_HOST_N_RUNTIME) spliced as the LEADING token of the
+	// remote `ssh <host> <cmd>` string the remote login shell re-parses —
+	// while the container-id / filter args in the SAME command are already
+	// shellEscape'd (Start/Stop/Remove/Status/List/Stats/Exec/Logs). Escape rt
+	// too so a value like "docker;evilcmd" cannot inject a second remote
+	// command; shellEscape is a no-op for the ordinary `[A-Za-z0-9_/.-]`
+	// runtime names (docker/podman), so legitimate configs are unchanged.
+	return fmt.Sprintf("%s %s", shellEscape(rt), args)
 }
 
 func parseRemoteStatus(

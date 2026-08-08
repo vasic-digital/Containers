@@ -178,6 +178,13 @@ func TestDefaultScheduler_RoundRobin(t *testing.T) {
 		Name: "h2", Address: "10.0.0.2", User: "u",
 	})
 	mgr.snapshots["local"] = makeSnapshot("local", 50, 50, 16384, 500000, 8)
+	// Wave-20 CT-HARDEN-SCHED-2 reconciliation (§11.4.120): round_robin now
+	// excludes remote hosts absent from ProbeAll's snapshots (probe failed =
+	// offline). h1/h2 must be PROBED to be eligible rotation targets — the intent
+	// of this test ("distribute across multiple hosts") is preserved; only the
+	// fixture is corrected so the hosts it distributes to are actually reachable.
+	mgr.snapshots["h1"] = makeSnapshot("h1", 50, 50, 16384, 500000, 8)
+	mgr.snapshots["h2"] = makeSnapshot("h2", 50, 50, 16384, 500000, 8)
 
 	sched := NewScheduler(mgr, logging.NopLogger{},
 		WithStrategy(StrategyRoundRobin),

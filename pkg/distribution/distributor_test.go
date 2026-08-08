@@ -148,8 +148,17 @@ func (m *mockHostManager) HostState(
 }
 
 func TestDefaultDistributor_Distribute_Local(t *testing.T) {
+	// §11.4.120 RECONCILED for CT-HARDEN-DIST-HARD DIST-3. This test previously
+	// asserted LocalContainers==2 / FailedContainers==0 with NO LocalRuntime —
+	// enshrining the deployLocal false-success bluff (nil runtime `return nil`
+	// counted as a deployed container though nothing ran). The fix makes a nil
+	// LocalRuntime a deploy FAILURE, so the correct-behaviour version supplies a
+	// real (fake) runtime seam: the 2 local placements genuinely reach Start()
+	// and THEN count as deployed. Asserting Local==2/Failed==0 is now backed by
+	// an actual runtime call, not a silent skip.
 	dist := NewDistributor(
 		WithScheduler(&mockScheduler{}),
+		WithLocalRuntime(&deployLocalRuntime{}),
 		WithLogger(logging.NopLogger{}),
 	)
 
@@ -197,6 +206,12 @@ func TestDefaultDistributor_Distribute_Mixed(t *testing.T) {
 			},
 		}),
 		WithExecutor(&mockExecutor{}),
+		// §11.4.120 RECONCILED for DIST-3: the local half of this mixed batch
+		// now needs a real (fake) runtime seam to count as deployed — a nil
+		// LocalRuntime is a deploy FAILURE post-fix, not a silent success, so
+		// without this the LocalContainers==1 assertion would be a bluff. The
+		// remote half is unchanged.
+		WithLocalRuntime(&deployLocalRuntime{}),
 		WithHostManager(&mockHostManager{
 			hosts: map[string]remote.RemoteHost{
 				"remote-1": {

@@ -36,7 +36,7 @@ func TestWithRegistryDir(t *testing.T) {
 }
 
 func TestWithHost_ServiceOption(t *testing.T) {
-	r := New(WithRegistryDir(""))
+	r := New(WithRegistryDir(t.TempDir()))
 	_ = r.Register("svc", 8080, WithHost("10.0.0.1"))
 	svc, ok := r.Get("svc")
 	assert.True(t, ok)
@@ -44,7 +44,7 @@ func TestWithHost_ServiceOption(t *testing.T) {
 }
 
 func TestWithHealthPath_ServiceOption(t *testing.T) {
-	r := New(WithRegistryDir(""))
+	r := New(WithRegistryDir(t.TempDir()))
 	_ = r.Register("svc", 8080, WithHealthPath("/health"))
 	svc, ok := r.Get("svc")
 	assert.True(t, ok)
@@ -52,7 +52,7 @@ func TestWithHealthPath_ServiceOption(t *testing.T) {
 }
 
 func TestWithHealthType_ServiceOption(t *testing.T) {
-	r := New(WithRegistryDir(""))
+	r := New(WithRegistryDir(t.TempDir()))
 	_ = r.Register("svc", 8080, WithHealthType("http"))
 	svc, ok := r.Get("svc")
 	assert.True(t, ok)
@@ -60,7 +60,7 @@ func TestWithHealthType_ServiceOption(t *testing.T) {
 }
 
 func TestWithProtocol_ServiceOption(t *testing.T) {
-	r := New(WithRegistryDir(""))
+	r := New(WithRegistryDir(t.TempDir()))
 	_ = r.Register("svc", 8080, WithProtocol("https"))
 	svc, ok := r.Get("svc")
 	assert.True(t, ok)
@@ -68,7 +68,7 @@ func TestWithProtocol_ServiceOption(t *testing.T) {
 }
 
 func TestWithLabels_ServiceOption(t *testing.T) {
-	r := New(WithRegistryDir(""))
+	r := New(WithRegistryDir(t.TempDir()))
 	labels := map[string]string{"env": "prod", "tier": "web"}
 	_ = r.Register("svc", 8080, WithLabels(labels))
 	svc, ok := r.Get("svc")
@@ -78,20 +78,20 @@ func TestWithLabels_ServiceOption(t *testing.T) {
 }
 
 func TestGetURL_HTTPS(t *testing.T) {
-	r := New(WithRegistryDir(""))
+	r := New(WithRegistryDir(t.TempDir()))
 	_ = r.Register("svc", 8443, WithProtocol("https"))
 	url := r.GetURL("svc")
 	assert.Equal(t, "https://localhost:8443", url)
 }
 
 func TestGetURL_NotFound(t *testing.T) {
-	r := New(WithRegistryDir(""))
+	r := New(WithRegistryDir(t.TempDir()))
 	url := r.GetURL("nonexistent")
 	assert.Empty(t, url)
 }
 
 func TestGetEndpoint_NotFound(t *testing.T) {
-	r := New(WithRegistryDir(""))
+	r := New(WithRegistryDir(t.TempDir()))
 	ep := r.GetEndpoint("nonexistent")
 	assert.Empty(t, ep)
 }

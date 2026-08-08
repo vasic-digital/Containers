@@ -12,14 +12,14 @@ import (
 // fakeBackend lets tests assert which Backend the Selector picks
 // without invoking real Build logic.
 type fakeBackend struct {
-	name    string
-	caps    Capabilities
-	called  bool
-	gotReq  BuildRequest
-	result  BuildResult
+	name   string
+	caps   Capabilities
+	called bool
+	gotReq BuildRequest
+	result BuildResult
 }
 
-func (f *fakeBackend) Name() string             { return f.name }
+func (f *fakeBackend) Name() string               { return f.name }
 func (f *fakeBackend) Capabilities() Capabilities { return f.caps }
 func (f *fakeBackend) Build(ctx context.Context, req BuildRequest) BuildResult {
 	f.called = true

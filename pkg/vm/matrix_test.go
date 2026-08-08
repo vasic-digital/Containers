@@ -36,17 +36,17 @@ type stubVM struct {
 	qmp *fakeQMPClient
 }
 
-func (s *stubVM) sshClientForNetwork() sshClient {
+func (s *stubVM) ApplyNetworkConditions(ctx context.Context, _ int, conditions NetworkConditions) error {
 	if s.ssh == nil {
 		return nil
 	}
-	return s.ssh
+	return applyNetworkConditionsVM(ctx, s.ssh, conditions)
 }
-func (s *stubVM) qmpClientForScreenshot() qmpClient {
+func (s *stubVM) CaptureScreenshot(ctx context.Context, monitorPort int, dstPath string) error {
 	if s.qmp == nil {
 		return nil
 	}
-	return s.qmp
+	return CaptureScreenshotVM(ctx, s.qmp, monitorPort, dstPath)
 }
 
 func (s *stubVM) Boot(_ context.Context, cfg VMConfig) (BootResult, error) {
@@ -599,7 +599,7 @@ func (f *fakeVMKiller) Exists(pid int) bool {
 //   - pid 4444: argv contains `-monitor tcp:127.0.0.1:114444,server,nowait`
 //     (port 114444 — substring "14444" appears inside "114444")
 //     → MUST NOT match for 14444 under strict equality. A weakened
-//       substring matcher WOULD match this; that's the bluff vector.
+//     substring matcher WOULD match this; that's the bluff vector.
 func TestKillByQEMUMonitorPort_StrictAdjacentMatch(t *testing.T) {
 	walker := fakeVMProcWalker{
 		cmdlines: map[int][]string{

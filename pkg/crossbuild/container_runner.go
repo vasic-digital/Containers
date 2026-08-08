@@ -117,6 +117,16 @@ func (realContainerRunner) ImageExists(ctx context.Context, imageRef string) boo
 		return false
 	}
 	cmd := exec.CommandContext(ctx, binary, "image", "exists", imageRef)
+	// XB3-3 (§11.4.14 no-leak): without configureProcessGroup, ctx
+	// cancellation only signals cmd.Process (the direct "podman"/
+	// "docker" child) — any descendant it spawned that outlives the
+	// direct child (e.g. a backgrounded helper process) is orphaned
+	// rather than killed. WaitDelay is added for consistency with every
+	// other real*Runner in this package (Run() below, realRunner.Run,
+	// realAppleContainerRunner.Run/ImageExists) even though this call
+	// does not itself capture Stdout/Stderr into a buffer.
+	cmd.WaitDelay = subprocessWaitDelay
+	configureProcessGroup(cmd)
 	return cmd.Run() == nil
 }
 
@@ -133,10 +143,33 @@ func (realContainerRunner) Run(ctx context.Context, spec containerRunSpec) (int,
 	for k, v := range spec.Environment {
 		args = append(args, "-e", k+"="+v)
 	}
+	// XBUILD2-2 (security, argv-injection): terminate podman/docker option
+	// parsing with an explicit end-of-options "--" BEFORE the image
+	// positional so a crafted image reference beginning with '-' (e.g.
+	// "--privileged", "--network=host", "-v/:/host") is forced to be the
+	// image positional and can never be parsed as a runtime flag. Mirror of
+	// the module's OR-1/RM2/VOL2/EG2 arg-injection hardenings; same guard
+	// applied to Apple `container run` in apple_container.go's buildRunArgs.
+	args = append(args, "--")
 	args = append(args, spec.Image, "sh", "-c", spec.Command)
 	cmd := exec.CommandContext(ctx, binary, args...)
-	cmd.Stdout = spec.Stdout
-	cmd.Stderr = spec.Stderr
+	// XB2-1: bound Wait()'s pipe-drain and kill the whole process
+	// group (not just this "docker"/"podman" CLI invocation) on ctx
+	// cancellation, matching pkg/runtime/docker.go's identical guard.
+	// This is belt-and-braces alongside "--rm": "--rm" only removes
+	// THIS container on ITS OWN exit — it does nothing for a
+	// detached/backgrounded process the in-container command itself
+	// launched, and does nothing to unblock a wedged host-side
+	// `docker`/`podman run` CLI process whose own descendants (if any)
+	// are still holding the stdout/stderr pipes open.
+	cmd.WaitDelay = subprocessWaitDelay
+	configureProcessGroup(cmd)
+	// XB3-5: bound retained memory (see host_direct.go's
+	// boundedBufferWriter doc) rather than handing the in-container
+	// build command a direct, uncapped pointer into spec.Stdout/Stderr
+	// for the full 30-45 min run.
+	cmd.Stdout = &boundedBufferWriter{buf: spec.Stdout, budget: maxCapturedOutputBytes}
+	cmd.Stderr = &boundedBufferWriter{buf: spec.Stderr, budget: maxCapturedOutputBytes}
 	err := cmd.Run()
 	exitCode := 0
 	if cmd.ProcessState != nil {

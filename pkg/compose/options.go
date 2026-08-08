@@ -10,6 +10,16 @@ type upOptions struct {
 	NoRecreate    bool
 	Timeout       int
 	Wait          bool
+	// WaitTimeout is the caller's wait-deadline (in seconds) for services to
+	// become running|healthy. It is DISTINCT from Timeout, which maps to
+	// compose's own `--timeout` graceful-shutdown flag (CO-2) -- conflating
+	// the two silently capped (or extended) the wait deadline to whatever the
+	// caller set for shutdown grace. On the podman host-side poll
+	// (waitForServices) 0 means "use the package default" (defaultWaitTimeout,
+	// 120s). On docker compose it is forwarded to the native `--wait-timeout`
+	// flag when > 0 (COMP2-1); 0 leaves docker's `--wait` on its own built-in
+	// default.
+	WaitTimeout int
 }
 
 // UpOption configures compose up behavior.
@@ -83,6 +93,20 @@ func WithUpTimeout(seconds int) UpOption {
 func WithWait(wait bool) UpOption {
 	return func(o *upOptions) {
 		o.Wait = wait
+	}
+}
+
+// WithWaitTimeout sets the caller's wait-deadline (in seconds) for services
+// to become running|healthy -- distinct from WithUpTimeout, which sets
+// compose's own `--timeout` graceful-shutdown flag. On podman-compose it
+// bounds the host-side wait-fallback poll (waitForServices); 0 (the default)
+// uses the package default (120s). On docker compose it is forwarded to the
+// native `--wait-timeout` flag when > 0 (COMP2-1); when unset (0) docker's
+// `--wait` keeps its own built-in default. Only meaningful alongside
+// WithWait(true).
+func WithWaitTimeout(seconds int) UpOption {
+	return func(o *upOptions) {
+		o.WaitTimeout = seconds
 	}
 }
 

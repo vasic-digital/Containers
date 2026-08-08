@@ -20,12 +20,23 @@ import (
 func main() {
 	verbose := flag.Bool("verbose", false, "print full CleanupReport JSON to stdout")
 	timeoutSec := flag.Int("timeout", 30, "overall timeout in seconds")
+	avd := flag.String("avd", "", "AVD name whose qemu-system-* to reap (REQUIRED per §11.4.174: an empty -avd refuses to reap, never a host-wide name match)")
 	flag.Parse()
+
+	// §11.4.174: refuse a host-wide reap. Cleanup requires an ownership token
+	// (the AVD name); without -avd there is nothing we can prove is ours, so we
+	// reap nothing and exit 0. Callers (run-emulator-tests.sh) MUST pass -avd
+	// <name> per booted AVD to reap that AVD's stuck qemu-system-*.
+	if *avd == "" {
+		fmt.Fprintln(os.Stderr,
+			"emulator-cleanup: no -avd supplied; refusing host-wide reap (§11.4.174). Pass -avd <name> to scope.")
+		os.Exit(0)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeoutSec)*time.Second)
 	defer cancel()
 
-	report, err := emulator.Cleanup(ctx)
+	report, err := emulator.Cleanup(ctx, *avd)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "emulator-cleanup: %v\n", err)
 		// Best-effort: even on error we exit 0 so the matrix runner can proceed.

@@ -50,16 +50,25 @@ func (r *deployLocalRuntime) Logs(ctx context.Context, id string, opts ...runtim
 	return io.NopCloser(strings.NewReader("")), nil
 }
 
-// TestDeployLocal_NilRuntime verifies deployLocal skips when no local runtime.
+// TestDeployLocal_NilRuntime verifies deployLocal FAILS (does not silently
+// succeed) when no local runtime is configured.
+//
+// §11.4.120 RECONCILED for CT-HARDEN-DIST-HARD DIST-3: this test previously
+// asserted deployLocal returns NoError with a nil LocalRuntime — enshrining the
+// false-success bluff (`return nil` while nothing deployed). The fix makes a nil
+// LocalRuntime an honest deploy failure (mirroring deployRemote's "no remote
+// executor configured"), so the assertion is flipped to require the error. The
+// negation is still caught: reverting the fix to `return nil` makes assert.Error
+// FAIL.
 func TestDeployLocal_NilRuntime(t *testing.T) {
 	dist := NewDistributor(WithLogger(logging.NopLogger{}))
 	dc := &DistributedContainer{
 		Requirement: scheduler.ContainerRequirements{Name: "app", Image: "nginx"},
 		HostName:    "local",
 	}
-	// Should return nil since LocalRuntime is nil
 	err := dist.deployLocal(context.Background(), dc)
-	assert.NoError(t, err)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "no local runtime configured")
 }
 
 // TestDeployLocal_WithRuntime verifies deployLocal calls runtime.Start.

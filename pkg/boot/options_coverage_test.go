@@ -16,6 +16,9 @@ func (m *mockDistributor) DistributeEndpoints(ctx context.Context, names []strin
 	return 0, nil
 }
 
+// Undistribute satisfies the extended boot.Distributor interface (BOOT-3).
+func (m *mockDistributor) Undistribute(_ context.Context) error { return nil }
+
 // mockHostManagerForBoot implements remote.HostManager with all required methods.
 type mockHostManagerForBoot struct{}
 

@@ -27,6 +27,16 @@ const (
 	MountSyncing MountState = "syncing"
 	// MountFailed means the mount operation failed.
 	MountFailed MountState = "failed"
+	// MountPending means the name is reserved and the mount is in progress.
+	// It is inserted under the same lock as the existence check so a
+	// concurrent same-name Mount is rejected before running any remote op.
+	MountPending MountState = "pending"
+	// MountUnmounting means an Unmount is currently in flight for this
+	// entry. It is set under the same lock as the exists-check in Unmount
+	// so a concurrent second Unmount(name) call is rejected before it can
+	// issue a second real remote unmount (VOL-HIGH-5) — mirrors the
+	// MountPending reservation barrier Mount() already uses (EGVOL-1).
+	MountUnmounting MountState = "unmounting"
 )
 
 // VolumeMount describes a volume to share between local and
@@ -70,6 +80,30 @@ type MountOptions struct {
 	RsyncFlags []string
 	// SyncInterval is the period between rsync syncs.
 	SyncInterval time.Duration
+	// LocalHostAddress is this orchestrator's own address (optionally
+	// "[user@]host"), as reachable FROM every remote host that mounts a
+	// local path via NFS or SSHFS. NFS/SSHFS mounts pull FROM the local
+	// host, so the remote `mount`/`sshfs` command needs a real,
+	// network-reachable server/source identity distinct from the local
+	// filesystem path being shared — LocalPath alone is a filesystem path,
+	// never a valid NFS server address or SSHFS source host (VOL-HIGH-1 /
+	// VOL-HIGH-2). Empty (the zero value) means unconfigured;
+	// NFSMounter.Mount / SSHFSMounter.Mount fail loudly in that case rather
+	// than silently emit a command built from LocalPath alone. Configure
+	// via WithLocalHostAddress. Rsync is unaffected — RsyncSyncer already
+	// pulls from host.Address (the remote host's own address), a separate,
+	// independently tracked concern.
+	LocalHostAddress string
+	// CommandTimeout, when > 0, bounds every remote command a Mount/
+	// Unmount/Sync call on the DefaultVolumeManager issues via a local
+	// context.WithTimeout derived from the caller's ctx — mirroring the
+	// per-call deadline every sibling package in this module already
+	// applies to its remote/exec calls (pkg/genymotion, pkg/cuttlefish,
+	// pkg/emulator, pkg/orchestrator, pkg/vm). Zero (the default) means
+	// unconfigured: the caller's ctx is used unmodified, preserving prior
+	// behavior — a stalled remote command then hangs for as long as the
+	// caller's own ctx and the executor's own backstop allow (VOL-MED-8).
+	CommandTimeout time.Duration
 }
 
 // DefaultMountOptions returns sensible defaults.

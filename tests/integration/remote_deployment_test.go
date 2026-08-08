@@ -105,7 +105,7 @@ func TestRemoteDeployment_ComposeDetection_PodmanComposePreferred(t *testing.T) 
 // TestRemoteDeployment_ComposeUp tests deploying a compose file to remote host.
 func TestRemoteDeployment_ComposeUp(t *testing.T) {
 	if os.Getenv("CONTAINERS_INTEGRATION_TEST") == "" {
-		t.Skip("Set CONTAINERS_INTEGRATION_TEST=1 to run integration tests")  // SKIP-OK: #integration-mode-only
+		t.Skip("Set CONTAINERS_INTEGRATION_TEST=1 to run integration tests") // SKIP-OK: #integration-mode-only
 	}
 
 	cfg := skipIfNoRemoteHost(t)

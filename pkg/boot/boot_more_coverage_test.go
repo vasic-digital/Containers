@@ -135,12 +135,22 @@ func (m *moreMockEventBus) Unsubscribe(_ event.SubscriptionID) {}
 
 // moreMockDistributor implements boot.Distributor with configurable error.
 type moreMockDistributor struct {
-	deployed int
-	err      error
+	deployed           int
+	err                error
+	undistributeCalled int   // BOOT-3: counts Shutdown's Undistribute calls.
+	undistributeErr    error // BOOT-3: forced Undistribute error.
 }
 
 func (m *moreMockDistributor) DistributeEndpoints(_ context.Context, names []string) (int, error) {
 	return m.deployed, m.err
+}
+
+// Undistribute satisfies the extended boot.Distributor interface (BOOT-3)
+// and records invocations so guards can assert Shutdown tears down remote
+// state. The real distribution.DefaultDistributor implements this for real.
+func (m *moreMockDistributor) Undistribute(_ context.Context) error {
+	m.undistributeCalled++
+	return m.undistributeErr
 }
 
 // --- Tests ---
@@ -257,23 +267,32 @@ func TestBootAll_WithDistributor_Success(t *testing.T) {
 	assert.Equal(t, 1, summary.Remote)
 }
 
-// TestBootAll_WithDistributor_Error exercises the distributor partial-failure
-// path (distErr != nil). The endpoint is still counted as distributed.
+// TestBootAll_WithDistributor_Error exercises the distributor total-failure
+// path (deployed:0, distErr != nil). §11.4.120 reconciliation for BOOT-1:
+// the OLD assertion asserted the swallowed-failure bug as correct behaviour
+// (Remote==1 for an endpoint the distributor NEVER deployed). The fixed
+// code attributes by count — a 0/1 deploy on a NON-required endpoint is NOT
+// counted as a successful remote (Remote==0), its result is "failed", but
+// (not being required) it does not force an overall boot error (err==nil,
+// mirroring a non-required Phase-3 health failure). This is genuine: an
+// undeployed endpoint is no longer reported as a running remote service.
 func TestBootAll_WithDistributor_Error(t *testing.T) {
 	dist := &moreMockDistributor{deployed: 0, err: errors.New("no hosts available")}
 	eps := map[string]endpoint.ServiceEndpoint{
 		"remote-svc": {
 			Enabled: true,
 			Remote:  true,
+			// Not Required → shortfall does not force a boot error.
 		},
 	}
 
 	bm := NewBootManager(eps, WithDistributor(dist))
-	// Distribution errors are warnings; BootAll still succeeds unless
-	// a required endpoint fails health check.
 	summary, err := bm.BootAll(context.Background())
-	require.NoError(t, err)
-	assert.Equal(t, 1, summary.Remote)
+	require.NoError(t, err) // not required → no overall error
+	// The undeployed endpoint MUST NOT be falsely counted as a remote.
+	assert.Equal(t, 0, summary.Remote, "undeployed endpoint must not count as remote")
+	assert.Equal(t, "failed", summary.Results["remote-svc"].Status,
+		"undeployed endpoint result must be failed, not distributed")
 }
 
 // TestBootAll_WithDistributor_NoRemoteEndpoints exercises the branch where

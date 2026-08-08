@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"digital.vasic.containers/pkg/logging"
@@ -115,8 +116,26 @@ func (e *SSHExecutor) ExecuteStream(
 	host RemoteHost,
 	command string,
 ) (io.ReadCloser, error) {
+	// REMOTE-MED-1: unlike Execute, ExecuteStream returns BEFORE the
+	// remote command finishes — the caller drains/closes the returned
+	// reader asynchronously. A CommandTimeout-derived context therefore
+	// cannot be released via `defer cancel()` in THIS function: that
+	// would cancel (and kill the just-started ssh process) the instant
+	// ExecuteStream returns, before the caller ever reads a byte.
+	// Ownership of cancel instead passes to the streamReader (success
+	// path) or is invoked directly on every early-error return below, so
+	// a caller supplying context.Background() (no deadline of its own)
+	// still gets a bounded call instead of an unbounded one.
+	var cancel context.CancelFunc
+	if e.opts.CommandTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, e.opts.CommandTimeout)
+	}
+
 	args, err := e.sshArgs(ctx, host)
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		return nil, err
 	}
 	// sshArgs may have acquired a pooled ControlMaster ref (refs++). On the
@@ -126,6 +145,9 @@ func (e *SSHExecutor) ExecuteStream(
 	releaseOnErr := func() {
 		if e.pool != nil {
 			e.pool.Release(host)
+		}
+		if cancel != nil {
+			cancel()
 		}
 	}
 	args = append(args, command)
@@ -153,6 +175,7 @@ func (e *SSHExecutor) ExecuteStream(
 		reader: stdout,
 		pool:   e.pool,
 		host:   host,
+		cancel: cancel,
 	}, nil
 }
 
@@ -162,13 +185,38 @@ func (e *SSHExecutor) CopyFile(
 	host RemoteHost,
 	localPath, remotePath string,
 ) error {
-	args := e.scpArgs(host)
-	args = append(args,
-		localPath,
-		fmt.Sprintf(
-			"%s@%s:%s", host.User, host.Address, remotePath,
-		),
-	)
+	// REMOTE-MED-1: CopyFile is synchronous (blocks until cmd.Run()
+	// returns), so — unlike ExecuteStream — a defer here is safe: it
+	// fires only once the scp transfer has actually finished. Without
+	// this guard a caller passing context.Background() (no deadline of
+	// its own) got an unbounded scp call; a stalled/wedged remote scp
+	// endpoint would hang this call forever.
+	if e.opts.CommandTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, e.opts.CommandTimeout)
+		defer cancel()
+	}
+
+	args, err := e.scpArgs(ctx, host)
+	if err != nil {
+		return err
+	}
+	// scpArgs may have acquired a pooled ControlMaster connection
+	// (refs++), same as sshArgs. CopyFile is synchronous (blocks until
+	// cmd.Run() returns below), so a defer here fires only once the
+	// transfer has actually finished — see the ExecuteStream ownership
+	// comment above for why a stream-returning method could not do this.
+	// Release is a no-op when nothing was acquired.
+	if e.pool != nil {
+		defer e.pool.Release(host)
+	}
+	// RM3 (SECURITY): refuse a leading-dash scp destination (ProxyCommand RCE
+	// via a tainted host.User) before spawning scp — see sshDestination.
+	dest, err := scpDestination(host, remotePath)
+	if err != nil {
+		return err
+	}
+	args = append(args, localPath, dest)
 
 	e.logger.Debug(
 		"scp file to %s: %s -> %s",
@@ -221,21 +269,46 @@ func (e *SSHExecutor) CopyDir(
 	host RemoteHost,
 	localDir, remoteDir string,
 ) error {
+	// REMOTE-MED-1: CopyDir is synchronous (blocks until cmd.Run()
+	// returns, and the basename-mismatch branch's own pre-clean also
+	// blocks before that), so a defer here is safe — see CopyFile's
+	// comment for the ExecuteStream contrast. Without this guard a
+	// caller passing context.Background() got an unbounded scp call.
+	if e.opts.CommandTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, e.opts.CommandTimeout)
+		defer cancel()
+	}
+
 	localBase := filepath.Base(localDir)
 	remoteBase := filepath.Base(remoteDir)
 	remoteParent := filepath.Dir(remoteDir)
 
-	args := e.scpArgs(host)
+	args, err := e.scpArgs(ctx, host)
+	if err != nil {
+		return err
+	}
+	// scpArgs may have acquired a pooled ControlMaster connection
+	// (refs++), same as sshArgs / CopyFile. CopyDir is synchronous
+	// (blocks until cmd.Run() returns below, and the basename-mismatch
+	// branch's own pre-clean also blocks before that), so a defer here
+	// is safe and fires exactly once regardless of which branch below
+	// runs. Release is a no-op when nothing was acquired.
+	if e.pool != nil {
+		defer e.pool.Release(host)
+	}
 	args = append([]string{"-r"}, args...)
 
 	if localBase == remoteBase {
 		// Universal case: copy source into the PARENT of the remote
 		// destination so scp's basename rule lands the contents where
 		// the caller expects, without any pre-state assumption.
-		args = append(args,
-			localDir,
-			fmt.Sprintf("%s@%s:%s", host.User, host.Address, remoteParent),
-		)
+		// RM3 (SECURITY): refuse a leading-dash scp destination before spawn.
+		dest, err := scpDestination(host, remoteParent)
+		if err != nil {
+			return err
+		}
+		args = append(args, localDir, dest)
 		e.logger.Debug(
 			"scp dir to %s: %s -> %s (via parent %s)",
 			host.Name, localDir, remoteDir, remoteParent,
@@ -247,23 +320,27 @@ func (e *SSHExecutor) CopyDir(
 		// to the destination. This path is race-prone if a sibling
 		// CopyFile is concurrently writing into the same parent, but
 		// it's also rarely exercised in practice.
+		// REMOTE-HIGH-2: route the pre-clean through e.Execute rather than
+		// a raw e.sshArgs(...) + exec.CommandContext(...) call. sshArgs
+		// internally does e.pool.Acquire (refs++) when ControlMasterEnabled,
+		// and Execute's own `defer e.pool.Release(host)` releases that ref
+		// on every return path. The previous direct call here acquired a
+		// pooled ControlMaster ref but never released it — leaking one ref
+		// per CopyDir(basename-mismatch) invocation, pinning the socket
+		// past its ControlPersist window (§11.4.14 no-leak).
 		cleanCmd := fmt.Sprintf("rm -rf -- %s", shellEscape(remoteDir))
-		if sshArgsList, sshErr := e.sshArgs(ctx, host); sshErr == nil {
-			cleanArgs := append(sshArgsList, cleanCmd)
-			cleanCmdRun := exec.CommandContext(ctx, "ssh", cleanArgs...)
-			var cleanStderr bytes.Buffer
-			cleanCmdRun.Stderr = &cleanStderr
-			if err := cleanCmdRun.Run(); err != nil {
-				e.logger.Debug(
-					"pre-scp rm on %s (ignored): %s -> %s: %v (stderr: %s)",
-					host.Name, localDir, remoteDir, err, cleanStderr.String(),
-				)
-			}
+		if _, err := e.Execute(ctx, host, cleanCmd); err != nil {
+			e.logger.Debug(
+				"pre-scp rm on %s (ignored): %s -> %s: %v",
+				host.Name, localDir, remoteDir, err,
+			)
 		}
-		args = append(args,
-			localDir,
-			fmt.Sprintf("%s@%s:%s", host.User, host.Address, remoteDir),
-		)
+		// RM3 (SECURITY): refuse a leading-dash scp destination before spawn.
+		dest, err := scpDestination(host, remoteDir)
+		if err != nil {
+			return err
+		}
+		args = append(args, localDir, dest)
 		e.logger.Debug(
 			"scp dir to %s (basename mismatch): %s -> %s",
 			host.Name, localDir, remoteDir,
@@ -324,6 +401,52 @@ func replaceAll(s, old, new string) string {
 		}
 	}
 	return out
+}
+
+// sshDestination renders the ssh/scp destination positional
+// ("<user>@<address>") for host AND refuses a value that ssh/scp's own
+// getopt would parse as an OPTION rather than a host (RM3 SECURITY).
+//
+// ssh/scp are spawned as a bare argv (exec.CommandContext("ssh"/"scp",
+// args...) / iexec.Run, no shell), so shell metacharacters in the
+// destination are inert — but the destination is a POSITIONAL argv element
+// with no reliable "--" end-of-options terminator for the host, so a value
+// that BEGINS WITH '-' is consumed by ssh/scp's getopt as an option.
+// host.User + host.Address are verbatim env config
+// (CONTAINERS_REMOTE_HOST_N_USER / _ADDRESS) with ZERO validation, so a
+// host.User of e.g. "-oProxyCommand=<cmd>" injects ssh's ProxyCommand
+// (arbitrary command execution) on the CONTROL-PLANE host that runs the
+// executor. Refuse it BEFORE any spawn (ssh/scp have no reliable "--" host
+// terminator, so rejection is the safe, deterministic fix). This is the
+// single source of truth for the class in pkg/remote — sshArgs,
+// scpDestination, ConnectionPool.masterArgs, and ConnectionPool.closeEntry
+// all route through here, so the checked value and the spawned value are
+// provably identical. Mirrors pkg/network CreateTunnel's §NET3 leading-dash
+// guard on tunnelDestination. An empty User yields "@<address>", which
+// begins with '@' and is inert to getopt.
+func sshDestination(host RemoteHost) (string, error) {
+	dest := fmt.Sprintf("%s@%s", host.User, host.Address)
+	if strings.HasPrefix(dest, "-") {
+		return "", fmt.Errorf(
+			"refusing ssh/scp destination %q that begins with '-' "+
+				"(would be parsed as an ssh/scp option — argument injection)",
+			dest,
+		)
+	}
+	return dest, nil
+}
+
+// scpDestination renders the scp destination positional
+// ("<user>@<address>:<remotePath>") for host, composing on sshDestination so
+// the leading-dash refusal lives in exactly ONE place: appending
+// ":<remotePath>" can never change whether the composed string begins with
+// '-' (that is fixed by the user@address prefix sshDestination validates).
+func scpDestination(host RemoteHost, remotePath string) (string, error) {
+	dest, err := sshDestination(host)
+	if err != nil {
+		return "", err
+	}
+	return dest + ":" + remotePath, nil
 }
 
 // IsReachable checks whether the host accepts SSH connections.
@@ -401,13 +524,30 @@ func (e *SSHExecutor) sshArgs(
 		args = append(args, "-i", host.KeyPath)
 	}
 
-	args = append(args,
-		fmt.Sprintf("%s@%s", host.User, host.Address),
-	)
+	// RM3 (SECURITY): host.User/host.Address are verbatim env config; refuse a
+	// leading-dash destination that ssh's getopt would parse as an option
+	// (ProxyCommand RCE) BEFORE the caller spawns ssh. Single source of truth
+	// with scpDestination/masterArgs/closeEntry via sshDestination.
+	dest, err := sshDestination(host)
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, dest)
 	return args, nil
 }
 
-func (e *SSHExecutor) scpArgs(host RemoteHost) []string {
+// scpArgs builds the scp CLI arguments for host, mirroring sshArgs
+// (including ControlMaster acquisition — REMOTE-MED-2). Without this
+// parity, scp transfers (CopyFile + the common-case CopyDir) never
+// reused a live ControlMaster socket: every file-copy opened a brand
+// new TCP+SSH connection even when a multiplexable master was already
+// up, defeating the pooling benefit for the file-shipping workload
+// where it matters most, and leaving pool.ActiveCount() blind to scp
+// activity. scp accepts the identical OpenSSH multiplexing option (`-o
+// ControlPath=<socket>`) that ssh does.
+func (e *SSHExecutor) scpArgs(
+	ctx context.Context, host RemoteHost,
+) ([]string, error) {
 	args := []string{
 		"-o", "StrictHostKeyChecking=" +
 			boolToYesNo(e.opts.StrictHostKeyCheck),
@@ -435,11 +575,24 @@ func (e *SSHExecutor) scpArgs(host RemoteHost) []string {
 
 	args = append(args, "-P", strconv.Itoa(host.SSHPort()))
 
+	if e.pool != nil && e.opts.ControlMasterEnabled {
+		socketPath, err := e.pool.Acquire(ctx, host)
+		if err != nil {
+			e.logger.Warn(
+				"ControlMaster unavailable for %s, "+
+					"falling back to direct: %v",
+				host.Name, err,
+			)
+		} else {
+			args = append(args, "-o", "ControlPath="+socketPath)
+		}
+	}
+
 	if host.KeyPath != "" {
 		args = append(args, "-i", host.KeyPath)
 	}
 
-	return args
+	return args, nil
 }
 
 // streamReader wraps an SSH command's stdout pipe.
@@ -448,6 +601,19 @@ type streamReader struct {
 	reader io.ReadCloser
 	pool   *ConnectionPool
 	host   RemoteHost
+	// cancel releases the CommandTimeout-derived context ExecuteStream
+	// created (REMOTE-MED-1), if any. Nil when CommandTimeout is
+	// disabled (0) — Close tolerates that.
+	cancel context.CancelFunc
+
+	// closeOnce makes Close idempotent: the pooled ControlMaster ref must be
+	// Released EXACTLY once per stream and cmd.Wait() called at most once, even
+	// when an io.Closer consumer calls Close() more than once (belt-and-
+	// suspenders `defer rc.Close()` + an explicit Close). A second unguarded
+	// Close would double-decrement the pool ref-count (underflow below 0,
+	// corrupting the leak-detection oracle) and hit "Wait was already called".
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (r *streamReader) Read(p []byte) (int, error) {
@@ -455,10 +621,15 @@ func (r *streamReader) Read(p []byte) (int, error) {
 }
 
 func (r *streamReader) Close() error {
-	_ = r.reader.Close()
-	err := r.cmd.Wait()
-	if r.pool != nil {
-		r.pool.Release(r.host)
-	}
-	return err
+	r.closeOnce.Do(func() {
+		_ = r.reader.Close()
+		r.closeErr = r.cmd.Wait()
+		if r.pool != nil {
+			r.pool.Release(r.host)
+		}
+		if r.cancel != nil {
+			r.cancel()
+		}
+	})
+	return r.closeErr
 }

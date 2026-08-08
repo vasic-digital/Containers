@@ -15,10 +15,14 @@ import (
 func newTestNFSMounter(
 	exec remote.RemoteExecutor,
 ) *NFSMounter {
+	// testMountOptionsWithAddress (see VOL-HIGH-1, manager_test.go)
+	// configures a placeholder LocalHostAddress so these tests keep
+	// exercising their mkdir/mount executor-error paths rather than the
+	// unconfigured-address fail-loud path.
 	return NewNFSMounter(
 		exec,
 		logging.NopLogger{},
-		DefaultMountOptions(),
+		testMountOptionsWithAddress(),
 	)
 }
 

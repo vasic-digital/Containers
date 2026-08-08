@@ -2,12 +2,16 @@ package distribution
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"digital.vasic.containers/pkg/network"
 	"digital.vasic.containers/pkg/remote"
+	"digital.vasic.containers/pkg/runtime"
 	"digital.vasic.containers/pkg/scheduler"
 )
 
@@ -82,7 +86,33 @@ func (d *DefaultDistributor) Distribute(
 
 	// Phase 2-7: Deploy each container.
 	containers := make([]DistributedContainer, 0, len(plan.Decisions))
+	// deployedThisRound records every container name whose decision actually
+	// REACHED deployContainer this round (regardless of whether the deploy
+	// itself then succeeded or failed) — see reconcileRelocations (CT-HARDEN-
+	// DIST2HARD DI-2).
+	deployedThisRound := make(map[string]bool, len(plan.Decisions))
+	var ctxErr error
 	for _, decision := range plan.Decisions {
+		// CT-HARDEN-DIST-HARD DIST-4: honour context cancellation. The deploy
+		// loop previously never checked ctx.Err(), so a cancelled/expired
+		// context still issued every remote rm/run and every local Start. Once
+		// ctx is cancelled, mark this and every remaining decision failed (no
+		// command is issued to any host) and return the partial summary with the
+		// ctx error; containers deployed BEFORE cancellation stay tracked in
+		// d.containers so Undistribute() can still tear them down.
+		if err := ctx.Err(); err != nil {
+			ctxErr = err
+			failed := DistributedContainer{
+				Requirement: decision.Requirement,
+				HostName:    decision.HostName,
+				State:       StateFailed,
+				Error:       err.Error(),
+				TunnelPorts: make(map[string]string),
+			}
+			summary.FailedContainers++
+			containers = append(containers, failed)
+			continue
+		}
 		dc := DistributedContainer{
 			Requirement: decision.Requirement,
 			HostName:    decision.HostName,
@@ -97,6 +127,13 @@ func (d *DefaultDistributor) Distribute(
 			containers = append(containers, dc)
 			continue
 		}
+
+		// CT-HARDEN-DIST2HARD DI-2: this name is genuinely being deployed THIS
+		// round from here on — deployRemote issues its pre-deploy `rm -f`
+		// unconditionally before the run command, so a same-host redeploy has
+		// already reaped any previous instance on that host regardless of
+		// whether the run itself then succeeds or fails.
+		deployedThisRound[decision.Requirement.Name] = true
 
 		// Deploy.
 		dc.State = StateDeploying
@@ -122,11 +159,27 @@ func (d *DefaultDistributor) Distribute(
 	}
 
 	summary.Duration = time.Since(start)
-	summary.Containers = containers
+	// Hand the caller an INDEPENDENT copy: d.containers keeps the original
+	// backing array (which Undistribute() mutates under d.mu), so a caller
+	// iterating the returned summary never aliases d.containers — no
+	// cross-goroutine read/write race on an escaped summary, and
+	// Undistribute() can never retroactively flip a previously-returned
+	// summary's State (CT-HARDEN-DIST-2, escaped-alias half).
+	summary.Containers = append([]DistributedContainer(nil), containers...)
 
+	// Publish the new placement and capture the PRIOR one so a container that
+	// relocated (or was dropped) can be torn down on its OLD host. deployRemote
+	// only rm-f's the NEW host, so without this a re-Distribute/Rebalance moving
+	// `foo` from host A to host B leaks `foo` still running on A (CT-HARDEN-DIST-
+	// HARD DIST-2, a §11.4.69 sink-side leak). `prev` no longer aliases
+	// d.containers after this critical section, so reading it lock-free below is
+	// race-safe (in-package readers copy under the lock).
 	d.mu.Lock()
+	prev := d.containers
 	d.containers = containers
 	d.mu.Unlock()
+
+	d.reconcileRelocations(ctx, prev, containers, deployedThisRound)
 
 	d.opts.Logger.Info(
 		"distribution complete: %d local, %d remote, %d failed "+
@@ -135,20 +188,50 @@ func (d *DefaultDistributor) Distribute(
 		summary.FailedContainers, summary.Duration,
 	)
 
-	return summary, nil
+	return summary, ctxErr
 }
 
 // Undistribute stops all distributed containers.
 func (d *DefaultDistributor) Undistribute(
 	ctx context.Context,
 ) error {
+	// Snapshot the tracked containers (a COPY, so the pre-stop State survives for
+	// the teardown predicate below) and mark the live array Stopped while STILL
+	// holding the lock: mutating after Unlock raced with any in-package reader
+	// (e.g. HealthCheckAll) that had captured the same live backing array via
+	// d.containers (CT-HARDEN-DIST-2). The escaped-summary alias is handled
+	// separately by the copy-on-publish in Distribute(), so a returned summary
+	// never shares this backing array. d.containers is niled under the lock, so
+	// the snapshot is exclusively ours once unlocked.
 	d.mu.Lock()
-	containers := d.containers
+	snapshot := make([]DistributedContainer, len(d.containers))
+	copy(snapshot, d.containers)
+	for i := range d.containers {
+		d.containers[i].State = StateStopped
+	}
 	d.containers = nil
 	d.mu.Unlock()
 
-	for i := range containers {
-		containers[i].State = StateStopped
+	// CT-HARDEN-DIST-HARD DIST-1: actually tear the containers DOWN on their
+	// hosts before dropping tracking. The prior code only flipped State to
+	// Stopped in memory while every container kept RUNNING on its host — a
+	// §11.4.69 sink-side bluff (State reports stopped, the host still runs it).
+	// Only containers that reached StateRunning have a live deployment to remove;
+	// failed/scheduled ones were never created. Per-container teardown errors are
+	// aggregated (returned) but never abort the sweep — CloseAll/UnmountAll below
+	// still run, and a double-Undistribute is safe (empty snapshot ⇒ no-op).
+	var teardownErrs []error
+	for _, dc := range snapshot {
+		if !stateNeedsTeardown(dc.State) {
+			continue
+		}
+		if err := d.teardownContainer(ctx, dc); err != nil {
+			teardownErrs = append(teardownErrs, err)
+			d.opts.Logger.Error(
+				"undistribute: teardown %s on %s failed: %v",
+				dc.Requirement.Name, dc.HostName, err,
+			)
+		}
 	}
 
 	// Close tunnels.
@@ -162,9 +245,9 @@ func (d *DefaultDistributor) Undistribute(
 	}
 
 	d.opts.Logger.Info("undistributed %d containers",
-		len(containers),
+		len(snapshot),
 	)
-	return nil
+	return errors.Join(teardownErrs...)
 }
 
 // Status returns all distributed containers.
@@ -185,8 +268,12 @@ func (d *DefaultDistributor) Status(
 func (d *DefaultDistributor) HealthCheckAll(
 	ctx context.Context,
 ) map[string]error {
+	// Copy under the read-lock (mirrors Status()) so the loop reads an
+	// independent backing array, never the live d.containers that
+	// Undistribute() mutates — no cross-method data race (CT-HARDEN-DIST-2).
 	d.mu.RLock()
-	containers := d.containers
+	containers := make([]DistributedContainer, len(d.containers))
+	copy(containers, d.containers)
 	d.mu.RUnlock()
 
 	errors := make(map[string]error)
@@ -194,9 +281,57 @@ func (d *DefaultDistributor) HealthCheckAll(
 		if dc.State != StateRunning {
 			continue
 		}
+
+		// CT-HARDEN-DIST2HARD DI-3: a LOCAL container was never health-checked
+		// — the entire body below was previously gated on HostName != "" &&
+		// != "local", so a crashed StateRunning local container was reported
+		// healthy forever (LocalRuntime.Status was never called). Mirror the
+		// remote branch's honest-nil-guard style: an absent LocalRuntime is a
+		// configuration error surfaced as an error, never silence (§11.4.69).
+		if normHost(dc.HostName) == "local" {
+			if d.opts.LocalRuntime == nil {
+				errors[dc.Requirement.Name] = fmt.Errorf(
+					"local runtime not configured",
+				)
+				continue
+			}
+			status, err := d.opts.LocalRuntime.Status(
+				ctx, dc.Requirement.Name,
+			)
+			if err != nil {
+				errors[dc.Requirement.Name] = fmt.Errorf(
+					"local container %s status: %w",
+					dc.Requirement.Name, err,
+				)
+				continue
+			}
+			if status == nil || status.State != runtime.StateRunning {
+				state := runtime.ContainerState("unknown")
+				if status != nil {
+					state = status.State
+				}
+				errors[dc.Requirement.Name] = fmt.Errorf(
+					"local container %s not running (state=%s)",
+					dc.Requirement.Name, state,
+				)
+			}
+			continue
+		}
+
 		// Basic check: verify host is reachable.
 		if d.opts.Executor != nil && dc.HostName != "" &&
 			dc.HostName != "local" {
+			// HostManager may be nil even when Executor is configured (they are
+			// independently settable). Surface an honest error rather than
+			// panicking on GetHost() (CT-HARDEN-DIST-1) — silently skipping the
+			// check would be a §11.4.69 sink-side bluff (a running-but-
+			// unverifiable container reported healthy).
+			if d.opts.HostManager == nil {
+				errors[dc.Requirement.Name] = fmt.Errorf(
+					"host manager not configured",
+				)
+				continue
+			}
 			host, err := d.opts.HostManager.GetHost(dc.HostName)
 			if err != nil || host == nil {
 				errors[dc.Requirement.Name] = fmt.Errorf(
@@ -261,36 +396,320 @@ func (d *DefaultDistributor) DistributeEndpoints(
 	}
 
 	summary, err := d.Distribute(ctx, reqs)
-	if err != nil {
+	// CT-HARDEN-DIST2HARD DI-5: a ctx-cancel error (DIST-4) still returns a
+	// non-nil summary whose LocalContainers/RemoteContainers counts genuinely
+	// deployed BEFORE cancellation — discarding it as 0 undercounts live
+	// containers to the boot manager. Only a truly summary-less error (no
+	// scheduler configured, ScheduleBatch failure) has nothing to count.
+	if summary == nil {
 		return 0, err
 	}
 
 	deployed := summary.LocalContainers + summary.RemoteContainers
-	return deployed, nil
+	return deployed, err
 }
 
 func (d *DefaultDistributor) deployContainer(
 	ctx context.Context, dc *DistributedContainer,
 ) error {
 	if dc.HostName == "" || dc.HostName == "local" {
-		return d.deployLocal(ctx, dc)
+		if err := d.deployLocal(ctx, dc); err != nil {
+			return err
+		}
+	} else {
+		if err := d.deployRemote(ctx, dc); err != nil {
+			return err
+		}
 	}
-	return d.deployRemote(ctx, dc)
+
+	// CT-HARDEN-DIST2HARD DI-1: wire the documented deploy flow's remaining
+	// two steps (CREATE TUNNELS then MOUNT VOLUMES) now that the container has
+	// actually started. A tunnel/volume failure must not be reported as a
+	// successful deploy (§11.4.108) — the container just started is torn down
+	// (§11.4.14, no orphaned running container survives a failed wiring step)
+	// and the error propagates so the caller marks this decision StateFailed
+	// instead of StateRunning.
+	if err := d.wireTunnelsAndVolumes(ctx, dc); err != nil {
+		if tdErr := d.teardownContainer(ctx, *dc); tdErr != nil {
+			d.opts.Logger.Error(
+				"deploy %s: teardown after tunnel/volume failure also "+
+					"failed: %v",
+				dc.Requirement.Name, tdErr,
+			)
+		}
+		return err
+	}
+	return nil
+}
+
+// wireTunnelsAndVolumes implements the two deploy-flow steps this module's
+// CLAUDE.md documents but that were never wired to any seam (CT-HARDEN-
+// DIST2HARD DI-1): "docker run -d -> CREATE TUNNELS -> MOUNT VOLUMES ->
+// health". Options.TunnelManager/VolumeManager were default-enabled
+// (EnableTunnels/EnableVolumes default true) yet CreateTunnel/Mount were
+// called nowhere — every deploy reported StateRunning full-success while any
+// configured tunnel/volume silently no-op'd and
+// dc.TunnelPorts/dc.VolumeMounts stayed permanently empty.
+//
+// Scope: REMOTE deployments only, mirroring this module's own CLAUDE.md
+// (tunnels/volumes are documented on the remote "else" branch) and
+// volume.VolumeManager's own doc ("handles remote volume mounts"). Tunnels
+// are derived from the container's own declared scheduler.
+// ContainerRequirements.Ports — the same real per-container signal already
+// used to render the remote run command's `-p` flags, so no new semantics
+// are invented. There is currently no per-container volume specification
+// anywhere upstream of this package, so Options.VolumeMountsFor is the
+// wiring seam a caller uses to opt a container into a mount; nil means no
+// volumes are mounted for ANY container, an honest "nothing configured"
+// rather than a guessed mount point (§11.4.6).
+//
+// On any failure, every tunnel/mount this call itself created is unwound
+// (closed/unmounted) before the error is returned, so a partial wiring
+// failure never leaks a tunnel or mount behind a container that is about to
+// be torn down by the caller.
+func (d *DefaultDistributor) wireTunnelsAndVolumes(
+	ctx context.Context, dc *DistributedContainer,
+) error {
+	if normHost(dc.HostName) == "local" {
+		return nil
+	}
+
+	var createdLocalPorts []string
+	rollbackTunnels := func() {
+		for _, p := range createdLocalPorts {
+			_ = d.opts.TunnelManager.CloseTunnel(p)
+		}
+	}
+
+	if d.opts.EnableTunnels && d.opts.TunnelManager != nil {
+		for _, p := range dc.Requirement.Ports {
+			if p.ContainerPort <= 0 {
+				continue
+			}
+			remotePort := strconv.Itoa(p.ContainerPort)
+			if p.HostPort > 0 {
+				remotePort = strconv.Itoa(p.HostPort)
+			}
+			spec := network.TunnelSpec{
+				Direction:  network.TunnelLocal,
+				RemotePort: remotePort,
+				Description: fmt.Sprintf(
+					"%s/%s", dc.Requirement.Name, remotePort,
+				),
+			}
+			info, err := d.opts.TunnelManager.CreateTunnel(
+				ctx, dc.HostName, spec,
+			)
+			if err != nil {
+				rollbackTunnels()
+				return fmt.Errorf(
+					"create tunnel for %s port %s: %w",
+					dc.Requirement.Name, remotePort, err,
+				)
+			}
+			localPort := remotePort
+			if info != nil && info.Spec.LocalPort != "" {
+				localPort = info.Spec.LocalPort
+			}
+			dc.TunnelPorts[remotePort] = localPort
+			createdLocalPorts = append(createdLocalPorts, localPort)
+		}
+	}
+
+	if d.opts.EnableVolumes && d.opts.VolumeManager != nil &&
+		d.opts.VolumeMountsFor != nil {
+		var mountedNames []string
+		rollbackVolumes := func() {
+			for _, n := range mountedNames {
+				_ = d.opts.VolumeManager.Unmount(ctx, n)
+			}
+		}
+		for _, mount := range d.opts.VolumeMountsFor(
+			dc.Requirement, dc.HostName,
+		) {
+			if mount.HostName == "" {
+				mount.HostName = dc.HostName
+			}
+			if err := d.opts.VolumeManager.Mount(ctx, mount); err != nil {
+				rollbackVolumes()
+				rollbackTunnels()
+				return fmt.Errorf(
+					"mount volume %s for %s: %w",
+					mount.Name, dc.Requirement.Name, err,
+				)
+			}
+			dc.VolumeMounts = append(dc.VolumeMounts, mount.Name)
+			mountedNames = append(mountedNames, mount.Name)
+		}
+	}
+
+	return nil
 }
 
 func (d *DefaultDistributor) deployLocal(
 	ctx context.Context, dc *DistributedContainer,
 ) error {
+	// CT-HARDEN-DIST-HARD DIST-3: a nil LocalRuntime is a MISCONFIGURATION, not a
+	// silent success. The prior `return nil` let the caller mark the container
+	// StateRunning + LocalContainers++ though nothing was deployed — a §11.4.69
+	// sink-side bluff, and asymmetric with deployRemote (which errors "no remote
+	// executor configured"). Restore symmetry: fail honestly.
 	if d.opts.LocalRuntime == nil {
-		return nil
+		return fmt.Errorf("no local runtime configured")
 	}
 
 	d.opts.Logger.Info("deploying %s locally",
 		dc.Requirement.Name,
 	)
+	// The ContainerRuntime.Start contract takes a container ID/NAME (its doc
+	// comment: "identified by its ID or name") — never an image. The prior code
+	// passed dc.Requirement.Image, a wrong-arg contract violation; pass the
+	// requirement Name (the container's identity, consistent with the remote
+	// --name/rm path and teardownContainer). KNOWN LIMITATION (§11.4.6, out of
+	// scope for this pkg/distribution-only batch): ContainerRuntime exposes NO
+	// create/run-from-image step, so local Start succeeds only for a pre-existing
+	// container — fully closing the local create-from-image gap needs a
+	// runtime-interface change in another package, which this batch must not
+	// make.
 	return d.opts.LocalRuntime.Start(
-		ctx, dc.Requirement.Image,
+		ctx, dc.Requirement.Name,
 	)
+}
+
+// normHost normalises a placement host name so the empty string and the
+// sentinel "local" compare equal — both denote the local host (mirrors
+// scheduler.PlacementDecision.IsLocal).
+func normHost(h string) string {
+	if h == "" {
+		return "local"
+	}
+	return h
+}
+
+// stateNeedsTeardown reports whether a tracked container was genuinely deployed
+// and may still be alive on its host, so the teardown sites (Undistribute +
+// reconcileRelocations) MUST still issue its stop/remove. StateRunning is the
+// obvious case; StateMigrating is the less-obvious one (CT-HARDEN-DIST3-DEEP):
+// CheckAndFailover flips a genuinely-deployed StateRunning container to
+// StateMigrating when it proves the host offline, but that DI-4 reschedule is a
+// documented NO-OP — the container is NOT actually moved and may still be
+// running on its (possibly since-recovered) host. Skipping it via a bare
+// `!= StateRunning` re-opened the §11.4.69 DIST-1 sink-side leak for the
+// StateMigrating subset (Undistribute reports success while the container keeps
+// running; a relocation strands/duplicates it on the old host). Teardown is
+// best-effort, so attempting it on a truly-dead host merely errors (joined) —
+// never worse than the silent orphan. StateFailed/StateScheduled/
+// StateDeploying/StateStopped have no live deployment to remove.
+func stateNeedsTeardown(s DistributionState) bool {
+	return s == StateRunning || s == StateMigrating
+}
+
+// teardownContainer issues a best-effort stop+remove of a single tracked
+// container on the host where it was placed. Remote: `rt rm -f <name>` via the
+// Executor (mirrors deployRemote's pre-deploy rm — force-remove stops then
+// deletes, and `|| true` keeps it idempotent for an already-absent container).
+// Local: LocalRuntime.Stop then a force Remove. Used by both Undistribute()
+// (DIST-1) and reconcileRelocations() (DIST-2).
+//
+// HONEST BOUNDARY (§11.4.107): a unit test with no live runtime can only assert
+// the teardown COMMAND is ISSUED to the seam (Executor / LocalRuntime); it
+// cannot confirm a real container actually died.
+func (d *DefaultDistributor) teardownContainer(
+	ctx context.Context, dc DistributedContainer,
+) error {
+	name := dc.Requirement.Name
+	if normHost(dc.HostName) == "local" {
+		if d.opts.LocalRuntime == nil {
+			return nil
+		}
+		var errs []error
+		if err := d.opts.LocalRuntime.Stop(ctx, name); err != nil {
+			errs = append(errs, fmt.Errorf("stop %s: %w", name, err))
+		}
+		if err := d.opts.LocalRuntime.Remove(
+			ctx, name, runtime.WithForceRemove(true),
+		); err != nil {
+			errs = append(errs, fmt.Errorf("remove %s: %w", name, err))
+		}
+		return errors.Join(errs...)
+	}
+
+	if d.opts.Executor == nil {
+		return fmt.Errorf(
+			"teardown %s on %s: no remote executor configured",
+			name, dc.HostName,
+		)
+	}
+	// Mirror deployRemote's nil-HostManager guard (GetHost on a nil interface
+	// panics — CT-HARDEN-DIST-1).
+	if d.opts.HostManager == nil {
+		return fmt.Errorf(
+			"teardown %s on %s: no host manager configured",
+			name, dc.HostName,
+		)
+	}
+	host, err := d.opts.HostManager.GetHost(dc.HostName)
+	if err != nil || host == nil {
+		return fmt.Errorf("teardown %s: host %s not found", name, dc.HostName)
+	}
+	rt := host.Runtime
+	if rt == "" {
+		rt = "docker"
+	}
+	removeCmd := buildRemoteRemoveCommand(rt, name)
+	if _, err := d.opts.Executor.Execute(ctx, *host, removeCmd); err != nil {
+		return fmt.Errorf("teardown %s on %s: %w", name, dc.HostName, err)
+	}
+	return nil
+}
+
+// reconcileRelocations tears down containers stranded on their OLD host after a
+// re-Distribute/Rebalance moved or dropped them. deployRemote only rm-f's the
+// NEW host, so without this a container relocating from host A to host B keeps
+// running on A (CT-HARDEN-DIST-HARD DIST-2, a §11.4.69 sink-side leak). Only
+// previously-LIVE placements are torn down (stateNeedsTeardown: StateRunning OR
+// StateMigrating — CT-HARDEN-DIST3-DEEP; failed/scheduled ones were never
+// created); a name kept on the SAME host is left alone because deployRemote
+// already rm-f'd it in place. Best-effort — per-container errors are logged,
+// never abort the batch.
+func (d *DefaultDistributor) reconcileRelocations(
+	ctx context.Context, prev, current []DistributedContainer,
+	deployedThisRound map[string]bool,
+) {
+	if len(prev) == 0 {
+		return
+	}
+	newHost := make(map[string]string, len(current))
+	for _, dc := range current {
+		newHost[dc.Requirement.Name] = normHost(dc.HostName)
+	}
+	for _, old := range prev {
+		if !stateNeedsTeardown(old.State) {
+			continue
+		}
+		// CT-HARDEN-DIST2HARD DI-2: "same host ⇒ already rm-f'd in place" is
+		// only true when a deploy ACTUALLY ran THIS round for this container.
+		// A round that short-circuited before reaching deployContainer (ctx
+		// cancelled, or Score==0) still records decision.HostName on the new
+		// entry even though nothing was issued to that host — trusting that
+		// recorded host left a truly-still-running old container never torn
+		// down, and its new StateFailed entry then permanently exempted it
+		// from every future teardown (deployedThisRound[...] is false here, so
+		// a short-circuited round now falls through to teardown below instead
+		// of being wrongly treated as already-handled).
+		if deployedThisRound[old.Requirement.Name] {
+			if h, ok := newHost[old.Requirement.Name]; ok &&
+				h == normHost(old.HostName) {
+				continue // same host: deployRemote already rm-f'd it in place
+			}
+		}
+		if err := d.teardownContainer(ctx, old); err != nil {
+			d.opts.Logger.Error(
+				"reconcile: teardown stale %s on %s failed: %v",
+				old.Requirement.Name, old.HostName, err,
+			)
+		}
+	}
 }
 
 // buildPublishFlags renders the `-p host:container[/proto]` fragment (each with
@@ -326,11 +745,75 @@ func buildPublishFlags(ports []scheduler.PortMapping) string {
 	return b.String()
 }
 
+// shellQuote wraps s in single quotes for safe interpolation into a POSIX
+// shell command. Any embedded single quote is rendered as the canonical
+// close-quote, backslash-escaped-quote, reopen-quote sequence (the ReplaceAll
+// below). Registry/requirement-controlled fields (container Name / Image)
+// reach the remote `run`/`rm` command as raw shell text, so they MUST pass
+// through this before interpolation — an unescaped shell metacharacter in a
+// registry-controlled value is remote command execution (§11.4, ATM-C056).
+// It always wraps (never leaves a value bare), so an empty value renders as an
+// empty single-quoted argument. Mirrors the proven pkg/emulator shellQuote;
+// kept local because that precedent is unexported and to keep pkg/distribution
+// decoupled (§11.4.28).
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// buildRemoteRemoveCommand renders the pre-deploy `rm -f` command. BOTH the
+// runtime (rt = host.Runtime, an unvalidated CONTAINERS_REMOTE_HOST_N_RUNTIME
+// env-config value) and the container Name (untrusted registry/requirement
+// input) are interpolated into a string that ssh_executor.Execute hands to the
+// REMOTE login shell verbatim (`ssh host <cmd>` re-parses the string), so BOTH
+// MUST be shell quoted before interpolation. Leaving rt raw while quoting name
+// was the §11.4.108 injection inconsistency the ARGSWEEP audit flagged (RT3): a
+// host.Runtime like `docker;touch /pwn` would run the injected 2nd command on
+// the remote host. Quoting is non-breaking because the LOCAL path already
+// treats rt as a single executable token (exec.CommandContext(ctx, rt, ...)),
+// so 'docker'/'podman' resolve identically. Pure function so the built string
+// is unit testable without a live executor (§11.4.115).
+func buildRemoteRemoveCommand(rt, name string) string {
+	return fmt.Sprintf(
+		"%s rm -f %s 2>/dev/null || true",
+		shellQuote(rt), shellQuote(name),
+	)
+}
+
+// buildRemoteRunCommand renders the remote `run -d` command. rt (host.Runtime,
+// an unvalidated CONTAINERS_REMOTE_HOST_N_RUNTIME env-config value), Name, and
+// Image are ALL interpolated into a string ssh_executor.Execute hands to the
+// REMOTE login shell verbatim (`ssh host <cmd>` re-parses the string), so ALL
+// THREE MUST be shell quoted. Leaving rt raw while quoting name/image was the
+// §11.4.108 injection inconsistency the ARGSWEEP audit flagged (SITE 4b): a
+// host.Runtime like `docker;touch /pwn` would run the injected 2nd command on
+// the remote host. The publish flags are allowlist-safe (buildPublishFlags).
+// Quoting rt is non-breaking because the LOCAL path treats it as a single
+// executable token (exec.CommandContext(ctx, rt, ...)), so 'docker'/'podman'
+// resolve identically. Pure function so the built string is unit testable
+// without a live executor (§11.4.115).
+func buildRemoteRunCommand(
+	rt, name, image string, ports []scheduler.PortMapping,
+) string {
+	return fmt.Sprintf(
+		"%s run -d --name %s%s %s",
+		shellQuote(rt), shellQuote(name),
+		buildPublishFlags(ports),
+		shellQuote(image),
+	)
+}
+
 func (d *DefaultDistributor) deployRemote(
 	ctx context.Context, dc *DistributedContainer,
 ) error {
 	if d.opts.Executor == nil {
 		return fmt.Errorf("no remote executor configured")
+	}
+	// HostManager is an independently-settable Option (options.go); a caller
+	// can configure Executor without HostManager. Guard exactly like
+	// HostStatus() does — GetHost() on a nil interface panics
+	// (CT-HARDEN-DIST-1).
+	if d.opts.HostManager == nil {
+		return fmt.Errorf("no host manager configured")
 	}
 
 	host, err := d.opts.HostManager.GetHost(dc.HostName)
@@ -345,17 +828,12 @@ func (d *DefaultDistributor) deployRemote(
 		rt = "docker"
 	}
 
-	removeCmd := fmt.Sprintf(
-		"%s rm -f %s 2>/dev/null || true",
-		rt, dc.Requirement.Name,
-	)
+	removeCmd := buildRemoteRemoveCommand(rt, dc.Requirement.Name)
 	d.opts.Executor.Execute(ctx, *host, removeCmd)
 
-	cmd := fmt.Sprintf(
-		"%s run -d --name %s%s %s",
-		rt, dc.Requirement.Name,
-		buildPublishFlags(dc.Requirement.Ports),
-		dc.Requirement.Image,
+	cmd := buildRemoteRunCommand(
+		rt, dc.Requirement.Name, dc.Requirement.Image,
+		dc.Requirement.Ports,
 	)
 
 	d.opts.Logger.Info("deploying %s on %s: %s",

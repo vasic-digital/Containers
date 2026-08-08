@@ -25,19 +25,19 @@ import (
 // be a bluff fake; this one implements every method the contract
 // declares.
 type fakeEmulator struct {
-	bootResults     []BootResult
-	waitDurations   []time.Duration
-	waitErrors      []error
-	installErrors   []error
-	runOutputs      []string
-	runPassed       []bool
-	runErrors       []error
-	teardownErrors  []error
-	bootCallCount   int
-	waitCallCount   int
-	installCount    int
-	runCount        int
-	teardownCount   int
+	bootResults    []BootResult
+	waitDurations  []time.Duration
+	waitErrors     []error
+	installErrors  []error
+	runOutputs     []string
+	runPassed      []bool
+	runErrors      []error
+	teardownErrors []error
+	bootCallCount  int
+	waitCallCount  int
+	installCount   int
+	runCount       int
+	teardownCount  int
 }
 
 func (f *fakeEmulator) Boot(_ context.Context, avd AVD, _ bool) (BootResult, error) {
@@ -274,11 +274,12 @@ func TestAndroidMatrixRunner_BootFailure_RecordsRowAndContinues(t *testing.T) {
 // scripts/tag.sh's gating check.
 //
 // Falsifiability:
-//   Mutation: in matrix.go, drop the `boot.BootCompleted = true` line
-//             added after WaitForBoot succeeds.
-//   Observed-Failure: this test asserts BootCompleted=true on the
-//             happy-path Boot row; the assertion fires.
-//   Reverted: yes (see git log).
+//
+//	Mutation: in matrix.go, drop the `boot.BootCompleted = true` line
+//	          added after WaitForBoot succeeds.
+//	Observed-Failure: this test asserts BootCompleted=true on the
+//	          happy-path Boot row; the assertion fires.
+//	Reverted: yes (see git log).
 //
 // Forensic anchor: the 2026-05-04 first-matrix-smoke-run produced
 // `all_passed=false` even though the test passed, because the Boot
@@ -349,11 +350,12 @@ func TestAndroidMatrixRunner_TestFailure_PropagatesToAttestation(t *testing.T) {
 // from a snapshot reload.
 //
 // Falsifiability rehearsal:
-//   Mutation: in matrix.go, remove the line `boot.BootDuration += waitDuration`.
-//   Observed-Failure: this test fails — boot_seconds in the attestation
-//             is 0.05 (the launch-command duration) instead of the 7.05
-//             total (5s wait + 0.05 launch).
-//   Reverted: yes — post-revert the test passes.
+//
+//	Mutation: in matrix.go, remove the line `boot.BootDuration += waitDuration`.
+//	Observed-Failure: this test fails — boot_seconds in the attestation
+//	          is 0.05 (the launch-command duration) instead of the 7.05
+//	          total (5s wait + 0.05 launch).
+//	Reverted: yes — post-revert the test passes.
 func TestAndroidMatrixRunner_BootDuration_IncludesWaitForBootElapsed(t *testing.T) {
 	fake := &fakeEmulator{
 		bootResults: []BootResult{
@@ -839,12 +841,12 @@ func TestRunMatrix_RoutesMissingSystemImageThroughCache_WhenImageManifestPathIsS
 // the `adb emu network` and `adb exec-out screencap -p` invocations the
 // matrix runner issues; the test asserts on those records.
 type adbStubEmulator struct {
-	exec    *fakeExecutor
-	adbBin  string
-	port    int
-	passed  bool
-	runOut  string
-	runErr  error
+	exec   *fakeExecutor
+	adbBin string
+	port   int
+	passed bool
+	runOut string
+	runErr error
 }
 
 func (s *adbStubEmulator) Boot(_ context.Context, avd AVD, _ bool) (BootResult, error) {
@@ -1001,7 +1003,7 @@ func TestRunOne_ScreenshotOnFailure(t *testing.T) {
 	pngBytes := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
 	exec := &fakeExecutor{
 		scripts: map[string]fakeScript{
-			"/sdk/platform-tools/adb -s localhost:5554 exec-out screencap -p": {Out: pngBytes},
+			"/sdk/platform-tools/adb -s localhost:5555 exec-out screencap -p": {Out: pngBytes},
 		},
 	}
 	stub := &adbStubEmulator{
@@ -1102,7 +1104,7 @@ func TestRunOne_NoScreenshotOnSuccess(t *testing.T) {
 func TestRunOne_NoScreenshotWhenFlagFalse(t *testing.T) {
 	exec := &fakeExecutor{
 		scripts: map[string]fakeScript{
-			"/sdk/platform-tools/adb -s localhost:5554 exec-out screencap -p": {
+			"/sdk/platform-tools/adb -s localhost:5555 exec-out screencap -p": {
 				Out: []byte("png-bytes"),
 			},
 		},
@@ -1137,7 +1139,7 @@ func TestRunOne_AttestationCarriesNetworkProfileAndScreenshotPath(t *testing.T) 
 	pngBytes := []byte{0x89, 'P', 'N', 'G'}
 	exec := &fakeExecutor{
 		scripts: map[string]fakeScript{
-			"/sdk/platform-tools/adb -s localhost:5554 exec-out screencap -p": {Out: pngBytes},
+			"/sdk/platform-tools/adb -s localhost:5555 exec-out screencap -p": {Out: pngBytes},
 		},
 	}
 	stub := &adbStubEmulator{

@@ -79,7 +79,12 @@ func (m *moreVolHostMgr) ProbeAll(_ context.Context) map[string]*remote.HostReso
 func (m *moreVolHostMgr) HostState(_ string) remote.HostState                         { return remote.HostOnline }
 
 func newMoreTestVolumeManager(hm *moreVolHostMgr, exec *moreVolExecutor) *DefaultVolumeManager {
-	return NewVolumeManager(hm, exec, logging.NopLogger{})
+	// WithLocalHostAddress is required for NFSMounter/SSHFSMounter (see
+	// VOL-HIGH-1 / VOL-HIGH-2); the tests through this helper exercise
+	// unrelated behavior using MountSSHFS/MountNFS as filler types.
+	return NewVolumeManager(
+		hm, exec, logging.NopLogger{}, WithLocalHostAddress("10.0.0.99"),
+	)
 }
 
 // --- NewVolumeManager nil logger branch ---
@@ -157,9 +162,11 @@ func TestSync_RsyncError(t *testing.T) {
 
 // --- Unmount branch coverage ---
 
-// TestUnmount_NilHost exercises the branch where Unmount finds the mount
-// but the host manager returns nil — the unmount proceeds without calling
-// the underlying sshfs/nfs unmount.
+// TestUnmount_NilHost exercises the branch where Unmount finds the mount but
+// the host manager returns nil (the host vanished). DEFECT-2: this is an
+// honest failure — the remote unmount cannot run, so Unmount MUST return an
+// error and MUST NOT drop the entry or falsely mark it unmounted (it may still
+// be mounted on a host we lost track of). Previously it silently succeeded.
 func TestUnmount_NilHost(t *testing.T) {
 	hm := &moreVolHostMgr{hosts: map[string]remote.RemoteHost{
 		"host-1": {Name: "host-1", Address: "10.0.0.1", User: "u", Port: 22},
@@ -177,10 +184,13 @@ func TestUnmount_NilHost(t *testing.T) {
 	hm.nilHost = true
 
 	err := mgr.Unmount(context.Background(), "sshfs-nil-host")
-	assert.NoError(t, err)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not found")
 
-	info, _ := mgr.Status("sshfs-nil-host")
-	assert.Equal(t, MountUnmounted, info.State)
+	// The entry is preserved (not silently dropped, not falsely unmounted).
+	info, e := mgr.Status("sshfs-nil-host")
+	require.NoError(t, e)
+	assert.Equal(t, MountMounted, info.State)
 }
 
 // TestUnmount_NFS_WithHost exercises the NFS unmount branch in Unmount when
@@ -199,10 +209,12 @@ func TestUnmount_NFS_WithHost(t *testing.T) {
 	require.NoError(t, mgr.Mount(context.Background(), mount))
 
 	err := mgr.Unmount(context.Background(), "nfs-unmount-test")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
-	info, _ := mgr.Status("nfs-unmount-test")
-	assert.Equal(t, MountUnmounted, info.State)
+	// DEFECT-1: a successful unmount removes the entry so the name is reusable
+	// and the map does not grow unbounded — Status now reports it as gone.
+	_, e := mgr.Status("nfs-unmount-test")
+	assert.Error(t, e)
 }
 
 // --- UnmountAll error branch ---
@@ -280,7 +292,7 @@ func TestSSHFS_Mount_MkdirError(t *testing.T) {
 			return nil, fmt.Errorf("connection refused")
 		},
 	}
-	m := NewSSHFSMounter(exec, logging.NopLogger{}, DefaultMountOptions())
+	m := NewSSHFSMounter(exec, logging.NopLogger{}, testMountOptionsWithAddress())
 	host := remote.RemoteHost{Name: "h", Address: "1.2.3.4", User: "u"}
 	mount := VolumeMount{Name: "x", LocalPath: "/a", RemotePath: "/b"}
 	err := m.Mount(context.Background(), host, mount)
@@ -295,7 +307,7 @@ func TestSSHFS_Mount_MkdirNonZeroExit(t *testing.T) {
 			return &remote.CommandResult{ExitCode: 1, Stderr: "permission denied"}, nil
 		},
 	}
-	m := NewSSHFSMounter(exec, logging.NopLogger{}, DefaultMountOptions())
+	m := NewSSHFSMounter(exec, logging.NopLogger{}, testMountOptionsWithAddress())
 	host := remote.RemoteHost{Name: "h", Address: "1.2.3.4", User: "u"}
 	mount := VolumeMount{Name: "x", LocalPath: "/a", RemotePath: "/b"}
 	err := m.Mount(context.Background(), host, mount)
@@ -315,7 +327,7 @@ func TestSSHFS_Mount_SshfsNonZeroExit(t *testing.T) {
 			return &remote.CommandResult{ExitCode: 1, Stderr: "sshfs not found"}, nil
 		},
 	}
-	m := NewSSHFSMounter(exec, logging.NopLogger{}, DefaultMountOptions())
+	m := NewSSHFSMounter(exec, logging.NopLogger{}, testMountOptionsWithAddress())
 	host := remote.RemoteHost{Name: "h", Address: "1.2.3.4", User: "u"}
 	mount := VolumeMount{Name: "x", LocalPath: "/a", RemotePath: "/b"}
 	err := m.Mount(context.Background(), host, mount)
@@ -326,7 +338,7 @@ func TestSSHFS_Mount_SshfsNonZeroExit(t *testing.T) {
 // TestSSHFS_Mount_ReadOnly exercises the ReadOnly branch in SSHFSMounter.Mount.
 func TestSSHFS_Mount_ReadOnly(t *testing.T) {
 	exec := &moreVolExecutor{}
-	m := NewSSHFSMounter(exec, logging.NopLogger{}, DefaultMountOptions())
+	m := NewSSHFSMounter(exec, logging.NopLogger{}, testMountOptionsWithAddress())
 	host := remote.RemoteHost{Name: "h", Address: "1.2.3.4", User: "u"}
 	mount := VolumeMount{Name: "x", LocalPath: "/a", RemotePath: "/b", ReadOnly: true}
 	err := m.Mount(context.Background(), host, mount)
@@ -341,7 +353,7 @@ func TestSSHFS_Unmount_Error(t *testing.T) {
 			return nil, fmt.Errorf("broken pipe")
 		},
 	}
-	m := NewSSHFSMounter(exec, logging.NopLogger{}, DefaultMountOptions())
+	m := NewSSHFSMounter(exec, logging.NopLogger{}, testMountOptionsWithAddress())
 	host := remote.RemoteHost{Name: "h", Address: "1.2.3.4", User: "u"}
 	mount := VolumeMount{Name: "x", RemotePath: "/b"}
 	err := m.Unmount(context.Background(), host, mount)
@@ -357,7 +369,7 @@ func TestSSHFS_Unmount_NonZeroExit(t *testing.T) {
 			return &remote.CommandResult{ExitCode: 1, Stderr: "not mounted"}, nil
 		},
 	}
-	m := NewSSHFSMounter(exec, logging.NopLogger{}, DefaultMountOptions())
+	m := NewSSHFSMounter(exec, logging.NopLogger{}, testMountOptionsWithAddress())
 	host := remote.RemoteHost{Name: "h", Address: "1.2.3.4", User: "u"}
 	mount := VolumeMount{Name: "x", RemotePath: "/b"}
 	err := m.Unmount(context.Background(), host, mount)
@@ -374,7 +386,7 @@ func TestNFS_Mount_MkdirError(t *testing.T) {
 			return nil, fmt.Errorf("permission denied")
 		},
 	}
-	m := NewNFSMounter(exec, logging.NopLogger{}, DefaultMountOptions())
+	m := NewNFSMounter(exec, logging.NopLogger{}, testMountOptionsWithAddress())
 	host := remote.RemoteHost{Name: "h", Address: "1.2.3.4", User: "u"}
 	mount := VolumeMount{Name: "x", LocalPath: "/a", RemotePath: "/b"}
 	err := m.Mount(context.Background(), host, mount)
@@ -389,7 +401,7 @@ func TestNFS_Mount_MkdirNonZeroExit(t *testing.T) {
 			return &remote.CommandResult{ExitCode: 1, Stderr: "permission denied"}, nil
 		},
 	}
-	m := NewNFSMounter(exec, logging.NopLogger{}, DefaultMountOptions())
+	m := NewNFSMounter(exec, logging.NopLogger{}, testMountOptionsWithAddress())
 	host := remote.RemoteHost{Name: "h", Address: "1.2.3.4", User: "u"}
 	mount := VolumeMount{Name: "x", LocalPath: "/a", RemotePath: "/b"}
 	err := m.Mount(context.Background(), host, mount)
@@ -409,7 +421,7 @@ func TestNFS_Mount_NFSNonZeroExit(t *testing.T) {
 			return &remote.CommandResult{ExitCode: 1, Stderr: "nfs: no such file"}, nil
 		},
 	}
-	m := NewNFSMounter(exec, logging.NopLogger{}, DefaultMountOptions())
+	m := NewNFSMounter(exec, logging.NopLogger{}, testMountOptionsWithAddress())
 	host := remote.RemoteHost{Name: "h", Address: "1.2.3.4", User: "u"}
 	mount := VolumeMount{Name: "x", LocalPath: "/a", RemotePath: "/b"}
 	err := m.Mount(context.Background(), host, mount)
@@ -420,7 +432,7 @@ func TestNFS_Mount_NFSNonZeroExit(t *testing.T) {
 // TestNFS_Mount_ReadOnly exercises the ReadOnly branch in NFSMounter.Mount.
 func TestNFS_Mount_ReadOnly(t *testing.T) {
 	exec := &moreVolExecutor{}
-	m := NewNFSMounter(exec, logging.NopLogger{}, DefaultMountOptions())
+	m := NewNFSMounter(exec, logging.NopLogger{}, testMountOptionsWithAddress())
 	host := remote.RemoteHost{Name: "h", Address: "1.2.3.4", User: "u"}
 	mount := VolumeMount{Name: "x", LocalPath: "/a", RemotePath: "/b", ReadOnly: true}
 	err := m.Mount(context.Background(), host, mount)
@@ -434,7 +446,7 @@ func TestNFS_Unmount_Error(t *testing.T) {
 			return nil, fmt.Errorf("ssh error")
 		},
 	}
-	m := NewNFSMounter(exec, logging.NopLogger{}, DefaultMountOptions())
+	m := NewNFSMounter(exec, logging.NopLogger{}, testMountOptionsWithAddress())
 	host := remote.RemoteHost{Name: "h", Address: "1.2.3.4", User: "u"}
 	mount := VolumeMount{Name: "x", RemotePath: "/b"}
 	err := m.Unmount(context.Background(), host, mount)
@@ -449,7 +461,7 @@ func TestNFS_Unmount_NonZeroExit(t *testing.T) {
 			return &remote.CommandResult{ExitCode: 1, Stderr: "not mounted"}, nil
 		},
 	}
-	m := NewNFSMounter(exec, logging.NopLogger{}, DefaultMountOptions())
+	m := NewNFSMounter(exec, logging.NopLogger{}, testMountOptionsWithAddress())
 	host := remote.RemoteHost{Name: "h", Address: "1.2.3.4", User: "u"}
 	mount := VolumeMount{Name: "x", RemotePath: "/b"}
 	err := m.Unmount(context.Background(), host, mount)

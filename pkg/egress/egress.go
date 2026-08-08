@@ -28,6 +28,7 @@
 package egress
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -37,10 +38,26 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"digital.vasic.containers/pkg/logging"
 )
+
+// execCommand is the process-spawn seam for the ssh child. Production uses
+// exec.Command; tests substitute a fake child to exercise the ssh-child
+// lifecycle (fast-fail, dead-child, foreign-listener) WITHOUT a real ssh/VPN
+// (§11.4.27 — no real ssh in tests). Mirrors pkg/vm's killByPortHook idiom.
+var execCommand = exec.Command
+
+// childReadyGrace is how long TunnelUp keeps watching an ssh child AFTER the
+// SOCKS port first dials, before trusting the tunnel. A fast-failing ssh child
+// behind a FOREIGN pre-bound listener otherwise masquerades as ready: the port
+// dials (someone else's listener) while our child has already died. The grace
+// window lets the child's exit win that race deterministically. It applies once,
+// only on the iteration the port first becomes dialable, so it adds negligible
+// latency to a genuine multi-second ssh setup.
+const childReadyGrace = 150 * time.Millisecond
 
 // Options configures a dynamic SOCKS5 egress tunnel to a VPN-connected host.
 type Options struct {
@@ -108,6 +125,16 @@ func buildDynamicForwardArgs(o Options) []string {
 	if connectTimeout <= 0 {
 		connectTimeout = 10 * time.Second
 	}
+	// §EG2-2: ssh's ConnectTimeout option is an INTEGER number of seconds, and
+	// ConnectTimeout=0 means "no timeout — fall back to the ~2-minute system TCP
+	// default", the OPPOSITE of a tight bound. int(d.Seconds()) truncates, so any
+	// sub-second ConnectTimeout (e.g. 500ms) silently rendered "ConnectTimeout=0",
+	// disabling the ssh-side connect bound the caller asked to tighten. Clamp to a
+	// floor of 1s so a positive request is never turned into "unbounded".
+	connectSecs := int(connectTimeout.Seconds())
+	if connectSecs < 1 {
+		connectSecs = 1
+	}
 	args := []string{
 		"-N",
 		"-D", o.SocksAddr(),
@@ -116,7 +143,7 @@ func buildDynamicForwardArgs(o Options) []string {
 		"-o", "ExitOnForwardFailure=yes",
 		"-o", "ServerAliveInterval=30",
 		"-o", "ServerAliveCountMax=3",
-		"-o", fmt.Sprintf("ConnectTimeout=%d", int(connectTimeout.Seconds())),
+		"-o", fmt.Sprintf("ConnectTimeout=%d", connectSecs),
 		"-p", strconv.Itoa(o.sshPort()),
 	}
 	if o.KeyPath != "" {
@@ -129,9 +156,22 @@ func buildDynamicForwardArgs(o Options) []string {
 
 // Tunnel is a running SOCKS5 egress tunnel.
 type Tunnel struct {
-	cmd       *exec.Cmd
 	socksAddr string
 	logger    logging.Logger
+
+	// stderr captures the ssh child's stderr so its real failure cause (auth,
+	// bind, host-down) is surfaced instead of a generic readiness timeout.
+	stderr *bytes.Buffer
+	// waitDone is closed once the single cmd.Wait() has reaped the ssh child;
+	// waitErr then holds that Wait result. Both are read only after a receive
+	// from waitDone (a happens-before edge), so they need no extra locking.
+	waitDone chan struct{}
+	waitErr  error
+
+	// mu guards cmd + down so Down is concurrency-safe + clean-idempotent.
+	mu   sync.Mutex
+	cmd  *exec.Cmd
+	down bool
 }
 
 // Addr returns the SOCKS5 proxy "addr:port".
@@ -150,15 +190,41 @@ func TunnelUp(ctx context.Context, o Options, logger logging.Logger) (*Tunnel, e
 	if o.LocalPort <= 0 {
 		return nil, fmt.Errorf("egress: LocalPort is required")
 	}
+	// §EG2-1: the ssh child is spawned as a bare argv (execCommand("ssh", args...),
+	// no shell), so shell metacharacters in the destination are inert — but a
+	// destination that BEGINS WITH '-' is parsed by ssh's own getopt as an OPTION,
+	// not a host. e.g. VPNHost "-oProxyCommand=<cmd>" injects ssh's ProxyCommand
+	// (arbitrary command execution) since destination() is appended as the final
+	// positional with no "--" guard. Refuse it (ssh has no reliable "--" end-of-
+	// options for the host, so rejection is the safe, deterministic fix). Checking
+	// destination() covers a leading '-' in EITHER VPNHost OR the User@VPNHost form.
+	if strings.HasPrefix(o.destination(), "-") {
+		return nil, fmt.Errorf("egress: refusing ssh destination %q that begins with '-' (would be parsed as an ssh option — argument injection)", o.destination())
+	}
 
 	args := buildDynamicForwardArgs(o)
-	cmd := exec.Command("ssh", args...)
+	cmd := execCommand("ssh", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	logger.Info("egress: starting SOCKS tunnel via %s on %s", o.destination(), o.SocksAddr())
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("egress: start ssh: %w", err)
 	}
 
-	t := &Tunnel{cmd: cmd, socksAddr: o.SocksAddr(), logger: logger}
+	t := &Tunnel{
+		socksAddr: o.SocksAddr(),
+		logger:    logger,
+		stderr:    &stderr,
+		waitDone:  make(chan struct{}),
+		cmd:       cmd,
+	}
+	// Watch the child: the SINGLE cmd.Wait() reaps it and records the exit cause.
+	// The moment it dies, waitDone is closed so the readiness loop can break out
+	// with the real ssh error instead of dialing a port the child never bound.
+	go func() {
+		t.waitErr = cmd.Wait()
+		close(t.waitDone)
+	}()
 
 	readyTimeout := o.ConnectTimeout
 	if readyTimeout <= 0 {
@@ -170,9 +236,35 @@ func TunnelUp(ctx context.Context, o Options, logger logging.Logger) (*Tunnel, e
 			_ = t.Down()
 			return nil, ctx.Err()
 		}
+		// Child died before the proxy came up (VPN host down / auth / bind
+		// failure) — surface the real cause, never the generic timeout.
+		select {
+		case <-t.waitDone:
+			err := t.childError()
+			_ = t.Down()
+			return nil, err
+		default:
+		}
 		conn, err := net.DialTimeout("tcp", t.socksAddr, 500*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
+			// Port is dialable — but confirm OUR ssh child is alive AND stays
+			// alive through the grace window. A dead child behind a foreign
+			// pre-bound listener otherwise reports ready (false positive).
+			select {
+			case <-t.waitDone:
+				err := t.childError()
+				_ = t.Down()
+				return nil, err
+			case <-time.After(childReadyGrace):
+			}
+			select {
+			case <-t.waitDone:
+				err := t.childError()
+				_ = t.Down()
+				return nil, err
+			default:
+			}
 			logger.Info("egress: SOCKS proxy ready on %s", t.socksAddr)
 			return t, nil
 		}
@@ -182,13 +274,51 @@ func TunnelUp(ctx context.Context, o Options, logger logging.Logger) (*Tunnel, e
 	return nil, fmt.Errorf("egress: SOCKS proxy %s did not become ready within %s", t.socksAddr, readyTimeout)
 }
 
-// Down stops the tunnel.
+// childError builds the tunnel-failure error from the reaped ssh child's exit
+// status and captured stderr. It MUST be called only after a receive from
+// t.waitDone (which makes t.waitErr + t.stderr safe to read).
+func (t *Tunnel) childError() error {
+	stderr := strings.TrimSpace(t.stderr.String())
+	base := fmt.Sprintf("egress: ssh tunnel to %s exited before the SOCKS proxy became ready", t.socksAddr)
+	switch {
+	case t.waitErr != nil && stderr != "":
+		return fmt.Errorf("%s: %v: %s", base, t.waitErr, stderr)
+	case t.waitErr != nil:
+		return fmt.Errorf("%s: %v", base, t.waitErr)
+	case stderr != "":
+		return fmt.Errorf("%s: %s", base, stderr)
+	default:
+		return fmt.Errorf("%s", base)
+	}
+}
+
+// Down stops the tunnel. Concurrency-safe + clean-idempotent: a sync.Mutex + a
+// down flag ensure the ssh child is killed + reaped exactly once (the single
+// cmd.Wait() runs in the watcher goroutine), and t.cmd is niled post-teardown.
 func (t *Tunnel) Down() error {
-	if t == nil || t.cmd == nil || t.cmd.Process == nil {
+	if t == nil {
 		return nil
 	}
-	_ = t.cmd.Process.Kill()
-	_, _ = t.cmd.Process.Wait()
+	t.mu.Lock()
+	if t.down {
+		t.mu.Unlock()
+		return nil
+	}
+	t.down = true
+	cmd := t.cmd
+	waitDone := t.waitDone
+	t.cmd = nil
+	t.mu.Unlock()
+
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	_ = cmd.Process.Kill()
+	if waitDone != nil {
+		<-waitDone // reap via the single cmd.Wait() in the watcher goroutine
+	} else {
+		_, _ = cmd.Process.Wait()
+	}
 	return nil
 }
 
@@ -225,9 +355,11 @@ func Verify(ctx context.Context, socksAddr, ipEchoURL string, targets []string) 
 // DirectEgressIP reads the host's own egress IP from ipEchoURL WITHOUT any
 // proxy — the "direct" half of the before/after diagnosis.
 func DirectEgressIP(ctx context.Context, ipEchoURL string) (string, error) {
+	// DisableKeepAlives mirrors socksClient: this one-shot transport is never
+	// reused, so a kept-alive idle connection + its readLoop goroutine would leak.
 	client := &http.Client{
 		Timeout:   15 * time.Second,
-		Transport: &http.Transport{Proxy: nil},
+		Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true},
 	}
 	ip, err := fetchEgressIP(ctx, client, ipEchoURL)
 	if err != nil {
@@ -269,8 +401,21 @@ func fetchEgressIP(ctx context.Context, client *http.Client, ipEchoURL string) (
 		return "", err
 	}
 	ip := strings.TrimSpace(string(body))
+	// A blocked/MITM'd IP-echo — the EXACT scenario this package diagnoses —
+	// answers with a non-2xx status (403 "Access Denied", 500, a 302+body).
+	// Using such a response would report a bogus egress IP with err==nil, so a
+	// dead/blocked echo would masquerade as a successful diagnosis. Require 2xx.
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("egress: IP-echo returned HTTP %d (body %q)", resp.StatusCode, ip)
+	}
 	if ip == "" {
 		return "", fmt.Errorf("empty IP-echo response (status %d)", resp.StatusCode)
+	}
+	// The body MUST be a bare IP address (the documented IP-echo contract). A 2xx
+	// with an HTML/error body (a soft block) is rejected so "Access Denied" is
+	// never returned as though it were the egress IP.
+	if net.ParseIP(ip) == nil {
+		return "", fmt.Errorf("egress: IP-echo body is not an IP address: %q", ip)
 	}
 	return ip, nil
 }

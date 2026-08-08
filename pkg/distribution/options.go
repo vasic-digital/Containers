@@ -29,6 +29,19 @@ type Options struct {
 	EnableTunnels bool
 	// EnableVolumes controls whether volumes are mounted.
 	EnableVolumes bool
+	// VolumeMountsFor derives the volume mounts to create for a container
+	// after it deploys successfully on a REMOTE host (CT-HARDEN-DIST2HARD
+	// DI-1 wires the module's documented deploy flow: run -> create tunnels
+	// -> mount volumes, see this module's CLAUDE.md "Mandatory Container
+	// Orchestration Flow"). scheduler.ContainerRequirements carries no volume
+	// specification of its own, so this hook is the seam a caller uses to opt
+	// a container into the mount-after-deploy step. nil (the default) means
+	// no volumes are ever mounted — a deliberate "nothing configured", never
+	// a guessed mount point (§11.4.6). Only consulted when EnableVolumes is
+	// true and VolumeManager is configured.
+	VolumeMountsFor func(
+		req scheduler.ContainerRequirements, hostName string,
+	) []volume.VolumeMount
 }
 
 // Option configures distribution behavior.
@@ -92,4 +105,13 @@ func WithTunnels(enabled bool) Option {
 // WithVolumes enables or disables volume mounting.
 func WithVolumes(enabled bool) Option {
 	return func(o *Options) { o.EnableVolumes = enabled }
+}
+
+// WithVolumeMountsFor sets the hook used to derive per-container volume
+// mounts for the documented create-tunnels-then-mount-volumes deploy flow
+// (CT-HARDEN-DIST2HARD DI-1). See Options.VolumeMountsFor.
+func WithVolumeMountsFor(
+	fn func(req scheduler.ContainerRequirements, hostName string) []volume.VolumeMount,
+) Option {
+	return func(o *Options) { o.VolumeMountsFor = fn }
 }

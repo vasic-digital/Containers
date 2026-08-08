@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -99,12 +100,14 @@ func TestScheduleRoundRobin_Distribution(t *testing.T) {
 		{Name: "h2", Labels: map[string]string{}},
 	}
 
+	var counter atomic.Uint64
 	seen := make(map[string]bool)
 	for i := 0; i < 10; i++ {
 		d := scheduleRoundRobin(
 			hosts,
 			ContainerRequirements{Name: "test"},
 			"local",
+			&counter,
 		)
 		seen[d.HostName] = true
 	}

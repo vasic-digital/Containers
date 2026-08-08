@@ -14,7 +14,7 @@ import (
 func skipUnlessIntegration(t *testing.T) {
 	t.Helper()
 	if os.Getenv("CONTAINERS_INTEGRATION_TEST") != "1" {
-		t.Skip("Set CONTAINERS_INTEGRATION_TEST=1 to run integration tests")  // SKIP-OK: #integration-mode-only
+		t.Skip("Set CONTAINERS_INTEGRATION_TEST=1 to run integration tests") // SKIP-OK: #integration-mode-only
 	}
 }
 

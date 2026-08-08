@@ -12,6 +12,11 @@ func (c *DefaultSystemCollector) collectDiskLinuxFromPath(
 ) {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(path, &stat); err != nil {
+		// SW2-1: the statfs probe FAILED — flag it so the leftover 0%
+		// DiskPercent is not read as a genuinely-empty disk. Without this a
+		// `system.disk > 90 → page` rule NEVER fires when statfs is broken while
+		// the disk is actually full (resolveMetric returns ok=false instead).
+		res.DiskError = true
 		return
 	}
 	// Total and free in bytes using the filesystem block size.

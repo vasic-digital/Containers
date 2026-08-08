@@ -448,8 +448,8 @@ func TestRealQMPClient_Dial_NegotiatesCapabilities(t *testing.T) {
 
 func TestRealQMPClient_SystemPowerdown_SendsExpectedJSON(t *testing.T) {
 	var (
-		mu      sync.Mutex
-		gotCmd  string
+		mu     sync.Mutex
+		gotCmd string
 	)
 	port := startQMPServer(t, &gotCmd, &mu)
 	c := &realQMPClient{}

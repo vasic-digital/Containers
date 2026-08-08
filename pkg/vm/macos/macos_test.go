@@ -17,24 +17,24 @@ import (
 // pre-configured responses so tests exercise the orchestration logic
 // without a real Tart installation.
 type fakeTartRunner struct {
-	versionResult  string
-	versionErr     error
-	cloneErr       error
-	runErr         error
-	sshStdout      string
-	sshStderr      string
-	sshExitCode    int
-	sshErr         error
-	stopErr        error
-	deleteErr      error
-	cloneCalled    bool
-	runCalled      bool
-	sshCalled      bool
-	stopCalled     bool
-	deleteCalled   bool
-	lastVMName     string
-	lastImage      string
-	lastCommand    string
+	versionResult string
+	versionErr    error
+	cloneErr      error
+	runErr        error
+	sshStdout     string
+	sshStderr     string
+	sshExitCode   int
+	sshErr        error
+	stopErr       error
+	deleteErr     error
+	cloneCalled   bool
+	runCalled     bool
+	sshCalled     bool
+	stopCalled    bool
+	deleteCalled  bool
+	lastVMName    string
+	lastImage     string
+	lastCommand   string
 }
 
 func (f *fakeTartRunner) Version(_ context.Context) (string, error) {

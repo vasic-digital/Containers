@@ -1473,6 +1473,7 @@ func TestCmdLogReader_ReadAndClose(t *testing.T) {
 	require.NoError(t, err)
 	_ = waitCalled // mockCmd.Wait() was called implicitly
 }
+
 // testLogger is a simple test logger for orchestrator tests.
 type testLogger struct{}
 

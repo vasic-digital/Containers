@@ -28,12 +28,44 @@ package ios
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
+
+// ErrUnsafeArg (VM3-8, SECURITY argv flag-injection) is returned when a
+// caller-supplied identifier or path that this package hands to `xcrun simctl`
+// as a POSITIONAL argument begins with '-'. simctl (like every getopt-style
+// CLI) parses a leading-'-' token as an OPTION/FLAG rather than a value, so a
+// crafted or typo'd UDID / .app path / bundle id / output path beginning with
+// '-' is an argv flag-injection vector (e.g. a "--foo" reaching `simctl io
+// <udid> screenshot <outPath>` selects an option instead of naming the file).
+// A legitimate CoreSimulator UDID (a UUID), reverse-DNS bundle id, or absolute
+// filesystem path never begins with '-'; a caller needing a relative path may
+// prefix "./". This is the exact parallel of the sibling pkg/applesim SIM2-1
+// checkArgs/ErrUnsafeArg guard for the un-fixed simctl wrapper in this package;
+// simctl's positional grammar is not documented to honour an end-of-options
+// "--" terminator, so the guard refuses the value rather than GUESS that "--"
+// would neutralise it (§11.4.6).
+var ErrUnsafeArg = errors.New("ios: argument begins with '-' (would be parsed as an xcrun/simctl flag; refusing to inject)")
+
+// checkSimctlArgs (VM3-8) rejects — BEFORE any process is spawned — any
+// caller-supplied positional argument that begins with '-'. An empty string is
+// permitted: `simctl <cmd> ""` yields a clear "invalid device/path" from simctl
+// itself (not an injection), so the guard stays narrow to the actual
+// flag-injection shape and never over-rejects a legitimate value.
+func checkSimctlArgs(args ...string) error {
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			return fmt.Errorf("%w: %q", ErrUnsafeArg, a)
+		}
+	}
+	return nil
+}
 
 // xcodeRunner is the seam through which IOSBuilder invokes Xcode CLT.
 // Production uses osExecXcodeRunner; tests inject a fake.
@@ -304,6 +336,9 @@ func (b *IOSBuilder) BuildIPA(ctx context.Context, req BuildIPARequest) BuildIPA
 // The simulator may take 30–120 s to reach the "Booted" state; callers
 // should poll ListSimulators for the state change.
 func (b *IOSBuilder) BootSimulator(ctx context.Context, udid string, timeout time.Duration) error {
+	if err := checkSimctlArgs(udid); err != nil {
+		return err
+	}
 	if runtime.GOOS != "darwin" {
 		return ErrXcodeNotAvailable
 	}
@@ -326,6 +361,9 @@ func (b *IOSBuilder) BootSimulator(ctx context.Context, udid string, timeout tim
 // ShutdownSimulator shuts down the iOS simulator identified by udid.
 // Returns ErrXcodeNotAvailable on non-macOS hosts or if xcrun is absent.
 func (b *IOSBuilder) ShutdownSimulator(ctx context.Context, udid string, timeout time.Duration) error {
+	if err := checkSimctlArgs(udid); err != nil {
+		return err
+	}
 	if runtime.GOOS != "darwin" {
 		return ErrXcodeNotAvailable
 	}
@@ -346,6 +384,9 @@ func (b *IOSBuilder) ShutdownSimulator(ctx context.Context, udid string, timeout
 // appPath is the path to the .app bundle (simulator build, not .ipa).
 // Returns ErrXcodeNotAvailable on non-macOS hosts or if xcrun is absent.
 func (b *IOSBuilder) InstallApp(ctx context.Context, udid, appPath string, timeout time.Duration) error {
+	if err := checkSimctlArgs(udid, appPath); err != nil {
+		return err
+	}
 	if runtime.GOOS != "darwin" {
 		return ErrXcodeNotAvailable
 	}
@@ -365,6 +406,9 @@ func (b *IOSBuilder) InstallApp(ctx context.Context, udid, appPath string, timeo
 // LaunchApp launches the app identified by bundleID on the simulator udid.
 // Returns ErrXcodeNotAvailable on non-macOS hosts or if xcrun is absent.
 func (b *IOSBuilder) LaunchApp(ctx context.Context, udid, bundleID string, timeout time.Duration) error {
+	if err := checkSimctlArgs(udid, bundleID); err != nil {
+		return err
+	}
 	if runtime.GOOS != "darwin" {
 		return ErrXcodeNotAvailable
 	}
@@ -385,6 +429,9 @@ func (b *IOSBuilder) LaunchApp(ctx context.Context, udid, bundleID string, timeo
 // outputPath must end in .png, .jpg, or .tiff.
 // Returns ErrXcodeNotAvailable on non-macOS hosts or if xcrun is absent.
 func (b *IOSBuilder) Screenshot(ctx context.Context, udid, outputPath string, timeout time.Duration) error {
+	if err := checkSimctlArgs(udid, outputPath); err != nil {
+		return err
+	}
 	if runtime.GOOS != "darwin" {
 		return ErrXcodeNotAvailable
 	}
@@ -408,6 +455,9 @@ func (b *IOSBuilder) Screenshot(ctx context.Context, udid, outputPath string, ti
 //
 // Returns ErrXcodeNotAvailable on non-macOS hosts or if xcrun is absent.
 func (b *IOSBuilder) Recording(ctx context.Context, udid, outputPath string, timeout time.Duration) error {
+	if err := checkSimctlArgs(udid, outputPath); err != nil {
+		return err
+	}
 	if runtime.GOOS != "darwin" {
 		return ErrXcodeNotAvailable
 	}

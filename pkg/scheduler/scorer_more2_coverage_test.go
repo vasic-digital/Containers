@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -331,10 +332,11 @@ func TestScheduleBinPack_WithRemoteHost(t *testing.T) {
 	assert.NotEmpty(t, decision.HostName)
 }
 
-// TestScheduleRoundRobin_NoEligibleHosts exercises the case where no hosts
-// match the required labels in scheduleRoundRobin.
-// Note: allNames always includes localName, so it's never empty in current
-// code. This test just confirms normal behavior with a label-filtered host.
+// TestScheduleRoundRobin_LabelFiltering confirms label filtering in
+// scheduleRoundRobin: the gpu-labelled host matches the required label and is
+// selected, while the unlabelled local host is correctly EXCLUDED from a
+// labelled request (the local host carries no labels, so it satisfies only
+// label-free requests). gpu-host is therefore the sole candidate.
 func TestScheduleRoundRobin_LabelFiltering(t *testing.T) {
 	hosts := []remote.RemoteHost{
 		{Name: "gpu-host", Labels: map[string]string{"gpu": "true"}},
@@ -343,9 +345,9 @@ func TestScheduleRoundRobin_LabelFiltering(t *testing.T) {
 		Name:   "needs-gpu",
 		Labels: map[string]string{"gpu": "true"},
 	}
-	decision := scheduleRoundRobin(hosts, req, "local")
-	// gpu-host matches the label, so it should be in allNames
-	assert.NotEmpty(t, decision.HostName)
+	var counter atomic.Uint64
+	decision := scheduleRoundRobin(hosts, req, "local", &counter)
+	assert.Equal(t, "gpu-host", decision.HostName)
 }
 
 // TestScheduleSpread_SingleHost exercises scheduleSpread with only local.
@@ -412,8 +414,10 @@ func TestScheduleResourceAware_LabelMismatch(t *testing.T) {
 		Labels: map[string]string{"type": "gpu"}, // mismatch
 	}
 	decision := scheduleResourceAware(scorer, snapshots, hosts, req, "local")
-	// gpu-host skipped (label mismatch), local chosen.
-	assert.Equal(t, "local", decision.HostName)
+	// gpu-host skipped (label mismatch); local ALSO excluded — it carries no
+	// labels, so it cannot satisfy the required type=gpu label either. No host
+	// qualifies for a labelled request that nothing matches.
+	assert.Empty(t, decision.HostName)
 }
 
 // TestScheduleResourceAware_CannotFitRemote exercises the CanFit false
@@ -455,8 +459,9 @@ func TestScheduleBinPack_LabelMismatch(t *testing.T) {
 		Labels: map[string]string{"zone": "us"}, // mismatch
 	}
 	decision := scheduleBinPack(scorer, snapshots, hosts, req, "local")
-	// remote skipped (label mismatch), local chosen.
-	assert.Equal(t, "local", decision.HostName)
+	// remote skipped (label mismatch); local ALSO excluded — it carries no
+	// labels, so it cannot satisfy the required zone=us label. No host fits.
+	assert.Empty(t, decision.HostName)
 }
 
 // TestScheduleBinPack_NoSnapshot exercises the no-snapshot branch for
