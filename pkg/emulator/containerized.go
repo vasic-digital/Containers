@@ -691,6 +691,18 @@ func (c *Containerized) authorizeADB(ctx context.Context) error {
 }
 
 // Install installs the APK onto the emulator via host adb.
+// RunADBCommand runs `adb -s localhost:<port> <args...>` against the
+// running containerized emulator and returns its combined output.
+func (c *Containerized) RunADBCommand(
+	ctx context.Context,
+	port int,
+	args ...string,
+) ([]byte, error) {
+	target := fmt.Sprintf("localhost:%d", port)
+	fullArgs := append([]string{"-s", target}, args...)
+	return c.executor.Execute(ctx, c.adbBinaryPath, fullArgs...)
+}
+
 func (c *Containerized) Install(
 	ctx context.Context,
 	port int,

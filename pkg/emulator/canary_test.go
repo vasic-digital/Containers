@@ -59,7 +59,7 @@ func TestObserveActivityAndLogcat_ResumedAndClean(t *testing.T) {
 	resumed, fatal, logcatOut := observeActivityAndLogcat(
 		context.Background(),
 		emu,
-		"localhost:5555", adbPath,
+		5555,
 		"digital.vasic.lava.client",
 		5*time.Second, 1*time.Second,
 	)
@@ -87,7 +87,7 @@ func TestObserveActivityAndLogcat_FatalDetected(t *testing.T) {
 	resumed, fatal, _ := observeActivityAndLogcat(
 		context.Background(),
 		emu,
-		"localhost:5555", adbPath,
+		5555,
 		"digital.vasic.lava.client",
 		5*time.Second, 1*time.Second,
 	)
@@ -118,7 +118,7 @@ func TestObserveActivityAndLogcat_NeverResumed(t *testing.T) {
 	resumed, fatal, _ := observeActivityAndLogcat(
 		context.Background(),
 		emu,
-		"localhost:5555", adbPath,
+		5555,
 		"digital.vasic.lava.client",
 		100*time.Millisecond, 50*time.Millisecond,
 	)

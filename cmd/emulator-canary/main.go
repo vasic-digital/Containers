@@ -20,6 +20,18 @@
 //
 // AVD format: Name[:APILevel[:FormFactor]] — identical to emulator-matrix.
 //
+// §6.X runner selection (added alongside the RunADBCommand interface
+// extension): --runner=auto|host-direct|containerized, identical
+// semantics to emulator-matrix. "auto" resolves the OS-correct runner
+// via emulator.ResolveRunner — Linux -> containerized (this is the
+// gate-eligible choice on Linux; host-direct-only was the pre-existing
+// gap this flag closes, since a release-signed APK cannot be
+// instrumented and the canary was previously the ONLY §6.Z verification
+// path for release builds, yet it always ran host-direct, which
+// violates the consuming project's own §6.AH container/VM-only policy
+// on Linux). macOS/Windows -> host-direct (their accelerators are
+// host-only APIs a Linux container cannot reach; see accel.go).
+//
 // Exit codes:
 //
 //	0 — activity reached RESUMED state AND no FATAL in logcat (canary PASS)
@@ -37,6 +49,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -81,6 +94,12 @@ func main() {
 		"Duration of logcat to observe after activity launch")
 	flagJSON := flag.Bool("json", false,
 		"Print the CanaryResult JSON to stdout on completion (in addition to the attestation file)")
+	flagRunner := flag.String("runner", "auto",
+		"Emulator runner: auto|host-direct|containerized. 'auto' picks the OS-correct runner (Linux->containerized, macOS/Windows->host-direct). §6.X/§6.AH gate runs require containerized on Linux.")
+	flagContainerImage := flag.String("container-image", "",
+		"Container image for the Android emulator. Required when the resolved runner is containerized.")
+	flagContainerRuntime := flag.String("container-runtime", "podman",
+		"Container runtime CLI: podman|docker. Used when the resolved runner is containerized.")
 
 	flag.Parse()
 
@@ -107,6 +126,46 @@ func main() {
 
 	avd := parseAVDSpec(*flagAVD)
 
+	// §6.X runner selection — identical semantics to emulator-matrix.
+	resolvedRunner, rerr := emulator.ResolveRunner(*flagRunner, runtime.GOOS)
+	if rerr != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", rerr)
+		os.Exit(2)
+	}
+	if *flagRunner == "auto" {
+		profile := emulator.AccelProfileForOS(runtime.GOOS)
+		fmt.Printf("[§6.X] runner=auto resolved to %s (accel=%s, goos=%s)\n",
+			resolvedRunner, profile.Accel, runtime.GOOS)
+	}
+	if resolvedRunner == emulator.RunnerContainerized && *flagContainerImage == "" {
+		fmt.Fprintln(os.Stderr, "ERROR: --container-image is required when the resolved runner is containerized")
+		os.Exit(2)
+	}
+
+	var emu emulator.Emulator
+	if resolvedRunner == emulator.RunnerContainerized {
+		c, cerr := emulator.NewContainerized(emulator.ContainerizedConfig{
+			RuntimeBinary: *flagContainerRuntime,
+			Image:         *flagContainerImage,
+		})
+		if cerr != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: NewContainerized: %v\n", cerr)
+			os.Exit(2)
+		}
+		emu = c
+		fmt.Printf("[§6.X] runner=containerized image=%s runtime=%s\n",
+			*flagContainerImage, *flagContainerRuntime)
+	} else {
+		emu = emulator.NewAndroidEmulator(*flagSDK)
+		if emulator.GateEligibleForOS(resolvedRunner, runtime.GOOS) {
+			profile := emulator.AccelProfileForOS(runtime.GOOS)
+			fmt.Printf("[§6.X] runner=host-direct is the OS-correct accelerated gate runner for %s (accel=%s)\n",
+				runtime.GOOS, profile.Accel)
+		} else {
+			fmt.Println("[§6.X] runner=host-direct (workstation iteration mode; not gate-eligible on this OS — gate runs require containerized)")
+		}
+	}
+
 	cfg := emulator.CanaryConfig{
 		AndroidSdkRoot:  *flagSDK,
 		APKPath:         *flagAPK,
@@ -118,6 +177,7 @@ func main() {
 		BootTimeout:     *flagBootTimeout,
 		ActivityTimeout: *flagActivityTimeout,
 		LogcatWindow:    *flagLogcatWindow,
+		Emu:             emu,
 	}
 
 	ctx := context.Background()

@@ -339,6 +339,16 @@ type Emulator interface {
 
 	// Teardown stops the emulator and frees its resources.
 	Teardown(ctx context.Context, port int) error
+
+	// RunADBCommand runs `adb -s localhost:<port> <args...>` against
+	// the booted instance and returns its combined output. This is
+	// the generic primitive that runner-agnostic verification flows
+	// (e.g. RunCanary in canary.go, which needs `am start` / `dumpsys`
+	// / `logcat` and cannot use RunInstrumentation because a
+	// release-signed APK cannot be instrumented) build on, so they
+	// work uniformly across every Emulator implementation without
+	// needing runner-specific knowledge of the adb target format.
+	RunADBCommand(ctx context.Context, port int, args ...string) ([]byte, error)
 }
 
 // MatrixRunner orchestrates a sequence of (AVD, test) pairs against an

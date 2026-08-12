@@ -47,6 +47,9 @@ go-mutesting-report.html
 # Built CLI from cmd/emulator-matrix/ — Go binary, never committed (CONST-053)
 /cmd/emulator-matrix/emulator-matrix
 
+# Built CLI from cmd/emulator-canary/ — Go binary, never committed (CONST-053)
+/cmd/emulator-canary/emulator-canary
+
 # CONST-053 round-299 sweep — explicit forbidden classes:
 # Build artefacts
 /bin/

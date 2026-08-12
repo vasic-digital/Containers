@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -100,6 +101,10 @@ func (f *fakeEmulator) RunInstrumentation(
 		err = f.runErrors[idx]
 	}
 	return out, passed, err
+}
+
+func (f *fakeEmulator) RunADBCommand(_ context.Context, _ int, _ ...string) ([]byte, error) {
+	return nil, nil
 }
 
 func (f *fakeEmulator) Teardown(_ context.Context, _ int) error {
@@ -617,6 +622,9 @@ func (s *stubEmulator) Install(_ context.Context, _ int, _ string) error { retur
 func (s *stubEmulator) RunInstrumentation(_ context.Context, _ int, _ string, _ time.Duration) (string, bool, error) {
 	return "BUILD SUCCESSFUL", true, nil
 }
+func (s *stubEmulator) RunADBCommand(_ context.Context, _ int, _ ...string) ([]byte, error) {
+	return nil, nil
+}
 func (s *stubEmulator) Teardown(_ context.Context, _ int) error { return nil }
 
 func runMatrixWithStub(t *testing.T, concurrent int, dev bool) MatrixResult {
@@ -872,6 +880,11 @@ func (s *adbStubEmulator) RunInstrumentation(_ context.Context, _ int, _ string,
 		out = "BUILD SUCCESSFUL"
 	}
 	return out, s.passed, s.runErr
+}
+func (s *adbStubEmulator) RunADBCommand(ctx context.Context, port int, args ...string) ([]byte, error) {
+	target := fmt.Sprintf("localhost:%d", port)
+	fullArgs := append([]string{"-s", target}, args...)
+	return s.exec.Execute(ctx, s.adbBin, fullArgs...)
 }
 func (s *adbStubEmulator) Teardown(_ context.Context, _ int) error { return nil }
 

@@ -977,6 +977,18 @@ func (a *AndroidEmulator) WaitForBoot(
 		fmt.Errorf("boot not completed within %s", timeout)
 }
 
+// RunADBCommand runs `adb -s localhost:<port> <args...>` against the
+// running emulator and returns its combined output.
+func (a *AndroidEmulator) RunADBCommand(
+	ctx context.Context,
+	port int,
+	args ...string,
+) ([]byte, error) {
+	target := fmt.Sprintf("localhost:%d", port)
+	fullArgs := append([]string{"-s", target}, args...)
+	return a.executor.Execute(ctx, a.adbBinary(), fullArgs...)
+}
+
 // Install installs the APK on the running emulator via `adb -s
 // localhost:<port> install -r <apkPath>`.
 func (a *AndroidEmulator) Install(

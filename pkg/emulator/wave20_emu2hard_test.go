@@ -179,6 +179,10 @@ func (e *emu2FakeEmulator) RunInstrumentation(_ context.Context, _ int, _ string
 	return "BUILD SUCCESSFUL", true, nil
 }
 
+func (e *emu2FakeEmulator) RunADBCommand(_ context.Context, _ int, _ ...string) ([]byte, error) {
+	return nil, nil
+}
+
 func (e *emu2FakeEmulator) Teardown(_ context.Context, _ int) error {
 	// Mirror Containerized.Teardown acting on c.containerName (NOT the port
 	// arg, which Containerized discards): record the name it would `rm -f`.

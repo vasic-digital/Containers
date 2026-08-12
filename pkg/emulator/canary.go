@@ -69,6 +69,16 @@ type CanaryConfig struct {
 	// ColdBoot enforces no-snapshot-reload (clause 6.I clause 6) when
 	// true. Gate-mode canary runs MUST use true.
 	ColdBoot bool
+
+	// Emu selects which Emulator implementation runs the canary. When
+	// nil (the default, preserving pre-§6.X-canary-extension behavior),
+	// RunCanary constructs a host-direct NewAndroidEmulator(AndroidSdkRoot).
+	// Callers that need §6.X/§6.AH compliance on Linux (this project's
+	// own containerized-only gate policy) pass an already-constructed
+	// Containerized instance instead — RunCanary itself is runner-agnostic
+	// once given an Emulator, since it only calls the Emulator interface's
+	// Boot/WaitForBoot/Install/RunADBCommand/Teardown methods.
+	Emu Emulator
 }
 
 // CanaryResult captures the outcome of a single RunCanary invocation.
@@ -165,7 +175,12 @@ func RunCanary(ctx context.Context, cfg CanaryConfig) (CanaryResult, error) {
 	// interrupted previous run left it, the emulator refuses to boot.
 	clearAVDLock(cfg.AVD.Name)
 
-	emu := NewAndroidEmulator(cfg.AndroidSdkRoot)
+	var emu Emulator
+	if cfg.Emu != nil {
+		emu = cfg.Emu
+	} else {
+		emu = NewAndroidEmulator(cfg.AndroidSdkRoot)
+	}
 
 	bootResult, err := emu.Boot(ctx, cfg.AVD, cfg.ColdBoot)
 	result.BootDuration = bootResult.BootDuration
@@ -191,11 +206,9 @@ func RunCanary(ctx context.Context, cfg CanaryConfig) (CanaryResult, error) {
 	}
 
 	// Launch the activity.
-	adb := emu.adbBinary()
-	target := fmt.Sprintf("localhost:%d", bootResult.ADBPort)
 	componentSpec := cfg.PackageName + "/" + cfg.LaunchActivity
-	launchOut, launchErr := emu.executor.Execute(
-		ctx, adb, "-s", target,
+	launchOut, launchErr := emu.RunADBCommand(
+		ctx, bootResult.ADBPort,
 		"shell", "am", "start", "-n", componentSpec,
 	)
 	if launchErr != nil {
@@ -209,7 +222,7 @@ func RunCanary(ctx context.Context, cfg CanaryConfig) (CanaryResult, error) {
 	// when the package appears in mResumedActivity the activity is
 	// on-screen and interactive.
 	resumed, fatalDetected, logcatOutput := observeActivityAndLogcat(
-		ctx, emu, target, adb, cfg.PackageName, activityTimeout, logcatWindow,
+		ctx, emu, bootResult.ADBPort, cfg.PackageName, activityTimeout, logcatWindow,
 	)
 	result.ActivityResumed = resumed
 	result.FatalDetected = fatalDetected
@@ -244,8 +257,9 @@ func RunCanary(ctx context.Context, cfg CanaryConfig) (CanaryResult, error) {
 // + logcat; the function does NOT short-circuit on install success.
 func observeActivityAndLogcat(
 	ctx context.Context,
-	emu *AndroidEmulator,
-	target, adb, packageName string,
+	emu Emulator,
+	port int,
+	packageName string,
 	activityTimeout, logcatWindow time.Duration,
 ) (resumed, fatalDetected bool, logcatOutput string) {
 	deadline := time.Now().Add(activityTimeout)
@@ -266,8 +280,8 @@ func observeActivityAndLogcat(
 	// First: poll dumpsys activity until the package appears as resumed
 	// or the timeout fires.
 	for time.Now().Before(deadline) {
-		dumpsysOut, err := emu.executor.Execute(
-			cctx, adb, "-s", target,
+		dumpsysOut, err := emu.RunADBCommand(
+			cctx, port,
 			"shell", "dumpsys", "activity", "activities",
 		)
 		if err == nil {
@@ -299,8 +313,8 @@ func observeActivityAndLogcat(
 	// FATAL or AndroidRuntime entries.
 	logcatCtx, cancel := context.WithTimeout(ctx, logcatWindow)
 	defer cancel()
-	logOut, _ := emu.executor.Execute(
-		logcatCtx, adb, "-s", target,
+	logOut, _ := emu.RunADBCommand(
+		logcatCtx, port,
 		"logcat", "-d", "-v", "threadtime",
 		"AndroidRuntime:E", "*:F",
 	)
