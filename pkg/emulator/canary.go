@@ -211,6 +211,11 @@ func RunCanary(ctx context.Context, cfg CanaryConfig) (CanaryResult, error) {
 		ctx, bootResult.ADBPort,
 		"shell", "am", "start", "-n", componentSpec,
 	)
+	// §6.AC: always surface the raw am-start output, not just on error.
+	// `am start` can exit 0 while still reporting a soft failure in its
+	// own stdout text (e.g. "Error type 3", "does not exist"), which a
+	// bare exit-code check would miss.
+	fmt.Fprintf(os.Stderr, "[canary] am start output: %s\n", strings.TrimSpace(string(launchOut)))
 	if launchErr != nil {
 		result.Error = fmt.Sprintf("am start: %v (output: %s)", launchErr, launchOut)
 		result.FinishedAt = time.Now()
@@ -226,6 +231,22 @@ func RunCanary(ctx context.Context, cfg CanaryConfig) (CanaryResult, error) {
 	)
 	result.ActivityResumed = resumed
 	result.FatalDetected = fatalDetected
+
+	// Diagnostic-only, on failure: capture an UNFILTERED logcat tail +
+	// the raw dumpsys activity output, written alongside the standard
+	// evidence. Best-effort — a failure to write these must not affect
+	// the canary's own pass/fail verdict, which is already decided
+	// above from the filtered/primary signals.
+	if !resumed {
+		diagCtx, diagCancel := context.WithTimeout(ctx, 5*time.Second)
+		if rawLogOut, rawErr := emu.RunADBCommand(diagCtx, bootResult.ADBPort, "logcat", "-d", "-t", "300"); rawErr == nil {
+			_ = os.WriteFile(filepath.Join(cfg.EvidenceDir, "logcat-unfiltered-on-failure.txt"), rawLogOut, 0o644)
+		}
+		if rawDumpsys, rawErr := emu.RunADBCommand(diagCtx, bootResult.ADBPort, "shell", "dumpsys", "activity", "activities"); rawErr == nil {
+			_ = os.WriteFile(filepath.Join(cfg.EvidenceDir, "dumpsys-activities-on-failure.txt"), rawDumpsys, 0o644)
+		}
+		diagCancel()
+	}
 	result.Passed = resumed && !fatalDetected
 
 	// Persist logcat output.
@@ -284,9 +305,30 @@ func observeActivityAndLogcat(
 			cctx, port,
 			"shell", "dumpsys", "activity", "activities",
 		)
-		if err == nil {
+		if err != nil {
+			// §6.AC: do not silently swallow — a failing dumpsys exec
+			// (e.g. a dropped adb connection to the forwarded port) is
+			// indistinguishable from "activity never resumed" unless
+			// surfaced, and the two have very different remediations.
+			fmt.Fprintf(os.Stderr, "[canary] dumpsys exec error (will retry until activityTimeout): %v\n", err)
+		} else {
+			// The dumpsys field name for the resumed activity changed
+			// across Android versions: older releases print
+			// "mResumedActivity:", API 34 (confirmed live against a
+			// real device: digital.vasic.lava.client 1.3.15-1082,
+			// 2026-08-12) prints "topResumedActivity=" and a separate
+			// "ResumedActivity:" summary line, neither of which contain
+			// the old "mResumedActivity" substring. Match all three
+			// known field-name spellings so the canary works across the
+			// API-level range this project's own §6.AE.2 matrix covers
+			// (28/30/34/latest) instead of silently only working on
+			// whichever Android version the string was originally
+			// written against.
 			for _, line := range strings.Split(string(dumpsysOut), "\n") {
-				if strings.Contains(line, "mResumedActivity") && strings.Contains(line, packageName) {
+				hasResumedField := strings.Contains(line, "mResumedActivity") ||
+					strings.Contains(line, "topResumedActivity=") ||
+					strings.Contains(line, "ResumedActivity:")
+				if hasResumedField && strings.Contains(line, packageName) {
 					resumed = true
 					break
 				}
@@ -313,11 +355,18 @@ func observeActivityAndLogcat(
 	// FATAL or AndroidRuntime entries.
 	logcatCtx, cancel := context.WithTimeout(ctx, logcatWindow)
 	defer cancel()
-	logOut, _ := emu.RunADBCommand(
+	logOut, logErr := emu.RunADBCommand(
 		logcatCtx, port,
 		"logcat", "-d", "-v", "threadtime",
 		"AndroidRuntime:E", "*:F",
 	)
+	if logErr != nil {
+		// §6.AC: surface, don't swallow — an empty logcat capture is
+		// ambiguous between "genuinely nothing logged" and "the adb
+		// exec itself failed", and only one of those is a real signal
+		// about the app under test.
+		fmt.Fprintf(os.Stderr, "[canary] logcat exec error: %v\n", logErr)
+	}
 	logcatOutput = string(logOut)
 
 	// Detect crash markers in the captured logcat.

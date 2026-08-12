@@ -128,6 +128,54 @@ func TestObserveActivityAndLogcat_NeverResumed(t *testing.T) {
 	assert.False(t, passed, "canary MUST fail when activity never resumes")
 }
 
+// TestObserveActivityAndLogcat_API34FieldNameFormat is a regression test
+// for a real bug found live on 2026-08-12: a fresh release-build canary
+// run against digital.vasic.lava.client 1.3.15-1082 on a real API 34
+// (Android 14) emulator reported resumed=false — but the SAME run's
+// captured dumpsys output showed `state=RESUMED` and
+// `topResumedActivity=digital.vasic.lava.client/.MainActivity`, proving
+// the app launched correctly and the CANARY's string match was wrong,
+// not the app. Root cause: API 34's dumpsys uses "topResumedActivity="
+// and a separate "ResumedActivity:" summary line; the old
+// "mResumedActivity" substring this function checked for does not
+// appear in either. This fixture is the exact dumpsys shape observed
+// live (trimmed to the load-bearing lines), so this test would have
+// caught the bug before it shipped.
+func TestObserveActivityAndLogcat_API34FieldNameFormat(t *testing.T) {
+	adbPath := "/sdk/platform-tools/adb"
+	// Trimmed from the real captured
+	// dumpsys-activities-on-failure.txt for
+	// digital.vasic.lava.client/.MainActivity on API 34.
+	api34DumpsysOutput := `  * Task{a780907 #8 type=standard A=10192:digital.vasic.lava.client:1387675798 U=0 visible=true visibleRequested=true mode=fullscreen translucent=false sz=1}
+    topResumedActivity=ActivityRecord{62ba346 u0 digital.vasic.lava.client/.MainActivity t8}
+    * Hist  #0: ActivityRecord{62ba346 u0 digital.vasic.lava.client/.MainActivity t8}
+      state=RESUMED delayedResume=false finishing=false
+  Resumed activities in task display areas (from top to bottom):
+    Resumed: ActivityRecord{62ba346 u0 digital.vasic.lava.client/.MainActivity t8}
+  ResumedActivity: ActivityRecord{62ba346 u0 digital.vasic.lava.client/.MainActivity t8}
+`
+	exec := &fakeExecutor{
+		scripts: map[string]fakeScript{
+			adbPath + " -s localhost:5555 shell dumpsys activity activities": {
+				Out: []byte(api34DumpsysOutput),
+			},
+			adbPath + " -s localhost:5555 logcat -d -v threadtime AndroidRuntime:E *:F": {
+				Out: []byte(""),
+			},
+		},
+	}
+	emu := &AndroidEmulator{executor: exec, androidSdkRoot: "/sdk"}
+	resumed, fatal, _ := observeActivityAndLogcat(
+		context.Background(),
+		emu,
+		5555,
+		"digital.vasic.lava.client",
+		5*time.Second, 1*time.Second,
+	)
+	assert.True(t, resumed, "API 34's topResumedActivity=/ResumedActivity: field names must be recognized, not just the old mResumedActivity")
+	assert.False(t, fatal)
+}
+
 // --- clearAVDLock tests ---
 
 // TestClearAVDLock_RemovesLockFile verifies that clearAVDLock removes
