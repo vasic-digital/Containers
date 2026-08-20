@@ -46,6 +46,25 @@ import (
 	"digital.vasic.containers/pkg/emulator"
 )
 
+// stringSliceFlag implements flag.Value so --extra-apk can be passed
+// multiple times on one invocation (`--extra-apk a.apk --extra-apk
+// b.apk`), each occurrence appending to the slice in the order given.
+// The standard library's flag package has no built-in repeatable-flag
+// type; this is the smallest correct implementation of one.
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string {
+	if s == nil {
+		return ""
+	}
+	return strings.Join(*s, ",")
+}
+
+func (s *stringSliceFlag) Set(value string) error {
+	*s = append(*s, value)
+	return nil
+}
+
 func parseAVDs(spec string) ([]emulator.AVD, error) {
 	if spec == "" {
 		return nil, fmt.Errorf("--avds MUST be a non-empty comma-separated list")
@@ -81,6 +100,12 @@ func main() {
 	flagSdkRoot := flag.String("android-sdk-root", os.Getenv("ANDROID_SDK_ROOT"),
 		"Host path to the Android SDK (default $ANDROID_SDK_ROOT)")
 	flagAPK := flag.String("apk", "", "Host path to the debug APK to install")
+	var flagExtraAPKs stringSliceFlag
+	flag.Var(&flagExtraAPKs, "extra-apk",
+		"Host path to an additional APK to install on each AVD after --apk, "+
+			"before instrumentation runs. Repeatable: pass --extra-apk more than "+
+			"once to install multiple companion APKs, in the order given. Empty "+
+			"(the default) preserves single-APK behavior unchanged.")
 	flagTestClass := flag.String("test-class", "",
 		"Fully-qualified instrumentation test class")
 	flagGradleModule := flag.String("gradle-module", "app",
@@ -262,6 +287,7 @@ func main() {
 		AVDs:              avds,
 		AndroidSdkRoot:    *flagSdkRoot,
 		APKPath:           *flagAPK,
+		ExtraAPKPaths:     []string(flagExtraAPKs),
 		TestClass:         *flagTestClass,
 		GradleModule:      *flagGradleModule,
 		EvidenceDir:       *flagEvidence,

@@ -159,6 +159,19 @@ type MatrixConfig struct {
 	// APKPath is the host path to the debug APK to install on each AVD.
 	APKPath string
 
+	// ExtraAPKPaths are additional host paths to APKs installed on each
+	// AVD AFTER APKPath, in order, before instrumentation runs. Empty
+	// (nil or zero-length) is the default and preserves all pre-existing
+	// single-APK behavior byte-for-byte — no consumer that doesn't set
+	// this field observes any change. This exists for Challenges that
+	// require a second, sibling app already installed on the SAME device
+	// (e.g. a same-device mDNS discovery test that needs a companion
+	// on-device API app running alongside the app under test) — a case
+	// the single-APKPath field cannot express. A failure installing any
+	// entry fails the row exactly like an APKPath install failure does
+	// (clause 6.J — no silent partial-install false-green).
+	ExtraAPKPaths []string
+
 	// TestClass is the fully-qualified instrumentation test class to
 	// run. Empty means "run the default suite" (the project's
 	// connectedAndroidTest task discovers tests).

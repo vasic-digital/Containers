@@ -276,6 +276,25 @@ func (r *AndroidMatrixRunner) runOne(
 		}
 	}
 
+	// Install any extra APKs (e.g. a companion on-device app a same-
+	// device Challenge needs installed alongside the app under test)
+	// AFTER the primary APK, in the order given. A failure here fails
+	// the row exactly like a primary-install failure — no silent
+	// partial-install false-green (clause 6.J).
+	for i, extraPath := range config.ExtraAPKPaths {
+		if err := em.Install(ctx, boot.ADBPort, extraPath); err != nil {
+			_ = em.Teardown(ctx, boot.ADBPort)
+			return boot, TestResult{
+				AVD:        avd,
+				TestClass:  config.TestClass,
+				Started:    time.Now(),
+				Passed:     false,
+				Error:      fmt.Errorf("extra apk install failed (index %d, path %s): %w", i, extraPath, err),
+				Concurrent: maxInt(config.Concurrent, 1),
+			}
+		}
+	}
+
 	// Phase 6 (Group C remaining): apply network conditions if either a
 	// profile name OR a non-zero override is configured. Failures are
 	// logged to stderr and DO NOT flip the row — network shaping is a

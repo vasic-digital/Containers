@@ -39,6 +39,12 @@ type fakeEmulator struct {
 	installCount   int
 	runCount       int
 	teardownCount  int
+	// installedPaths records the apkPath argument of every Install call,
+	// in call order — lets a test assert WHICH paths were installed and
+	// in what order, not just how many times Install fired (a call-
+	// counting-only assertion would be a bluff per the Sixth Law clause
+	// 3 / Seventh Law clause 4).
+	installedPaths []string
 }
 
 func (f *fakeEmulator) Boot(_ context.Context, avd AVD, _ bool) (BootResult, error) {
@@ -74,9 +80,10 @@ func (f *fakeEmulator) WaitForBoot(_ context.Context, _ int, _ time.Duration) (t
 	return 100 * time.Millisecond, nil
 }
 
-func (f *fakeEmulator) Install(_ context.Context, _ int, _ string) error {
+func (f *fakeEmulator) Install(_ context.Context, _ int, apkPath string) error {
 	idx := f.installCount
 	f.installCount++
+	f.installedPaths = append(f.installedPaths, apkPath)
 	if idx < len(f.installErrors) {
 		return f.installErrors[idx]
 	}
@@ -234,6 +241,127 @@ func TestAndroidMatrixRunner_AllAVDsPass_ReportsAllPassed(t *testing.T) {
 		assert.Equal(t, "BUILD SUCCESSFUL", string(content),
 			"gradle.log for %s must contain the captured runOutputs[i]", avd.Name)
 	}
+}
+
+// TestRunMatrix_ExtraAPKPaths_InstallsEachAfterPrimary is the load-
+// bearing proof for the ExtraAPKPaths field (added for Challenges that
+// need a second, companion APK — e.g. an on-device API app — already
+// installed on the SAME emulator alongside the app under test, which
+// the single-APKPath field could not express). Asserts on the actual
+// installedPaths recorded by the fake, in order — a plain
+// installCount-only assertion would be a bluff per §6.J/Seventh Law
+// clause 4 (it would pass even if the WRONG paths were installed, or
+// installed out of order).
+//
+// Falsifiability rehearsal (Sixth Law clause 2): comment out the
+// `for _, extraPath := range config.ExtraAPKPaths` loop body in
+// matrix.go's runOne (i.e. never install the extras) → this test fails
+// with "expected 3 installed paths (primary + 2 extras), got 1" because
+// fake.installedPaths only records the primary APKPath call. Reverted
+// after confirming the failure; test passes again with the loop
+// restored.
+func TestRunMatrix_ExtraAPKPaths_InstallsEachAfterPrimary(t *testing.T) {
+	fake := &fakeEmulator{
+		runPassed:  []bool{true},
+		runOutputs: []string{"BUILD SUCCESSFUL"},
+	}
+	runner := NewAndroidMatrixRunner(fake)
+	primaryAPK := writeFakeAPK(t)
+	extraAPK1 := writeFakeAPK(t)
+	extraAPK2 := writeFakeAPK(t)
+
+	result, err := runner.RunMatrix(context.Background(), MatrixConfig{
+		AVDs:          []AVD{{Name: "API34", APILevel: 34, FormFactor: "phone"}},
+		APKPath:       primaryAPK,
+		ExtraAPKPaths: []string{extraAPK1, extraAPK2},
+		TestClass:     "lava.app.challenges.Challenge72SameDeviceMdnsDiscoveryTest",
+		EvidenceDir:   t.TempDir(),
+		ColdBoot:      true,
+	})
+	require.NoError(t, err)
+	assert.True(t, result.AllPassed())
+
+	require.Len(t, fake.installedPaths, 3,
+		"expected 3 installed paths (primary + 2 extras), got %d: %v",
+		len(fake.installedPaths), fake.installedPaths)
+	assert.Equal(t, []string{primaryAPK, extraAPK1, extraAPK2}, fake.installedPaths,
+		"primary APK MUST install first, then extras in the order given")
+}
+
+// TestRunMatrix_ExtraAPKPaths_EmptyPreservesSingleApkBehavior pins the
+// backward-compatibility contract explicitly promised in types.go's
+// ExtraAPKPaths KDoc: a MatrixConfig that doesn't set the new field
+// behaves byte-for-byte like before it existed. Falsifiability: if a
+// future change made the install loop unconditionally append even a
+// nil/empty ExtraAPKPaths as a phantom entry, fake.installedPaths would
+// have 2 entries instead of 1 here.
+func TestRunMatrix_ExtraAPKPaths_EmptyPreservesSingleApkBehavior(t *testing.T) {
+	fake := &fakeEmulator{
+		runPassed:  []bool{true},
+		runOutputs: []string{"BUILD SUCCESSFUL"},
+	}
+	runner := NewAndroidMatrixRunner(fake)
+	primaryAPK := writeFakeAPK(t)
+
+	result, err := runner.RunMatrix(context.Background(), MatrixConfig{
+		AVDs:        []AVD{{Name: "API34", APILevel: 34, FormFactor: "phone"}},
+		APKPath:     primaryAPK,
+		TestClass:   "lava.app.challenges.Challenge01AppLaunchAndTrackerSelectionTest",
+		EvidenceDir: t.TempDir(),
+		ColdBoot:    true,
+		// ExtraAPKPaths deliberately omitted (zero value: nil)
+	})
+	require.NoError(t, err)
+	assert.True(t, result.AllPassed())
+	assert.Equal(t, []string{primaryAPK}, fake.installedPaths)
+}
+
+// TestRunMatrix_ExtraAPKPaths_InstallFailureFailsRow proves an extra-APK
+// install failure fails the row exactly like a primary-install failure
+// does — no silent partial-install false-green (clause 6.J). Without
+// this test, a bug that swallowed the extra-install error (e.g. `_ =
+// em.Install(...)` instead of checking it) would produce a green row
+// even though the companion APK never made it onto the device — which
+// is exactly the "test executed and passed against a feature that
+// doesn't actually work" bluff class the parent project's §6.AB exists
+// to prevent.
+//
+// Falsifiability rehearsal (Sixth Law clause 2): change the extra-APK
+// error handling in matrix.go's runOne from `return boot, TestResult{...
+// Passed: false ...}` to a no-op continue (swallow the error) → this
+// test fails because result.AllPassed() reports true despite the
+// injected installErrors[1] failure. Reverted after confirming the
+// failure; test passes again with the error-propagating code restored.
+func TestRunMatrix_ExtraAPKPaths_InstallFailureFailsRow(t *testing.T) {
+	extraInstallErr := errors.New("extra apk install: adb device offline")
+	fake := &fakeEmulator{
+		// index 0 = primary install (succeeds), index 1 = first extra
+		// APK install (fails).
+		installErrors: []error{nil, extraInstallErr},
+	}
+	runner := NewAndroidMatrixRunner(fake)
+	primaryAPK := writeFakeAPK(t)
+	extraAPK := writeFakeAPK(t)
+
+	result, err := runner.RunMatrix(context.Background(), MatrixConfig{
+		AVDs:          []AVD{{Name: "API34", APILevel: 34, FormFactor: "phone"}},
+		APKPath:       primaryAPK,
+		ExtraAPKPaths: []string{extraAPK},
+		TestClass:     "lava.app.challenges.Challenge72SameDeviceMdnsDiscoveryTest",
+		EvidenceDir:   t.TempDir(),
+		ColdBoot:      true,
+	})
+	require.NoError(t, err, "RunMatrix itself does not error; the failure is recorded per-row")
+	assert.False(t, result.AllPassed(),
+		"a failed extra-APK install MUST fail the row, not silently pass")
+	require.Len(t, result.Tests, 1)
+	assert.False(t, result.Tests[0].Passed)
+	require.Error(t, result.Tests[0].Error)
+	assert.Contains(t, result.Tests[0].Error.Error(), "extra apk install failed")
+	assert.Contains(t, result.Tests[0].Error.Error(), "index 0")
+	// The emulator MUST still be torn down even on an extra-install
+	// failure (clause 6.B — no leaked emulator on a failed row).
+	assert.Equal(t, 1, fake.teardownCount)
 }
 
 // TestAndroidMatrixRunner_BootFailure_RecordsRowAndContinues pins the
