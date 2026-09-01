@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # boot_reports_what_it_did_challenge.sh — anti-bluff gate for cmd/boot.
 #
 # The defect this exists to catch: `boot` ran all three of its phases, started

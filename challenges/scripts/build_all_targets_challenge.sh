@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # build_all_targets_challenge.sh — gate for scripts/build-all.sh.
 #
 # The defect this exists to catch: build-all.sh named three hardcoded build
