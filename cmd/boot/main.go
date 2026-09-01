@@ -84,13 +84,12 @@ func main() {
 	}
 }
 
-type distributorAdapter struct {
-	*distribution.DefaultDistributor
-}
-
-func (d *distributorAdapter) DistributeEndpoints(ctx context.Context, names []string) (int, error) {
-	return 0, nil
-}
+// There is deliberately no local distributorAdapter here. One used to exist,
+// embedding *distribution.DefaultDistributor and overriding DistributeEndpoints
+// with `return 0, nil`. Because the override shadowed the embedded method,
+// remote distribution deployed nothing and reported success to BootAll.
+// *distribution.DefaultDistributor already satisfies boot.Distributor — its own
+// doc comment says so — so it is passed straight through.
 
 func runBoot(ctx context.Context, envFile, projectDir string) error {
 	logger := logging.NewStdLogger("boot")
@@ -141,16 +140,30 @@ func runBoot(ctx context.Context, envFile, projectDir string) error {
 			distribution.WithHostManager(hostManager),
 			distribution.WithLogger(logger),
 		)
-		distributor = &distributorAdapter{DefaultDistributor: defaultDist}
+		distributor = defaultDist
 		logger.Info("Remote distribution enabled with scheduler: %s", cfg.Scheduler)
 	}
 
-	endpoints := map[string]endpoint.ServiceEndpoint{
-		"helixagent": {
-			Host:    "localhost",
-			Port:    "7061",
-			Enabled: true,
-		},
+	// This module is consumer-agnostic (§11.4.28(B)) and may carry no host or
+	// port literal in tracked source (§6.R). The endpoint list that used to sit
+	// here was a hardcoded consumer service name pointing at a hardcoded
+	// host:port, and it was the only thing this command ever tried to boot.
+	//
+	// Honest boundary: there is currently NO configuration source that supplies
+	// service endpoints to this command — envconfig carries remote *hosts*, not
+	// services — and BootAll's compose and health phases are inert here anyway,
+	// because no orchestrator and no health checker are wired below. So this
+	// command cannot presently boot anything, and it now says that instead of
+	// printing a completion line over an empty result set.
+	endpoints := map[string]endpoint.ServiceEndpoint{}
+
+	if len(endpoints) == 0 {
+		return fmt.Errorf(
+			"no service endpoints are configured, so there is nothing to boot: " +
+				"this command has no endpoint configuration source yet, and no " +
+				"compose orchestrator or health checker is wired into its " +
+				"BootManager. Use the pkg/boot API directly and pass " +
+				"boot.WithOrchestrator/WithHealthChecker with your own endpoints")
 	}
 
 	bm := boot.NewBootManager(
@@ -171,6 +184,17 @@ func runBoot(ctx context.Context, envFile, projectDir string) error {
 	if err != nil {
 		logger.Error("Boot failed: %v", err)
 		return err
+	}
+
+	// A boot that processed nothing is not a boot. Reporting success here is
+	// what let this command exit 0 having started no containers at all: every
+	// phase is skipped when its collaborator is nil, and an empty result set
+	// then reads exactly like a clean run.
+	if len(result.Results) == 0 {
+		return fmt.Errorf(
+			"boot processed 0 services: %d configured endpoint(s) produced no "+
+				"result, which means every phase was skipped rather than run. "+
+				"Nothing was started", len(endpoints))
 	}
 
 	logger.Info("Boot completed: %d services processed", len(result.Results))
