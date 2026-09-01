@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # no_suspend_calls_challenge.sh — CONST-033 source-tree gate.
 #
 # Wraps check-no-suspend-calls.sh as a challenge. Asserts the project's

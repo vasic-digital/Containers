@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # install-host-suspend-guard.sh
 #
 # MANUAL PREREQUISITE — run ONCE per host, with sudo, BEFORE running

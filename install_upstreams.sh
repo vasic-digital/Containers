@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # install_upstreams.sh - Configure git remotes for all upstream repositories
 #

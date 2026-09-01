@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # user_session_no_suspend_bootstrap.sh
 #
 # Per-user defensive layer — runs without sudo. Protects ONLY the

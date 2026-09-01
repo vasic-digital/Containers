@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 API_LEVELS="28 29 30 31 33 34 35 36"
 RESULTS_DIR="/test-results"

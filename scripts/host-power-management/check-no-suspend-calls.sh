@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # check-no-suspend-calls.sh — CONST-033 static scanner.
 #
 # Walks the project tree and fails if ANY file invokes a host-level

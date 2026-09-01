@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # build-all.sh — build every command binary this module ships.
 #
 # The target list is DERIVED from the module, never hardcoded. It used to be a
