@@ -344,3 +344,12 @@ func TestBootAll_ComposeError_NonRequired(t *testing.T) {
 	_ = err
 	assert.Equal(t, 1, summary.Failed)
 }
+
+// Run satisfies the ContainerRuntime interface's ephemeral-run primitive. This
+// fake does not exercise it; it returns an empty result rather than a nil one
+// so a caller can never dereference nil on a nil error.
+func (m *moreMockRuntime) Run(
+	_ context.Context, _ string, _ []string, _ ...runtime.RunOption,
+) (*runtime.ExecResult, error) {
+	return &runtime.ExecResult{}, nil
+}

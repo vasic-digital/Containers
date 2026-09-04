@@ -314,3 +314,21 @@ func (c *CRIORuntime) Logs(ctx context.Context, id string, opts ...LogOption) (i
 	}
 	return rc, nil
 }
+
+// Run reports ErrRunUnsupported: crictl has no `run --rm -i` equivalent.
+//
+// crictl's own `run` takes a container-config JSON file plus a pod-config JSON
+// file and attaches the container to a sandbox the caller must supply; it does
+// not accept an image name and an argv, does not remove the container on exit,
+// and offers no interactive-stdin flag. Synthesising those two config files
+// here would be a parallel reimplementation of pod-sandbox orchestration
+// inside a runtime adapter, so this returns an explicit sentinel instead of a
+// half-working approximation.
+func (c *CRIORuntime) Run(
+	ctx context.Context, image string, cmd []string, opts ...RunOption,
+) (*ExecResult, error) {
+	return nil, fmt.Errorf(
+		"crictl run %s: %w (crictl run requires pod- and container-config "+
+			"JSON and has no --rm/-i form)", image, ErrRunUnsupported,
+	)
+}

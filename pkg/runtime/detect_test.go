@@ -199,3 +199,12 @@ func TestDetectAll_Integration(t *testing.T) {
 		assert.NotEmpty(t, rt.Name())
 	}
 }
+
+// Run satisfies the ContainerRuntime interface's ephemeral-run primitive. This
+// fake does not exercise it; it returns an empty result rather than a nil one
+// so a caller can never dereference nil on a nil error.
+func (a *availableRuntime) Run(
+	_ context.Context, _ string, _ []string, _ ...RunOption,
+) (*ExecResult, error) {
+	return &ExecResult{}, nil
+}

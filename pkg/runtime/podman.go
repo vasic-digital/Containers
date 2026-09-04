@@ -328,8 +328,25 @@ func (p *PodmanRuntime) Logs(
 	if o.Until != "" {
 		args = append(args, "--until", o.Until)
 	}
+	// Podman's --tail is an INTEGER flag (default -1 = "all lines"); it does
+	// NOT accept Docker's "all" string sentinel, which is exactly what
+	// defaultLogOptions() supplies. Measured on this project's build host with
+	// podman 5.7.1:
+	//
+	//	$ podman logs --tail all workshop-curriculum_platform_1
+	//	Error: invalid argument "all" for "--tail" flag:
+	//	       strconv.ParseInt: parsing "all": invalid syntax   (exit 125)
+	//
+	// Every DEFAULT-OPTION call to PodmanRuntime.Logs therefore ran a command
+	// that produced no stdout at all. Guard it the way crio.go and lxd.go
+	// already guard their integer --tail flags: pass a genuinely-numeric Tail
+	// through, and OMIT the flag entirely for "all" (or anything non-numeric)
+	// — podman's own default already means every line, so omitting it is the
+	// requested semantics rather than an approximation of them.
 	if o.Tail != "" {
-		args = append(args, "--tail", o.Tail)
+		if n, err := strconv.Atoi(o.Tail); err == nil {
+			args = append(args, "--tail", strconv.Itoa(n))
+		}
 	}
 	args = append(args, id)
 
@@ -338,4 +355,11 @@ func (p *PodmanRuntime) Logs(
 		return nil, fmt.Errorf("podman logs %s: %w", id, err)
 	}
 	return rc, nil
+}
+
+// Run performs a one-shot `podman run` — see ContainerRuntime.Run.
+func (p *PodmanRuntime) Run(
+	ctx context.Context, image string, cmd []string, opts ...RunOption,
+) (*ExecResult, error) {
+	return runViaCLI(ctx, p.executor, p.binary, "podman", image, cmd, opts)
 }

@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -98,6 +100,50 @@ func (e *defaultExecutor) ExecuteWithStderr(
 	return stdout.Bytes(), stderr.Bytes(), exitCode, err
 }
 
+// stderrPiper is the OPTIONAL half of StreamCmd: a StreamCmd that can also
+// hand over the child's stderr. `*exec.Cmd` satisfies it, so the production
+// path always captures stderr; a test fake that implements only the three
+// declared StreamCmd methods does not, and degrades to "exit status N" with
+// no diagnostic text rather than failing. Adding StderrPipe to StreamCmd
+// itself would break every external implementer of that exported interface,
+// so it is probed for instead (§11.4.122).
+type stderrPiper interface {
+	StderrPipe() (io.ReadCloser, error)
+}
+
+// stderrCaptureLimit bounds how much of a failed command's stderr is retained
+// for the error message. The drain goroutine keeps reading past this point and
+// discards the excess, so the child never blocks on a full pipe — `podman logs`
+// writes the CONTAINER's stderr stream here and that can be arbitrarily large.
+const stderrCaptureLimit = 8 << 10
+
+// boundedBuffer keeps the first stderrCaptureLimit bytes written to it and
+// silently discards the rest, always reporting a full write so io.Copy runs to
+// completion.
+type boundedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if room := stderrCaptureLimit - b.buf.Len(); room > 0 {
+		if len(p) <= room {
+			b.buf.Write(p)
+		} else {
+			b.buf.Write(p[:room])
+		}
+	}
+	return len(p), nil
+}
+
+func (b *boundedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func (e *defaultExecutor) ExecuteStream(
 	ctx context.Context, name string, args ...string,
 ) (io.ReadCloser, error) {
@@ -110,21 +156,91 @@ func (e *defaultExecutor) ExecuteStream(
 	if err != nil {
 		return nil, fmt.Errorf("creating stdout pipe: %w", err)
 	}
+
+	rc := &streamCmdReadCloser{ReadCloser: stdout, cmd: cmd}
+
+	// Attach stderr BEFORE Start: exec.Cmd.StderrPipe must not be called on a
+	// started command.
+	if piper, ok := cmd.(stderrPiper); ok {
+		if errPipe, perr := piper.StderrPipe(); perr == nil {
+			rc.stderr = &boundedBuffer{}
+			done := make(chan struct{})
+			rc.stderrDone = done
+			go func() {
+				defer close(done)
+				_, _ = io.Copy(rc.stderr, errPipe)
+			}()
+		}
+	}
+
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("starting command: %w", err)
 	}
-	return &streamCmdReadCloser{ReadCloser: stdout, cmd: cmd}, nil
+	return rc, nil
 }
 
-// streamCmdReadCloser waits for the command to finish on Close.
+// streamCmdReadCloser is the reader ExecuteStream hands back, and its whole
+// job is to make ONE silent failure impossible.
+//
+// The shape it replaces: the old form returned the raw stdout pipe and called
+// cmd.Wait only from Close. When the CLI failed before writing anything —
+// measured on this project's own build host, `podman logs --tail all <id>`
+// exits 125 with "invalid argument \"all\" for \"--tail\" flag" on podman
+// 5.7.1 — the caller's io.ReadAll returned (0 bytes, nil error). "Logs fine,
+// container quiet" and "I could not read the logs at all" were the same
+// observation. Callers that used `defer rc.Close()` discarded the only
+// remaining signal, and even a caller that checked it got a bare
+// "exit status 125" with the reason stripped.
+//
+// The rule this type enforces: ZERO BYTES WITH A NIL ERROR IS IMPOSSIBLE WHEN
+// THE COMMAND FAILED. Read waits for the child at stdout EOF and returns the
+// child's failure INSTEAD of io.EOF, with the captured stderr appended. A
+// container that genuinely printed nothing still exits 0, so Read still
+// returns (0, io.EOF) and io.ReadAll still returns (empty, nil) — the
+// legitimate case is unchanged and remains distinguishable.
+//
+// finish() is memoised: Wait is called exactly once however Read and Close
+// interleave, and both report the same verdict.
 type streamCmdReadCloser struct {
 	io.ReadCloser
-	cmd StreamCmd
+	cmd        StreamCmd
+	stderr     *boundedBuffer
+	stderrDone <-chan struct{}
+	once       sync.Once
+	waitErr    error
+}
+
+func (c *streamCmdReadCloser) Read(p []byte) (int, error) {
+	n, err := c.ReadCloser.Read(p)
+	if errors.Is(err, io.EOF) {
+		if waitErr := c.finish(); waitErr != nil {
+			return n, waitErr
+		}
+	}
+	return n, err
 }
 
 func (c *streamCmdReadCloser) Close() error {
 	_ = c.ReadCloser.Close()
-	return c.cmd.Wait()
+	return c.finish()
+}
+
+// finish drains stderr, reaps the child exactly once, and enriches a non-zero
+// exit with the captured diagnostic text.
+func (c *streamCmdReadCloser) finish() error {
+	c.once.Do(func() {
+		if c.stderrDone != nil {
+			<-c.stderrDone
+		}
+		err := c.cmd.Wait()
+		if err != nil && c.stderr != nil {
+			if txt := strings.TrimSpace(c.stderr.String()); txt != "" {
+				err = fmt.Errorf("%w: %s", err, txt)
+			}
+		}
+		c.waitErr = err
+	})
+	return c.waitErr
 }
 
 // DockerRuntime implements ContainerRuntime using the docker CLI.
@@ -663,4 +779,11 @@ func mapContainerState(state string) ContainerState {
 	default:
 		return ContainerState(state)
 	}
+}
+
+// Run performs a one-shot `docker run` — see ContainerRuntime.Run.
+func (d *DockerRuntime) Run(
+	ctx context.Context, image string, cmd []string, opts ...RunOption,
+) (*ExecResult, error) {
+	return runViaCLI(ctx, d.executor, d.binary, "docker", image, cmd, opts)
 }

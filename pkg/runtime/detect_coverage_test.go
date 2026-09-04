@@ -153,3 +153,21 @@ func TestSetRuntimePriority(t *testing.T) {
 	priority := GetRuntimePriority()
 	assert.Equal(t, []string{"docker", "podman"}, priority)
 }
+
+// Run satisfies the ContainerRuntime interface's ephemeral-run primitive. This
+// fake does not exercise it; it returns an empty result rather than a nil one
+// so a caller can never dereference nil on a nil error.
+func (r *alwaysAvailableRuntime) Run(
+	_ context.Context, _ string, _ []string, _ ...RunOption,
+) (*ExecResult, error) {
+	return &ExecResult{}, nil
+}
+
+// Run satisfies the ContainerRuntime interface's ephemeral-run primitive. This
+// fake does not exercise it; it returns an empty result rather than a nil one
+// so a caller can never dereference nil on a nil error.
+func (r *neverAvailableRuntime) Run(
+	_ context.Context, _ string, _ []string, _ ...RunOption,
+) (*ExecResult, error) {
+	return &ExecResult{}, nil
+}

@@ -414,3 +414,12 @@ func TestContainerCollector_CollectAll_PreservesNames(t *testing.T) {
 func TestMockRuntime_ImplementsInterface(t *testing.T) {
 	var _ runtime.ContainerRuntime = (*mockRuntime)(nil)
 }
+
+// Run satisfies the ContainerRuntime interface's ephemeral-run primitive. This
+// fake does not exercise it; it returns an empty result rather than a nil one
+// so a caller can never dereference nil on a nil error.
+func (m *mockRuntime) Run(
+	_ context.Context, _ string, _ []string, _ ...runtime.RunOption,
+) (*runtime.ExecResult, error) {
+	return &runtime.ExecResult{}, nil
+}

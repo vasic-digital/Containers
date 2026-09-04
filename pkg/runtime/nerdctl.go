@@ -183,3 +183,10 @@ func (n *NerdctlRuntime) Logs(ctx context.Context, id string, opts ...LogOption)
 	}
 	return rc, nil
 }
+
+// Run performs a one-shot `nerdctl run` — see ContainerRuntime.Run.
+func (n *NerdctlRuntime) Run(
+	ctx context.Context, image string, cmd []string, opts ...RunOption,
+) (*ExecResult, error) {
+	return runViaCLI(ctx, n.executor, n.binary, "nerdctl", image, cmd, opts)
+}

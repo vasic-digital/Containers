@@ -251,3 +251,12 @@ func TestDefaultMonitor_StatsError(t *testing.T) {
 	// Container stats should be empty due to errors
 	assert.Empty(t, snap.Containers)
 }
+
+// Run satisfies the ContainerRuntime interface's ephemeral-run primitive. This
+// fake does not exercise it; it returns an empty result rather than a nil one
+// so a caller can never dereference nil on a nil error.
+func (s *stubRuntime) Run(
+	_ context.Context, _ string, _ []string, _ ...runtime.RunOption,
+) (*runtime.ExecResult, error) {
+	return &runtime.ExecResult{}, nil
+}

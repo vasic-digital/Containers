@@ -337,3 +337,20 @@ func (l *LXDRuntime) Logs(ctx context.Context, id string, opts ...LogOption) (io
 	}
 	return rc, nil
 }
+
+// Run reports ErrRunUnsupported: LXD has no one-shot ephemeral-run form.
+//
+// `lxc launch` starts a long-lived instance and returns immediately without a
+// command, exit code or captured output; getting Run's semantics would mean
+// launch → exec → collect → delete, which is a lifecycle this adapter would be
+// inventing rather than delegating. The sentinel keeps that visible instead of
+// shipping a multi-step emulation that fails differently from every other
+// runtime.
+func (l *LXDRuntime) Run(
+	ctx context.Context, image string, cmd []string, opts ...RunOption,
+) (*ExecResult, error) {
+	return nil, fmt.Errorf(
+		"lxc run %s: %w (lxc launch starts a persistent instance and "+
+			"captures no exit code or output)", image, ErrRunUnsupported,
+	)
+}

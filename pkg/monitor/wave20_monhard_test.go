@@ -252,3 +252,12 @@ func TestHardenMON3_StatsFailure_Surfaced(t *testing.T) {
 		t.Fatalf("ListError = true on a Stats-only failure; want false (List succeeded)")
 	}
 }
+
+// Run satisfies the ContainerRuntime interface's ephemeral-run primitive. This
+// fake does not exercise it; it returns an empty result rather than a nil one
+// so a caller can never dereference nil on a nil error.
+func (f *mon3FakeRuntime) Run(
+	_ context.Context, _ string, _ []string, _ ...runtime.RunOption,
+) (*runtime.ExecResult, error) {
+	return &runtime.ExecResult{}, nil
+}

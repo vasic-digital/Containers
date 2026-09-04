@@ -425,3 +425,27 @@ func (k *KubernetesRuntime) Logs(
 	}
 	return rc, nil
 }
+
+// Run reports ErrRunUnsupported.
+//
+// `kubectl run --rm -i --restart=Never` is a real one-shot form, and this is
+// the one place where the honest answer is "not verified rather than not
+// possible" (§11.4.6). It is NOT implemented here because it differs from
+// Run's contract in ways that cannot be papered over blind: it requires a
+// caller-supplied pod NAME as a positional argument (Run takes only an image),
+// it interleaves pod-lifecycle messages such as `pod "x" deleted` into the
+// captured stdout, and its exit code reports kubectl's own status rather than
+// the container's in several documented cases. No cluster is reachable from
+// this repository, so none of that could be measured. Shipping an unverified
+// implementation whose output silently mixes kubectl chatter with the
+// container's own bytes is the same silent-failure class this package has just
+// been repaired for; the sentinel says so out loud instead.
+func (k *KubernetesRuntime) Run(
+	ctx context.Context, image string, cmd []string, opts ...RunOption,
+) (*ExecResult, error) {
+	return nil, fmt.Errorf(
+		"kubectl run %s: %w (kubectl run needs an explicit pod name and "+
+			"mixes pod-lifecycle output into stdout; not implemented "+
+			"unverified)", image, ErrRunUnsupported,
+	)
+}

@@ -213,6 +213,53 @@ func (r *RemoteRuntime) Logs(
 	)
 }
 
+// Run performs a one-shot `<runtime> run` on the remote host.
+//
+// Stdin is the hard boundary here, and it is reported rather than dropped.
+// RemoteExecutor exposes Execute (command string in, CommandResult out) and
+// ExecuteStream (command string in, output reader out); neither accepts an
+// io.Reader, so there is no seam through which a local document could be
+// streamed to the remote container's standard input. A caller passing
+// WithRunStdin therefore gets an error wrapping runtime.ErrStdinUnsupported —
+// it must never get back a zero-exit result produced by running the same
+// command with an empty stdin, which would look exactly like success.
+//
+// Without stdin the run is performed normally. Every argument is shellEscape'd
+// because the assembled string is re-parsed by the remote login shell, the same
+// contract Start/Stop/Remove/Exec already follow here.
+func (r *RemoteRuntime) Run(
+	ctx context.Context,
+	image string,
+	cmd []string,
+	opts ...runtime.RunOption,
+) (*runtime.ExecResult, error) {
+	if image == "" {
+		return nil, fmt.Errorf("remote run: image is required")
+	}
+	spec := runtime.ResolveRunSpec(image, cmd, opts)
+	if spec.Stdin != nil {
+		return nil, fmt.Errorf(
+			"remote run %s on %s: %w",
+			image, r.host.Name, runtime.ErrStdinUnsupported,
+		)
+	}
+
+	escaped := make([]string, 0, len(spec.Args))
+	for _, a := range spec.Args {
+		escaped = append(escaped, shellEscape(a))
+	}
+
+	result, err := r.exec(ctx, strings.Join(escaped, " "))
+	if err != nil {
+		return nil, err
+	}
+	return &runtime.ExecResult{
+		ExitCode: result.ExitCode,
+		Stdout:   result.Stdout,
+		Stderr:   result.Stderr,
+	}, nil
+}
+
 // Host returns the remote host this runtime targets.
 func (r *RemoteRuntime) Host() RemoteHost {
 	return r.host
