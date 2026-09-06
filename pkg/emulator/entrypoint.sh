@@ -25,7 +25,12 @@ fi
 # Sanity-check the AVD exists in the image. Avd-not-found errors at
 # `emulator -avd` time produce opaque exit codes; explicit pre-check
 # gives a diagnostic message that surfaces in `podman logs`.
-if ! avdmanager list avd 2>/dev/null | grep -q "Name: ${AVD_NAME}"; then
+# Captured first, then matched with bash's own pattern operator: as a
+# `... | grep -q` pipeline under the `set -o pipefail` above, a MATCH kills
+# avdmanager with SIGPIPE (141) and pipefail promotes it, so `if !` would
+# declare the AVD missing exactly when it was present.
+avd_list="$(avdmanager list avd 2>/dev/null || true)"
+if [[ $avd_list != *"Name: ${AVD_NAME}"* ]]; then
     echo "ERROR: AVD '${AVD_NAME}' not found in image. Available:" >&2
     avdmanager list avd 2>&1 >&2 || true
     exit 1

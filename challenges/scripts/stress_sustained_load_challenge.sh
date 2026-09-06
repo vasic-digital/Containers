@@ -37,7 +37,9 @@ base_med=$(sort -n "$base" | awk 'NR==5{print; exit}')
 echo "[2/6] Baseline median: ${base_med}s"
 
 body=$(curl -sS --max-time "$TIMEOUT_SEC" "$HEALTH_URL" 2>/dev/null || true)
-printf '%s' "$body" | grep -qE '"status"\s*:\s*"(ok|healthy|UP)"' || { echo "[3/6] FAIL"; exit 1; }
+# Bash's own regex, NOT `printf ... | grep -qE` — see SIGPIPE-V-001.
+status_re='"status"[[:space:]]*:[[:space:]]*"(ok|healthy|UP)"'
+[[ $body =~ $status_re ]] || { echo "[3/6] FAIL"; exit 1; }
 echo "[3/6] Schema sanity: PASS"
 
 RES=$(mktemp); trap "rm -f $base $RES" EXIT

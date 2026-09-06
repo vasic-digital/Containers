@@ -36,7 +36,9 @@ echo "[1/6] Topology: ${#REACH[@]} replicas — PASS"
 
 for u in "${REACH[@]}"; do
     b=$(curl -sS --max-time 5 "$u/health" 2>/dev/null || true)
-    printf '%s' "$b" | grep -qE '"status"\s*:\s*"(ok|healthy|UP)"' || { echo "[2/6] FAIL: $u no status"; exit 1; }
+    # Bash's own regex, NOT `printf ... | grep -qE` — see SIGPIPE-V-001.
+    status_re='"status"[[:space:]]*:[[:space:]]*"(ok|healthy|UP)"'
+    [[ $b =~ $status_re ]] || { echo "[2/6] FAIL: $u no status"; exit 1; }
 done
 echo "[2/6] Schema sanity: PASS"
 

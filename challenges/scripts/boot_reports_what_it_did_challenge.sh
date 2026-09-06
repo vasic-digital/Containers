@@ -77,7 +77,13 @@ fi
 # doc comment says so. Any local override in cmd/ that returns a bare (0, nil)
 # is deploying nothing and reporting success.
 echo "[3/4] cmd/ declares no DistributeEndpoints override that returns (0, nil)"
-if grep -rn -A3 'func .*DistributeEndpoints' cmd/ 2>/dev/null | grep -qE 'return 0, nil'; then
+# Captured first, then matched with bash's own pattern operator. As a
+# `... | grep -qE` pipeline under the `set -o pipefail` above, a match kills
+# the left-hand grep with SIGPIPE (141) and pipefail promotes it — so this
+# check FAILED OPEN: it took the `else pass` branch precisely when it had
+# found the no-op override it exists to catch.
+dist_overrides="$(grep -rn -A3 'func .*DistributeEndpoints' cmd/ 2>/dev/null || true)"
+if [[ $dist_overrides == *"return 0, nil"* ]]; then
     fail "a DistributeEndpoints override in cmd/ returns (0, nil) — distributes nothing, reports success"
 else
     pass "no no-op DistributeEndpoints override in cmd/"

@@ -81,8 +81,15 @@ if [[ -f "${CAPABILITIES}" ]]; then
     in_table && /^\|/ { gsub(/^[ ]+|[ ]+$/, "", $7); if ($7 == "active") { gsub(/^[ ]+|[ ]+$/, "", $2); print $2 } }
   ' "${MANIFEST}")
   mapfile -t DECLARED_IDS < <(grep -oE 'CAP-[0-9]{3}' "${CAPABILITIES}" | sort -u)
+  # One newline-delimited blob, matched with bash's own pattern operator.
+  # `printf ... | grep -qxF` is a trap under the `set -o pipefail` above:
+  # grep -q closes the pipe the instant it matches, printf dies of SIGPIPE
+  # (141), and pipefail promotes that — so the id would be reported MISSING
+  # precisely because it was FOUND. The surrounding \n keeps this an exact
+  # whole-line match, which is what -x meant.
+  ACTIVE_BLOB=$'\n'"$(printf '%s\n' "${ACTIVE_IDS[@]}")"$'\n'
   for cid in "${DECLARED_IDS[@]}"; do
-    if ! printf '%s\n' "${ACTIVE_IDS[@]}" | grep -qxF "${cid}"; then
+    if [[ $ACTIVE_BLOB != *$'\n'"${cid}"$'\n'* ]]; then
       echo "FAIL: ${cid} declared in CAPABILITIES.md but no active anchor." >&2
       failed=1
     fi

@@ -68,7 +68,19 @@ anti-bluff-mutation:
 anti-bluff-mutation-changed:
 	@bash challenges/scripts/mutation_ratchet_challenge.sh
 
-anti-bluff: anti-bluff-scan anti-bluff-anchors anti-bluff-mutation-changed
+# SIGPIPE-V: a pipeline whose status decides a verdict while its last stage may
+# close the read end early. Under `set -o pipefail` the writer dies of SIGPIPE
+# and the check fails BECAUSE the pattern matched. Detector + its §1.1 paired
+# mutation proof, whose mutations are fixture DATA, never edits to the detector.
+sigpipe-verdict-scan:
+	@bash scripts/anti-bluff/sigpipe-verdict-scanner.sh --mode all
+
+sigpipe-verdict-proof:
+	@bash scripts/anti-bluff/tests/run-sigpipe-fixtures.sh
+
+sigpipe-verdict: sigpipe-verdict-scan sigpipe-verdict-proof
+
+anti-bluff: anti-bluff-scan anti-bluff-anchors anti-bluff-mutation-changed sigpipe-verdict
 
 update-baseline:
 	@echo "Manual baseline update — see docs/ANTI_BLUFF.md"

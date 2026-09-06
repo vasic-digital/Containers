@@ -23,8 +23,18 @@ echo "[1/4] Binary present: PASS"
 assert_no_panic() {
     local label="$1" body="$2"
     for pat in "${USER_HOSTILE[@]}"; do
-        printf '%s' "$body" | grep -qE "$pat" && { echo "  FAIL: $label leaked: $pat"; return 1; }
+        # Bash's own regex operator, NOT `printf ... | grep -qE`. Under the
+        # `set -o pipefail` at the top of this file that pipeline reports 141
+        # when grep -q closes the pipe on a match, so a body over ~4 KiB made
+        # THIS CHECK FAIL OPEN: the leak was found and the `&&` did not fire.
+        if [[ $body =~ $pat ]]; then
+            echo "  FAIL: $label leaked: $pat"
+            return 1
+        fi
     done
+    # Explicit: without it the function's status is the last loop iteration's,
+    # so a clean body whose last pattern simply did not match returned 1.
+    return 0
 }
 
 help_out=$(timeout "$TIMEOUT_SEC" "$CT_BIN" --help 2>&1 || timeout "$TIMEOUT_SEC" "$CT_BIN" -h 2>&1 || true)
